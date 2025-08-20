@@ -1428,6 +1428,8 @@ class ExplorerView(QTreeView):
         self.setDragEnabled(True); self.setAcceptDrops(True)
         self.setDropIndicatorShown(True); self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+        # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
+        self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
         else: super().dragEnterEvent(e)
@@ -1457,6 +1459,14 @@ class ExplorerView(QTreeView):
 
     # 단일 선택 항목을 재클릭해도 선택 해제되지 않게
     def mousePressEvent(self, e):
+        # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
+        try:
+            if not self.hasFocus():
+                self.setFocus(Qt.MouseFocusReason)
+        except Exception:
+            pass
+
+        # 단일 선택 항목을 재클릭해도 선택 해제되지 않게 (기존 동작 유지)
         if e.button() == Qt.LeftButton and e.modifiers() == Qt.NoModifier:
             clicked = self.indexAt(e.pos())
             sm = self.selectionModel()
@@ -1470,7 +1480,9 @@ class ExplorerView(QTreeView):
                 e.accept()
                 return
             return
+
         super().mousePressEvent(e)
+
 
 # -------------------- Explorer Pane --------------------
 class ExplorerPane(QWidget):
