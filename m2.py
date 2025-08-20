@@ -1501,6 +1501,7 @@ class ExplorerPane(QWidget):
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
         self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
+
         self.btn_cmd=QToolButton(self); self.btn_cmd.setIcon(icon_cmd(self.host.theme)); self.btn_cmd.setToolTip("Open Command Prompt here"); self.btn_cmd.setFixedHeight(UI_H)
         self.btn_up=QToolButton(self); self.btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp)); self.btn_up.setToolTip("Up"); self.btn_up.setFixedHeight(UI_H)
         self.btn_new=QToolButton(self); self.btn_new.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder)); self.btn_new.setToolTip("New Folder"); self.btn_new.setFixedHeight(UI_H)
@@ -1512,12 +1513,25 @@ class ExplorerPane(QWidget):
         self.btn_new_file.setFixedHeight(UI_H)
 
         self.btn_refresh=QToolButton(self); self.btn_refresh.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload)); self.btn_refresh.setToolTip("Refresh"); self.btn_refresh.setFixedHeight(UI_H)
-        row_toolbar=QHBoxLayout(); row_toolbar.setContentsMargins(0,0,0,0); row_toolbar.setSpacing(ROW_SPACING)
-        row_toolbar.addWidget(self.btn_star); row_toolbar.addWidget(self._bm_btn_container,1)
-        row_toolbar.addWidget(self.btn_cmd); row_toolbar.addWidget(self.btn_up); row_toolbar.addWidget(self.btn_new)
-        row_toolbar.addWidget(self.btn_new_file)  # 새 문서 버튼을 새 폴더 버튼 오른쪽에 배치
+
+        row_toolbar=QHBoxLayout()
+        row_toolbar.setContentsMargins(0,0,0,0)
+        # ▶ 우상단 아이콘 사이 간격 축소
+        row_toolbar.setSpacing(max(0, ROW_SPACING-2))
+        row_toolbar.addWidget(self.btn_star)
+        row_toolbar.addWidget(self._bm_btn_container,1)
+        row_toolbar.addWidget(self.btn_cmd)
+        row_toolbar.addWidget(self.btn_up)
+        row_toolbar.addWidget(self.btn_new)
+        row_toolbar.addWidget(self.btn_new_file)
         row_toolbar.addWidget(self.btn_refresh)
         self._row_toolbar=row_toolbar
+
+        # ▶ 우상단 아이콘 좌우 패딩 축소(해당 버튼에만 적용)
+        _tight_css = "QToolButton{padding-left:4px;padding-right:4px;}"
+        for b in (self.btn_cmd, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
+            b.setStyleSheet(_tight_css)
+            b.setAutoRaise(True)  # 테두리/여백 느낌 최소화
 
         # Path
         self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb — Double-click or F4/Ctrl+L to enter path")
@@ -1599,7 +1613,7 @@ class ExplorerPane(QWidget):
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
-        # ▶▶ 경로 복사 단축키
+        # 경로 복사 단축키
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))  # 전체 경로
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))   # 폴더까지만
 
@@ -1607,6 +1621,7 @@ class ExplorerPane(QWidget):
         self._apply_default_sort_size()
 
         self._update_pane_status()
+
 
     def _copy_path_shortcut(self, folder_only: bool = False):
         """
