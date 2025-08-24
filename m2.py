@@ -2529,8 +2529,16 @@ class MultiExplorer(QMainWindow):
         self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 ↔ 6 ↔ 8)"); self.btn_layout.setFixedHeight(UI_H)
         self.btn_theme=QToolButton(top); self.btn_theme.setToolTip("Toggle Light/Dark"); self.btn_theme.setFixedHeight(UI_H)
         self.btn_bm_edit=QToolButton(top); self.btn_bm_edit.setToolTip("Edit Bookmarks"); self.btn_bm_edit.setFixedHeight(UI_H)
+
+        # ▶ Session 버튼 추가 (Edit Bookmarks 오른쪽)
+        self.btn_session=QToolButton(top)
+        self.btn_session.setToolTip("Session (save/load all pane paths)")
+        self.btn_session.setFixedHeight(UI_H)
+
         self.btn_about=QToolButton(top); self.btn_about.setToolTip("About"); self.btn_about.setFixedHeight(UI_H)
-        top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0); top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
+        top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0)
+        top_lay.addWidget(self.btn_session,0)  # ← 추가된 버튼
+        top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
 
         self.central=QWidget(self); self.setCentralWidget(self.central)
         vmain=QVBoxLayout(self.central); vmain.setContentsMargins(0,0,0,0); vmain.setSpacing(ROW_SPACING)
@@ -2541,7 +2549,9 @@ class MultiExplorer(QMainWindow):
 
         self._update_layout_icon(); self._update_theme_icon()
         self.btn_layout.clicked.connect(self._cycle_layout); self.btn_theme.clicked.connect(self._toggle_theme)
-        self.btn_bm_edit.clicked.connect(self._open_bookmark_editor); self.btn_about.clicked.connect(self._show_about)
+        self.btn_bm_edit.clicked.connect(self._open_bookmark_editor)
+        self.btn_session.clicked.connect(self._open_session_manager)  # ← 세션 매니저 열기
+        self.btn_about.clicked.connect(self._show_about)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
         self.statusBar().showMessage("Ready", 1500)
@@ -2556,6 +2566,7 @@ class MultiExplorer(QMainWindow):
         settings=QSettings(ORG_NAME, APP_NAME); geo=settings.value("window/geometry")
         if isinstance(geo, QtCore.QByteArray): self.restoreGeometry(geo)
 
+
     def _update_layout_icon(self):
         states=getattr(self,"_layout_states",[4,6,8]); idx=getattr(self,"_layout_idx",0)
         if not states: states=[4,6,8]
@@ -2565,6 +2576,14 @@ class MultiExplorer(QMainWindow):
         if hasattr(self,"btn_theme") and self.btn_theme: self.btn_theme.setIcon(icon_theme_toggle(self.theme))
         if hasattr(self,"btn_bm_edit") and self.btn_bm_edit: self.btn_bm_edit.setIcon(icon_edit(self.theme))
         if hasattr(self,"btn_about") and self.btn_about: self.btn_about.setIcon(icon_info(self.theme))
+        # Session 버튼은 기본 스타일 아이콘 사용 (저장/불러오기 의미)
+        try:
+            if hasattr(self, "btn_session") and self.btn_session:
+                # 다크/라이트 모두 잘 보이는 시스템 아이콘 조합
+                self.btn_session.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        except Exception:
+            pass
+
     def _update_theme_dependent_icons(self):
         self._update_layout_icon(); self._update_theme_icon()
         for p in getattr(self,"panes",[]):
@@ -2670,6 +2689,193 @@ class MultiExplorer(QMainWindow):
         settings.setValue("layout/pane_count", len(self.panes))
         for i,p in enumerate(self.panes): settings.setValue(f"layout/pane_{i}_path", p.current_path())
         settings.sync(); super().closeEvent(e)
+
+    # ---- Sessions (save/load all pane paths) ---------------------------------
+    def _get_sessions(self) -> list:
+        s = QSettings(ORG_NAME, APP_NAME)
+        val = s.value("sessions/items", [])
+        out = []
+        if isinstance(val, list):
+            for it in val:
+                try:
+                    name = str(it.get("name", "")).strip()
+                    paths = [str(p) for p in it.get("paths", [])]
+                    panes = int(it.get("panes", len(paths) or len(self.panes) or 6))
+                    ts = float(it.get("ts", time.time()))
+                    if name and paths:
+                        out.append({"name": name, "paths": paths, "panes": panes, "ts": ts})
+                except Exception:
+                    pass
+        return out
+
+    def _set_sessions(self, items: list):
+        s = QSettings(ORG_NAME, APP_NAME)
+        s.setValue("sessions/items", items); s.sync()
+
+    def _save_session(self, name: str):
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.information(self, "Save Session", "세션 이름을 입력해 주세요.")
+            return
+        paths = self._current_paths()
+        panes = len(self.panes)
+        items = self._get_sessions()
+        # 이름 중복은 대소문자 무시하고 교체
+        lowered = name.lower()
+        replaced = False
+        for i, it in enumerate(items):
+            if it.get("name","").lower() == lowered:
+                items[i] = {"name": name, "paths": paths, "panes": panes, "ts": time.time()}
+                replaced = True
+                break
+        if not replaced:
+            items.append({"name": name, "paths": paths, "panes": panes, "ts": time.time()})
+        self._set_sessions(items)
+        try: self.statusBar().showMessage(f"Session '{name}' saved.", 2000)
+        except Exception: pass
+
+    def _delete_session(self, name: str):
+        items = self._get_sessions()
+        new_items = [it for it in items if it.get("name","") != name]
+        self._set_sessions(new_items)
+
+    def _load_session(self, name: str):
+        items = self._get_sessions()
+        target = None
+        for it in items:
+            if it.get("name","") == name:
+                target = it; break
+        if not target:
+            QMessageBox.warning(self, "Load Session", "세션을 찾을 수 없습니다."); return
+        paths = list(target.get("paths", []))
+        panes = int(target.get("panes", len(paths)))
+        if panes <= 0 or not paths:
+            QMessageBox.warning(self, "Load Session", "세션 데이터가 비어 있습니다."); return
+
+        # 현재 레이아웃과 다르면 재구성
+        if panes != len(self.panes):
+            self.build_panes(panes, paths)
+        else:
+            for i, p in enumerate(paths):
+                if i < len(self.panes) and os.path.exists(p):
+                    try:
+                        self.panes[i].set_path(p, push_history=False)
+                    except Exception:
+                        pass
+        try: self.statusBar().showMessage(f"Session '{name}' loaded.", 2000)
+        except Exception: pass
+
+    def _open_session_manager(self):
+        dlg = SessionManagerDialog(self, self._get_sessions())
+        if dlg.exec_() == QDialog.Accepted:
+            pass  # 필요 시 후처리
+
+class SessionManagerDialog(QDialog):
+    def __init__(self, parent: MultiExplorer, sessions: list):
+        super().__init__(parent)
+        self.setWindowTitle("Session Manager")
+        self.resize(560, 400)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Name", "Panes", "Saved"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        self.btn_save = QPushButton("Save Current", self)
+        self.btn_load = QPushButton("Load Selected", self)
+        self.btn_delete = QPushButton("Delete Selected", self)
+        self.btn_close = QPushButton("Close", self)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_load)
+        btns.addWidget(self.btn_delete)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.table, 1)
+        lay.addLayout(btns)
+
+        self._sessions = []
+        self.set_sessions(sessions)
+
+        self.btn_close.clicked.connect(self.accept)
+        self.btn_load.clicked.connect(self._on_load)
+        self.btn_delete.clicked.connect(self._on_delete)
+        self.btn_save.clicked.connect(self._on_save)
+
+    def set_sessions(self, items: list):
+        self._sessions = list(items or [])
+        self.table.setRowCount(len(self._sessions))
+        for r, it in enumerate(self._sessions):
+            name = it.get("name","")
+            panes = int(it.get("panes", 0))
+            ts = float(it.get("ts", time.time()))
+            dt = QDateTime.fromSecsSinceEpoch(int(ts)).toString("yyyy-MM-dd HH:mm:ss")
+
+            self.table.setItem(r, 0, QTableWidgetItem(name))
+            self.table.setItem(r, 1, QTableWidgetItem(str(panes)))
+            self.table.setItem(r, 2, QTableWidgetItem(dt))
+        self.table.resizeColumnsToContents()
+
+    def _selected_name(self) -> str | None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        r = rows[0].row()
+        it = self.table.item(r, 0)
+        return it.text().strip() if it else None
+
+    def _on_load(self):
+        name = self._selected_name()
+        if not name:
+            QMessageBox.information(self, "Load Session", "세션을 선택해 주세요.")
+            return
+        try:
+            self.parent()._load_session(name)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Session", str(e))
+
+    def _on_delete(self):
+        name = self._selected_name()
+        if not name:
+            QMessageBox.information(self, "Delete Session", "세션을 선택해 주세요.")
+            return
+        btn = QMessageBox.question(self, "Delete Session", f"삭제하시겠습니까?\n{name}",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if btn != QMessageBox.Yes:
+            return
+        try:
+            self.parent()._delete_session(name)
+            self.set_sessions(self.parent()._get_sessions())
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Session", str(e))
+
+    def _on_save(self):
+        name, ok = QInputDialog.getText(self, "Save Session", "Session name:",
+                                        text=time.strftime("Session %Y-%m-%d %H-%M-%S"))
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        # 이미 존재하면 덮어쓸지 확인
+        exists = any(s.get("name","").lower() == name.lower() for s in self.parent()._get_sessions())
+        if exists:
+            btn = QMessageBox.question(self, "Save Session",
+                                       f"동일한 이름의 세션이 있습니다.\n덮어쓰시겠습니까?\n{name}",
+                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if btn != QMessageBox.Yes:
+                return
+        try:
+            self.parent()._save_session(name)
+            self.set_sessions(self.parent()._get_sessions())
+        except Exception as e:
+            QMessageBox.critical(self, "Save Session", str(e))
+
 
 # -------------------- Bookmark Editor --------------------
 class BookmarkEditDialog(QDialog):
