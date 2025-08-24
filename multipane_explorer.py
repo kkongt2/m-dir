@@ -3002,16 +3002,46 @@ class MultiExplorer(QMainWindow):
         s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
 
     def build_panes(self, n:int, start_paths):
-        # 현재 최대화 여부 기억
+        """
+        - 현재(직전) 창 개수에 대한 경로들을 last_paths_{count} 로 저장
+        - 4→6, 6→8 등 창 개수를 늘릴 때, 새로 생기는 창(5~n)은
+          마지막으로 사용했던 same-count(6 또는 8) 레이아웃의 경로를 사용
+        - 레이아웃은 새 GridLayout으로 재구성하고, 최대화 상태를 유지/복원
+        """
         was_max = self.isMaximized()
 
-        cols = {4: 2, 6: 3, 8: 4}.get(n, 3)
-        gap = GRID_GAPS.get(cols, 3)
-        margin_lr = GRID_MARG_LR.get(cols, 6)
+        # 1) 직전 레이아웃의 경로 저장 (예: 4개 사용 중이었다면 last_paths_4 로 저장)
+        try:
+            prev_count = len(getattr(self, "panes", []))
+        except Exception:
+            prev_count = 0
+        if prev_count > 0:
+            try:
+                prev_paths = self._current_paths()
+                s = QSettings(ORG_NAME, APP_NAME)
+                s.setValue(f"layout/last_paths_{prev_count}", prev_paths)
+                s.sync()
+            except Exception:
+                pass
 
+        # 2) 대상 레이아웃에서 사용할 경로 구성
+        #    - start_paths(호출자가 넘긴 현재 표시 경로들)로 우선 채움
+        #    - 부족한 나머지는 last_paths_{n}에서 보충 (주로 5~n 채우기)
+        final_paths = list(start_paths or [])[:n]
+        if len(final_paths) < n:
+            s = QSettings(ORG_NAME, APP_NAME)
+            saved = s.value(f"layout/last_paths_{n}", [])
+            if not isinstance(saved, list):
+                saved = []
+            base_len = len(final_paths)
+            for i in range(base_len, n):
+                cand = saved[i] if i < len(saved) else None
+                if not cand or not os.path.exists(str(cand)):
+                    cand = QDir.homePath()
+                final_paths.append(str(cand))
+
+        # 3) 기존 그리드/페인 완전 제거
         vmain = self.centralWidget().layout() if self.centralWidget() else None
-
-        # ── 기존 그리드/페인 완전 정리 ─────────────────────────────────
         if hasattr(self, "grid") and isinstance(self.grid, QGridLayout):
             while self.grid.count():
                 it = self.grid.takeAt(0)
@@ -3028,18 +3058,18 @@ class MultiExplorer(QMainWindow):
             except Exception:
                 pass
 
-        # ── 새 그리드 생성/부착 ─────────────────────────────────────────
+        # 4) 새 그리드 구성
+        cols = {4: 2, 6: 3, 8: 4}.get(n, 3)
+        gap = GRID_GAPS.get(cols, 3)
+        margin_lr = GRID_MARG_LR.get(cols, 6)
+
         self.grid = QGridLayout()
         self.grid.setSpacing(gap)
         self.grid.setContentsMargins(margin_lr, 2, margin_lr, 4)
         if vmain:
             vmain.addLayout(self.grid, 1)
 
-        # 새 상태 초기화
-        self.panes = []
-        self.setUpdatesEnabled(False)
-
-        # 열/행 스트레치/최소치 초기화
+        # 스트레치 설정
         for c in range(cols):
             self.grid.setColumnStretch(c, 1)
             self.grid.setColumnMinimumWidth(c, 0)
@@ -3048,26 +3078,28 @@ class MultiExplorer(QMainWindow):
             self.grid.setRowStretch(r, 1)
             self.grid.setRowMinimumHeight(r, 0)
 
-        # ── 새 페인 생성/배치 ──────────────────────────────────────────
+        # 5) 새 페인 생성/배치 (final_paths를 그대로 사용)
+        self.panes = []
+        self.setUpdatesEnabled(False)
         for i in range(n):
-            spath = start_paths[i] if i < len(start_paths) else None
+            spath = final_paths[i] if i < len(final_paths) else None
             pane = ExplorerPane(None, start_path=spath, pane_id=i + 1, host_main=self)
             self.panes.append(pane)
             rr = i // cols
             cc = i % cols
             self.grid.addWidget(pane, rr, cc)
-
         self.setUpdatesEnabled(True)
 
+        # 6) 타이틀/아이콘/레이아웃 마무리
         self.setWindowTitle(f"Multi-Pane File Explorer — {n} panes")
         self._update_theme_dependent_icons()
 
-        # 레이아웃/지오메트리 강제 재계산
+        # 최대화 상태였다면: 해제→재최대화로 레이아웃을 확실히 채움
         if was_max:
-            # 최대화 상태였다면: 최대화 해제 → 레이아웃 킥 → 다시 최대화 (깜빡임 최소화 위해 타이머 사용)
             QTimer.singleShot(0, self._unmax_then_remax)
         else:
             QTimer.singleShot(0, self._kick_layout)
+
 
     def _unmax_then_remax(self):
         try:
