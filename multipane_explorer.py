@@ -2803,14 +2803,19 @@ class ExplorerPane(QWidget):
             self._search_stat_worker = w
             w.start()
 
-
     def _on_context_menu(self, pos):
-        owner_hwnd=int(self.window().winId()) if HAS_PYWIN32 else 0; paths=self._selected_paths()
+        owner_hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
+        paths = self._selected_paths()
         handled = False
+
+        # 먼저 윈도우 탐색기 네이티브 메뉴 시도
         if HAS_PYWIN32:
-            try: cx,cy=win32api.GetCursorPos(); screen_pt=(int(cx),int(cy))
+            try:
+                cx, cy = win32api.GetCursorPos()
+                screen_pt = (int(cx), int(cy))
             except Exception:
-                g=self.view.viewport().mapToGlobal(pos); screen_pt=(g.x(),g.y())
+                g = self.view.viewport().mapToGlobal(pos)
+                screen_pt = (g.x(), g.y())
             if paths:
                 handled = show_explorer_context_menu(owner_hwnd, paths, screen_pt)
             else:
@@ -2818,45 +2823,49 @@ class ExplorerPane(QWidget):
             if handled:
                 return
 
-        # Fallback menu (includes New)
+        # ── Fallback: 'New' 항목만 상위 레벨에 바로 표시 ──
         dst_dir = self.current_path()
-        global_pt=QCursor.pos(); menu=QMenu(self)
-        act_open=menu.addAction("Open"); act_reveal=menu.addAction("Open in Explorer"); act_copy_path=menu.addAction("Copy Path")
-        menu.addSeparator()
-        m_new = menu.addMenu("New")
-        a_new_folder = m_new.addAction("Folder")
-        a_new_txt    = m_new.addAction("Text Document (.txt)")
-        a_new_docx   = m_new.addAction("Word Document (.docx)")
-        a_new_xlsx   = m_new.addAction("Excel Workbook (.xlsx)")
-        a_new_pptx   = m_new.addAction("PowerPoint Presentation (.pptx)")
+        global_pt = QCursor.pos()
+        menu = QMenu(self)
 
-        action=menu.exec_(global_pt); target=paths[0] if paths else dst_dir
-        if action==act_open and paths: self._open_many(paths); return
-        elif action==act_open and os.path.exists(target):
-            self.set_path(target, True) if os.path.isdir(target) else self._open_file_with_cwd(target); return
-        elif action==act_reveal:
-            if os.path.isdir(target): os.startfile(target)
-            else: os.system(f'explorer /select,\"{target}\"'); return
-        elif action==act_copy_path: QApplication.clipboard().setText(target); return
+        a_new_folder = menu.addAction("New Folder")
+        a_new_txt    = menu.addAction("New Text File (.txt)")
+        a_new_docx   = menu.addAction("New Word Document (.docx)")
+        a_new_xlsx   = menu.addAction("New Excel Workbook (.xlsx)")
+        a_new_pptx   = menu.addAction("New PowerPoint Presentation (.pptx)")
+
+        action = menu.exec_(global_pt)
 
         try:
             if action == a_new_folder:
-                newp = unique_dest_path(dst_dir, "New Folder"); os.makedirs(newp, exist_ok=False)
-                self.hard_refresh(); self.host.flash_status("Folder created"); return
+                newp = unique_dest_path(dst_dir, "New Folder")
+                os.makedirs(newp, exist_ok=False)
+                self.hard_refresh()
+                self.host.flash_status("Folder created")
+                return
             if action == a_new_txt:
                 _create_new_file_with_template(dst_dir, "New Text Document.txt", ".txt")
-                self.hard_refresh(); self.host.flash_status("Text file created"); return
+                self.hard_refresh()
+                self.host.flash_status("Text file created")
+                return
             if action == a_new_docx:
                 _create_new_file_with_template(dst_dir, "New Word Document.docx", ".docx")
-                self.hard_refresh(); self.host.flash_status("Word document created"); return
+                self.hard_refresh()
+                self.host.flash_status("Word document created")
+                return
             if action == a_new_xlsx:
                 _create_new_file_with_template(dst_dir, "New Excel Workbook.xlsx", ".xlsx")
-                self.hard_refresh(); self.host.flash_status("Excel workbook created"); return
+                self.hard_refresh()
+                self.host.flash_status("Excel workbook created")
+                return
             if action == a_new_pptx:
                 _create_new_file_with_template(dst_dir, "New PowerPoint Presentation.pptx", ".pptx")
-                self.hard_refresh(); self.host.flash_status("PowerPoint presentation created"); return
+                self.hard_refresh()
+                self.host.flash_status("PowerPoint presentation created")
+                return
         except Exception as e:
             QMessageBox.critical(self, "Create failed", str(e))
+
 
     def _on_selection_changed(self,*_): self._update_statusbar_selection(); self._update_pane_status()
     def _update_statusbar_selection(self):
