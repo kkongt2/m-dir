@@ -310,7 +310,7 @@ def _common_css():
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
 
-    QLabel#crumbSep {{ padding: 0 2px; }}
+    QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
 
 def apply_dark_style(app: QApplication):
@@ -352,7 +352,7 @@ def apply_dark_style(app: QApplication):
         QPushButton#crumb {
             background: rgba(255,255,255,0.05);
             border: 1px solid #2B2E34;
-            padding: 0 6px; border-radius: 6px; text-align: left; color: #E6E9EE;
+            padding: 0 3px; border-radius: 6px; text-align: left; color: #E6E9EE;
         }
         QPushButton#crumb:hover { background: rgba(255,255,255,0.09); }
         QLabel#crumbSep { color: #7F8796; }
@@ -409,7 +409,7 @@ def apply_light_style(app: QApplication):
         QPushButton#crumb {
             background: rgba(0,0,0,0.04);
             border: 1px solid #E5E8EE;
-            padding: 0 6px; border-radius: 6px; text-align: left; color: #1C1C1E;
+            padding: 0 3px; border-radius: 6px; text-align: left; color: #1C1C1E;
         }
         QPushButton#crumb:hover { background: rgba(0,0,0,0.07); }
         QLabel#crumbSep { color: #7A7F89; }
@@ -1257,7 +1257,7 @@ class PathBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent); self._current_path=QDir.homePath()
         self._host=QWidget(self); self._hlay=QHBoxLayout(self._host)
-        self._hlay.setContentsMargins(4,0,4,0); self._hlay.setSpacing(max(0, ROW_SPACING-2))
+        self._hlay.setContentsMargins(4,0,4,0); self._hlay.setSpacing(0)
         self._scroll=QScrollArea(self); self._scroll.setWidget(self._host)
         self._scroll.setWidgetResizable(True); self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self._scroll.setFrameShape(QFrame.NoFrame)
