@@ -2440,18 +2440,113 @@ class ExplorerPane(QWidget):
         # 일반 모델 비동기 로딩 시작
         _ = self.source_model.setRootPath(path)
 
-
     def set_path(self, path:str, push_history:bool=True):
         with perf(f"set_path begin -> {path}"):
-            path=nice_path(path)
-            if not os.path.exists(path): QMessageBox.warning(self,"Path not found",path); return
-            cur=getattr(self.path_bar,"_current_path",None)
-            if push_history and cur and os.path.normcase(cur)!=os.path.normcase(path):
-                self._back_stack.append(cur); self._fwd_stack.clear()
-            self.path_bar.set_path(path); self._update_star_button()
+            path = nice_path(path)
+            if not os.path.exists(path):
+                QMessageBox.warning(self, "Path not found", path)
+                return
+
+            cur = getattr(self.path_bar, "_current_path", None)
+            if push_history and cur and os.path.normcase(cur) != os.path.normcase(path):
+                self._back_stack.append(cur)
+                self._fwd_stack.clear()
+
+            # 경로 표시/즐겨찾기 상태 반영
+            self.path_bar.set_path(path)
+            self._update_star_button()
+
+            # ── 파일시스템 워처 바인딩(자동 새로고침) ──
+            try:
+                self._bind_fs_watcher(path)
+            except Exception:
+                pass
+
+            # 빠른 모델로 즉시 표시 → 백그라운드로 QFileSystemModel 로딩
             self._use_fast_model(path)
             QTimer.singleShot(0, lambda: self._start_normal_model_loading(path))
-            QTimer.singleShot(50, self._update_pane_status); self._update_statusbar_selection()
+
+            # 상태바/선택정보 업데이트 예약
+            QTimer.singleShot(50, self._update_pane_status)
+            self._update_statusbar_selection()
+
+    def _bind_fs_watcher(self, folder_path: str):
+        """
+        현재 Pane이 보고 있는 폴더에 QFileSystemWatcher를 바인딩한다.
+        - 디렉터리 변경 이벤트를 디바운스(합치기)해서 과도한 새로고침을 방지
+        - 일반 모드(QFileSystemModel)에서는 모델이 스스로 갱신되므로 최소 작업만,
+          빠른 모드(FastDirModel/검색 모드)에서는 가벼운 재로딩을 수행
+        """
+        # 워처/디바운스 타이머 지연 생성
+        if not hasattr(self, "_fswatch"):
+            self._fswatch = QtCore.QFileSystemWatcher(self)
+            self._fswatch.directoryChanged.connect(self._on_fs_changed)
+            self._fswatch.fileChanged.connect(self._on_fs_changed)
+
+        if not hasattr(self, "_fswatch_debounce"):
+            self._fswatch_debounce = QTimer(self)
+            self._fswatch_debounce.setSingleShot(True)
+            self._fswatch_debounce.setInterval(600)  # ms: 변경 폭주 대비
+            self._fswatch_debounce.timeout.connect(self._apply_fs_change)
+
+        # 기존 감시 경로 제거 후 새 경로 등록
+        try:
+            dirs = list(self._fswatch.directories())
+            if dirs:
+                self._fswatch.removePaths(dirs)
+        except Exception:
+            pass
+
+        try:
+            # 존재하는 디렉터리만 감시
+            if os.path.isdir(folder_path):
+                self._fswatch.addPath(folder_path)
+        except Exception:
+            # 감시 실패는 기능상 치명적이지 않음(무시)
+            pass
+
+    def _on_fs_changed(self, _path: str):
+        """
+        워처 이벤트 수신 시 디바운스 타이머만 갱신한다.
+        (실제 갱신은 _apply_fs_change 에서 일괄 처리)
+        """
+        try:
+            if self._fswatch_debounce.isActive():
+                self._fswatch_debounce.stop()
+            self._fswatch_debounce.start()
+        except Exception:
+            pass
+
+    def _apply_fs_change(self):
+        """
+        디바운스 후 실제 반영 로직.
+        - 검색 모드: 필터가 있으면 재검색, 없으면 브라우즈 모드로 복귀
+        - 빠른 모드: 현재 경로를 빠르게 재열거
+        - 일반 모드(QFileSystemModel): 모델이 자동 반영 → 가시 영역 통계만 갱신
+        """
+        try:
+            # 검색 모드일 때
+            if getattr(self, "_search_mode", False):
+                pattern = self.filter_edit.text().strip()
+                if pattern:
+                    # 현재 필터 그대로 재검색
+                    self._apply_filter()
+                else:
+                    # 필터가 비어 있으면 브라우즈 모드로 복귀
+                    self._enter_browse_mode()
+                return
+
+            # 빠른 모드일 때는 빠르게 재열거
+            if getattr(self, "_using_fast", False):
+                self._use_fast_model(self.current_path())
+                return
+
+            # 일반 모드(QFileSystemModel)라면 자동으로 반영되므로 가시영역만 갱신
+            QTimer.singleShot(0, self._schedule_visible_stats)
+            self._update_pane_status()
+        except Exception:
+            pass
+
 
     @QtCore.pyqtSlot(str)
     def _on_directory_loaded(self, loaded_path:str):
