@@ -917,21 +917,41 @@ class FastDirModel(QAbstractTableModel):
             return self._icon_dir if r["is_dir"] else self._icon_file
 
         if role==Qt.DisplayRole:
-            if c==0: return r["name"]
-            if c==1: return "" if r["size"] is None else human_size(int(r["size"]))
-            if c==2: return r["type"]
+            if c==0:
+                return r["name"]
+            if c==1:
+                # ▶ 폴더의 크기는 표시하지 않음 (정렬용 값은 EditRole/SIZE_BYTES_ROLE에서 0으로 유지)
+                if r.get("is_dir", False): return ""
+                if r["size"] is None: return ""
+                return human_size(int(r["size"]))
+            if c==2:
+                return r["type"]
             if c==3:
                 if r["mtime"] is None: return ""
                 dt=QDateTime.fromSecsSinceEpoch(int(r["mtime"])); return dt.toString("yyyy-MM-dd HH:mm:ss")
+
         elif role==Qt.EditRole:
             if c==0: return r["name"]
-            if c==1: return 0 if r["size"] is None else int(r["size"])
-            if c==3: return QDateTime.fromSecsSinceEpoch(int(r["mtime"])) if r["mtime"] else QDateTime()
-            else: return r["type"]
-        elif role==Qt.ToolTipRole: return r["path"]
-        elif role==Qt.UserRole: return r["path"]
-        elif role==IS_DIR_ROLE: return r["is_dir"]
-        elif role==SIZE_BYTES_ROLE: return 0 if r["size"] is None else int(r["size"])
+            if c==1:
+                # ▶ 폴더는 0, 파일은 실제 바이트 (정렬에 사용)
+                if r.get("is_dir", False): return 0
+                return 0 if r["size"] is None else int(r["size"])
+            if c==3:
+                return QDateTime.fromSecsSinceEpoch(int(r["mtime"])) if r["mtime"] else QDateTime()
+            else:
+                return r["type"]
+
+        elif role==Qt.ToolTipRole:
+            return r["path"]
+        elif role==Qt.UserRole:
+            return r["path"]
+        elif role==IS_DIR_ROLE:
+            return r["is_dir"]
+        elif role==SIZE_BYTES_ROLE:
+            # ▶ 폴더는 0, 파일은 실제 바이트
+            if r.get("is_dir", False): return 0
+            return 0 if r["size"] is None else int(r["size"])
+
         return None
 
 class FastStatWorker(QtCore.QThread):
@@ -1340,11 +1360,21 @@ class PathBar(QWidget):
 class SearchResultModel(QStandardItemModel):
     def data(self, index, role=Qt.DisplayRole):
         if role==Qt.DisplayRole and index.column()==1:
+            # ▶ 검색 결과에서도 폴더 크기는 숨기기
+            try:
+                is_dir = bool(super().data(self.index(index.row(), 0), IS_DIR_ROLE))
+            except Exception:
+                is_dir = False
+            if is_dir:
+                return ""
             b=super().data(index, SIZE_BYTES_ROLE)
-            if b is None: b=super().data(index, Qt.EditRole)
-            if isinstance(b,(int,float)) and b: return human_size(int(b))
+            if b is None:
+                b=super().data(index, Qt.EditRole)
+            if isinstance(b,(int,float)) and b:
+                return human_size(int(b))
             return ""
         return super().data(index, role)
+
 
 # -------------------- Conflict Resolution Dialog --------------------
 class ConflictResolutionDialog(QDialog):
@@ -1623,7 +1653,8 @@ class ExplorerPane(QWidget):
         self.view.viewport().installEventFilter(self)
         self.view.viewport().installEventFilter(self)
         self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
-        self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        self._sel_model = None
+        self._hook_selection_model()
         self.filter_edit.returnPressed.connect(self._apply_filter); self.btn_search.clicked.connect(self._apply_filter)
         self.filter_edit.returnPressed.connect(self._apply_filter)
         self.btn_search.clicked.connect(self._apply_filter)
@@ -1654,6 +1685,30 @@ class ExplorerPane(QWidget):
 
         self._update_pane_status()
 
+    def _hook_selection_model(self):
+        """
+        뷰의 모델을 교체하면 selectionModel도 새로 생긴다.
+        항상 최신 selectionModel에 selectionChanged를 다시 연결한다.
+        """
+        try:
+            old = getattr(self, "_sel_model", None)
+            if old is not None:
+                try:
+                    old.selectionChanged.disconnect(self._on_selection_changed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._sel_model = self.view.selectionModel()
+        try:
+            if self._sel_model:
+                self._sel_model.selectionChanged.connect(self._on_selection_changed)
+        except Exception:
+            pass
+
+        # 현재 상태를 즉시 반영
+        QTimer.singleShot(0, self._update_pane_status)
 
     def _copy_path_shortcut(self, folder_only: bool = False):
         """
@@ -2079,6 +2134,7 @@ class ExplorerPane(QWidget):
         if self._enum_worker and self._enum_worker.isRunning(): self._enum_worker.cancel(); self._enum_worker.wait(100)
         self.stat_proxy.clear_cache(); self._using_fast=True
         self._fast_model.reset_dir(path); self.view.setModel(self._fast_proxy)
+
         header=self.view.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -2090,6 +2146,10 @@ class ExplorerPane(QWidget):
         if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
         header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
         self._apply_default_sort_size()
+
+        # ★ 선택모델 재연결
+        self._hook_selection_model()
+
         self._enum_worker=DirEnumWorker(path)
         self._enum_worker.batchReady.connect(self._fast_model.append_rows, QtCore.Qt.QueuedConnection)
         self._enum_worker.batchReady.connect(lambda _rows: self._schedule_visible_stats(), QtCore.Qt.QueuedConnection)
@@ -2098,10 +2158,50 @@ class ExplorerPane(QWidget):
         self._enum_worker.start()
         QTimer.singleShot(0, self._schedule_visible_stats)
 
+
     def _start_normal_model_loading(self, path:str):
-        self._pending_normal_root=path; t=QElapsedTimer(); t.start(); self._dirload_timer[path.lower()]=t
-        if ALWAYS_GENERIC_ICONS: self.source_model.setIconProvider(self._generic_icons)
+        """
+        큰 폴더 진입 시 UI 스톨을 줄이기 위해:
+          - 항목 수가 매우 많으면(Q&D 카운트) QFileSystemModel 로딩을 생략하고 fast 모델만 유지
+          - 중간 규모 이상이면 아이콘을 제너릭으로 강제하여 셸 아이콘 조회 비용 최소화
+        """
+        self._pending_normal_root = path
+        t = QElapsedTimer(); t.start()
+        self._dirload_timer[path.lower()] = t
+
+        # ── 폴더 크기 빠른 추정: threshold를 넘으면 즉시 중단
+        count = 0
+        is_huge = False
+        HUGE_THRESHOLD = 3000   # 이 이상이면 normal 모델 전환 생략
+        GENERIC_THRESHOLD = 1200  # 이 이상이면 제너릭 아이콘 강제
+        try:
+            with os.scandir(path) as it:
+                for _ in it:
+                    count += 1
+                    if count >= HUGE_THRESHOLD:
+                        is_huge = True
+                        break
+        except Exception:
+            # 읽기 실패해도 normal 로딩을 시도할 수 있게 둔다
+            pass
+
+        if is_huge:
+            # 매우 큰 폴더: fast 모델만 유지 (normal 전환 생략)
+            dlog(f"[perf] Skip QFileSystemModel for huge folder (>= {HUGE_THRESHOLD} items): {path}")
+            self._pending_normal_root = None
+            QTimer.singleShot(0, self._schedule_visible_stats)
+            return
+
+        # 중간 규모 이상: 제너릭 아이콘 강제(셸 아이콘 조회 비용 절감)
+        try:
+            if ALWAYS_GENERIC_ICONS or count >= GENERIC_THRESHOLD:
+                self.source_model.setIconProvider(self._generic_icons)
+        except Exception:
+            pass
+
+        # 일반 모델 비동기 로딩 시작
         _ = self.source_model.setRootPath(path)
+
 
     def set_path(self, path:str, push_history:bool=True):
         with perf(f"set_path begin -> {path}"):
@@ -2117,28 +2217,44 @@ class ExplorerPane(QWidget):
 
     @QtCore.pyqtSlot(str)
     def _on_directory_loaded(self, loaded_path:str):
-        key=loaded_path.lower()
+        key = loaded_path.lower()
         if key in self._dirload_timer:
-            ms=self._dirload_timer[key].elapsed(); dlog(f"directoryLoaded: '{loaded_path}' in {ms} ms")
-            self._dirload_timer.pop(key,None)
-        if (os.path.normcase(loaded_path)==os.path.normcase(self.current_path())
+            ms = self._dirload_timer[key].elapsed()
+            dlog(f"directoryLoaded: '{loaded_path}' in {ms} ms")
+            self._dirload_timer.pop(key, None)
+
+        # 큰 폴더로 판단해 normal 전환을 건너뛰었으면 아무 것도 하지 않음
+        if self._pending_normal_root is None:
+            return
+
+        if (os.path.normcase(loaded_path) == os.path.normcase(self.current_path())
             and self._using_fast and self._pending_normal_root
-            and os.path.normcase(self._pending_normal_root)==os.path.normcase(loaded_path)
+            and os.path.normcase(self._pending_normal_root) == os.path.normcase(loaded_path)
             and not self._search_mode):
             try:
-                src_idx=self.source_model.index(loaded_path)
+                src_idx = self.source_model.index(loaded_path)
                 self.view.setModel(self.proxy)
                 self.view.setRootIndex(self.proxy.mapFromSource(self.stat_proxy.mapFromSource(src_idx)))
-                self._using_fast=False; self._pending_normal_root=None
-                header=self.view.header()
-                for i in range(4): header.setSectionResizeMode(i, QHeaderView.Interactive)
-                header.resizeSection(1, 90); header.resizeSection(3, 150)
+                self._using_fast = False
+                self._pending_normal_root = None
+
+                # ★ 선택모델 재연결
+                self._hook_selection_model()
+
+                header = self.view.header()
+                for i in range(4):
+                    header.setSectionResizeMode(i, QHeaderView.Interactive)
+                header.resizeSection(1, 90)
+                header.resizeSection(3, 150)
                 self.view.setColumnHidden(2, True)
-                if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
-                header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
+                if not self.view.isSortingEnabled():
+                    self.view.setSortingEnabled(True)
+                header.setSortIndicator(0, Qt.AscendingOrder)
+                self.view.sortByColumn(0, Qt.AscendingOrder)
                 self._apply_default_sort_size()
                 QTimer.singleShot(0, self._schedule_visible_stats)
-            except Exception: pass
+            except Exception:
+                pass
 
     def current_path(self)->str: return self.path_bar._current_path or QDir.homePath()
     def go_back(self):
@@ -2331,7 +2447,7 @@ class ExplorerPane(QWidget):
 
     # ---- Search ----
     def _enter_browse_mode(self):
-        # 검색 모드가 아니어도 안전하게 워커/상태를 정리
+        # 검색 관련 상태/워커 정리
         try:
             if hasattr(self, "_cancel_search_worker"):
                 self._cancel_search_worker()
@@ -2343,17 +2459,18 @@ class ExplorerPane(QWidget):
         self._search_proxy = None
 
         if not self._search_mode:
-            # 이미 브라우즈 모드면 가시 영역 통계만 예약
             QTimer.singleShot(0, self._schedule_visible_stats)
             return
 
-        # 검색 모드 → 브라우즈 모드 전환
         self._search_mode = False
 
         if self._using_fast:
             self.view.setModel(self._fast_proxy)
         else:
             self.view.setModel(self.proxy)
+
+        # ★ 선택모델 재연결
+        self._hook_selection_model()
 
         path = self.current_path()
         if not self._using_fast:
@@ -2376,13 +2493,21 @@ class ExplorerPane(QWidget):
         self.view.sortByColumn(0, Qt.AscendingOrder)
         self._apply_default_sort_size()
 
-        # 화면 준비가 끝난 뒤 가시 영역 통계 수집
         QTimer.singleShot(0, self._schedule_visible_stats)
 
     def _enter_search_mode(self, model:QStandardItemModel):
-        self._cancel_fast_stat_worker(); self._using_fast=False; self._search_mode=True
-        self._search_model=model; self._search_proxy=FsSortProxy(self); self._search_proxy.setSourceModel(self._search_model)
-        self.view.setModel(self._search_proxy); self.view.setRootIndex(QtCore.QModelIndex())
+        self._cancel_fast_stat_worker()
+        self._using_fast=False
+        self._search_mode=True
+        self._search_model=model
+        self._search_proxy=FsSortProxy(self)
+        self._search_proxy.setSourceModel(self._search_model)
+        self.view.setModel(self._search_proxy)
+        self.view.setRootIndex(QtCore.QModelIndex())
+
+        # ★ 선택모델 재연결
+        self._hook_selection_model()
+
         header=self.view.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -2392,6 +2517,7 @@ class ExplorerPane(QWidget):
         header.resizeSection(1,90); header.resizeSection(2,150)
         if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
         header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
+
 
     def _apply_filter(self):
         pattern = self.filter_edit.text().strip()
@@ -2538,32 +2664,56 @@ class ExplorerPane(QWidget):
 
     def _on_selection_changed(self,*_): self._update_statusbar_selection(); self._update_pane_status()
     def _update_statusbar_selection(self):
-        sel=self._selected_paths(); count=len(sel); size=0
-        for p in sel:
-            if os.path.isdir(p):
-                for root,dirs,files in os.walk(p):
-                    for f in files:
-                        try: size+=os.path.getsize(os.path.join(root,f))
-                        except Exception: pass
-            else:
-                try: size+=os.path.getsize(p)
-                except Exception: pass
-        txt=f"Pane {self.pane_id} — selected {count} item(s)"; 
-        if count: txt+=f" / {human_size(size)}"
-        self.host.statusBar().showMessage(txt, 2000)
+        # 상태바는 가볍게: 디렉터리 재귀 계산 없이, 전부 파일일 때만 합계
+        sel = self._selected_paths()
+        cnt = len(sel)
+        msg = f"Pane {self.pane_id} — selected {cnt} item(s)"
+        if cnt and all(os.path.isfile(p) for p in sel):
+            total = 0
+            for p in sel:
+                try:
+                    total += os.path.getsize(p)
+                except Exception:
+                    pass
+            msg += f" / {human_size(total)}"
+        try:
+            self.host.statusBar().showMessage(msg, 2000)
+        except Exception:
+            pass
+
     def _drive_label(self, path:str)->str:
         if path.startswith("\\\\"):
             comps=[c for c in path.split("\\") if c]
             return f"\\\\{comps[0]}\\{comps[1]}" if len(comps)>=2 else "\\\\"
         drv,_=os.path.splitdrive(path); return drv if drv else os.sep
     def _update_pane_status(self):
-        cnt=len(self._selected_paths()); self.lbl_sel.setText(f"{cnt} selected" if cnt else "")
-        path=self.current_path()
+        sel = self._selected_paths()
+        cnt = len(sel)
+
+        # 좌측 상태 텍스트: 선택 개수, 전부 파일일 때는 총 용량
+        text = ""
+        if cnt:
+            only_files = all(os.path.isfile(p) for p in sel)
+            if only_files:
+                total = 0
+                for p in sel:
+                    try:
+                        total += os.path.getsize(p)
+                    except Exception:
+                        pass
+                text = f"{cnt} selected — {human_size(total)}"
+            else:
+                text = f"{cnt} selected"
+        self.lbl_sel.setText(text)
+
+        # 우측 드라이브 여유 공간
+        path = self.current_path()
         try:
-            total,used,free=shutil.disk_usage(path)
+            total, used, free = shutil.disk_usage(path)
             self.lbl_free.setText(f"{self._drive_label(path)} free {human_size(free)}")
         except Exception:
             self.lbl_free.setText("")
+
 
 # -------------------- Main Window --------------------
 class MultiExplorer(QMainWindow):
