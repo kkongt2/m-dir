@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 # -------------------- Perf / Debug --------------------
-DEBUG = True
+DEBUG = False
 def dlog(msg):
     if DEBUG:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -1612,14 +1612,17 @@ class ExplorerPane(QWidget):
             sc=QShortcut(QKeySequence(seq), self.view)
             sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
         add_sc("Backspace", self.go_back); add_sc("Alt+Left", self.go_back); add_sc("Alt+Right", self.go_forward)
-        add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit); add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
+        add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit)
+        add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
+        add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))  # ← 추가: Ctrl+F도 필터창으로
         add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current); add_sc("Ctrl+Z", self.undo_last)
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
         # 경로 복사 단축키
-        add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))  # 전체 경로
-        add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))   # 폴더까지만
+        add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
+        add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
+
 
         # 기본 정렬: 크기 내림차순 + 날짜 폭 확장
         self._apply_default_sort_size()
@@ -1852,42 +1855,46 @@ class ExplorerPane(QWidget):
         self._fast_stat_worker=None
 
     def _schedule_visible_stats(self):
-        # 검색 모드에서는 먼저 아이콘만 채움
+        """
+        화면에 보이는 영역에 대해서만 stat(크기/수정시각) 계산을 예약한다.
+        - 검색 모드: 검색 전용 경량 경로만 처리하고 즉시 반환 (프록시 혼동 방지)
+        - fast 모델: fast 프록시가 실제로 뷰에 연결돼 있을 때만 처리
+        - 일반 모델: self.proxy 가 뷰에 연결돼 있을 때만 처리
+        """
+        # 검색 모드에서는 검색 전용 경로만 갱신하고, 다른 프록시로의 mapToSource 호출을 피한다.
         if self._search_mode:
             self._fill_search_visible_icons()
+            return
 
+        # 현재 뷰에 연결된 모델을 확인 (프록시 불일치 시 아무 것도 하지 않음)
+        current_model = self.view.model()
         vp = self.view.viewport()
 
-        # -------- Fast 모델(빠른 나열)일 때: 자체 워커로 size/mtime 채움 --------
+        # ---- Fast(임시) 모델 경로 ----
         if self._using_fast:
-            rc = self._fast_model.rowCount()
+            if current_model is not self._fast_proxy:
+                return
+            rc = self._fast_proxy.rowCount()
             if rc <= 0:
                 return
-
             top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
             bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
-
-            if top_ix.isValid() and bot_ix.isValid():
-                proxy_start = max(0, top_ix.row() - 30)
-                proxy_end   = min(rc - 1, bot_ix.row() + 50)
-            else:
-                # 초기 진입 직후: 아직 화면 배치 전이면 선두 N개를 선제적으로 수집
-                proxy_start = 0
-                proxy_end   = min(rc - 1, 199)
+            proxy_start = top_ix.row() if top_ix.isValid() else 0
+            proxy_end   = bot_ix.row() if bot_ix.isValid() else min(proxy_start + 80, rc - 1)
+            proxy_start = max(0, proxy_start - 30)
+            proxy_end   = min(rc - 1, proxy_end + 50)
 
             to_rows = []
             for r in range(proxy_start, proxy_end + 1):
                 prx_ix = self._fast_proxy.index(r, 0)
-                src_ix = self._fast_proxy.mapToSource(prx_ix)
-                row    = src_ix.row()
+                src_ix = self._fast_proxy.mapToSource(prx_ix)  # -> FastDirModel 인덱스
+                row = src_ix.row()
                 if row is None or row < 0:
                     continue
-
-                # 파일 크기/시간 미수집이면 수집 대상으로 추가
                 if not self._fast_model.has_stat(row):
                     to_rows.append(row)
 
-                # 아이콘은 즉시 표시
+                # OS 아이콘 즉시 채우기
                 if not self._fast_model.has_icon(row):
                     p = self._fast_model.row_path(row)
                     if p:
@@ -1899,51 +1906,42 @@ class ExplorerPane(QWidget):
 
             if not to_rows:
                 return
-
             self._cancel_fast_stat_worker()
             root = self._fast_model.rootPath()
             w = FastStatWorker(self._fast_model, root, to_rows, self)
             w.statReady.connect(self._fast_model.apply_stat, Qt.QueuedConnection)
-            w.finishedCycle.connect(lambda: None)
             self._fast_stat_worker = w
             w.start()
             return
 
-        # -------- Normal 모델(QFileSystemModel + StatOverlayProxy)일 때 --------
+        # ---- 일반(정상) 모델 경로 ----
+        if current_model is not self.proxy:
+            return
+
         model = self.proxy
         stat_proxy = self.stat_proxy
         src_model = self.source_model
 
-        mrc = model.rowCount()
-        if mrc <= 0:
-            return
-
+        paths = []
         top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
         bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
-
-        if top_ix.isValid() and bot_ix.isValid():
-            start = max(0, top_ix.row() - 40)
-            end   = min(mrc - 1, bot_ix.row() + 80)
-        else:
-            # 초기 진입 직후: 화면 배치 전이면 선두 N개 경로를 선제적으로 요청
-            start = 0
-            end   = min(mrc - 1, 199)
-
+        start = top_ix.row() if top_ix.isValid() else 0
+        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, model.rowCount() - 1)
+        start = max(0, start - 40)
+        end = min(model.rowCount() - 1, end + 80)
         if end < start:
             end = start
 
-        paths = []
         for r in range(start, end + 1):
-            prx_ix = model.index(r, 0)
-            st_ix  = model.mapToSource(prx_ix)
-            src_ix = stat_proxy.mapToSource(st_ix)
+            prx_ix = model.index(r, 0)                 # -> FsSortProxy(self.proxy) 인덱스
+            st_ix  = model.mapToSource(prx_ix)         # -> StatOverlayProxy 인덱스
+            src_ix = stat_proxy.mapToSource(st_ix)     # -> QFileSystemModel 인덱스
             try:
                 p = src_model.filePath(src_ix)
             except Exception:
                 p = None
-            if not p:
-                continue
-            paths.append(p)
+            if p:
+                paths.append(p)
 
         if paths:
             stat_proxy.request_paths(paths)
