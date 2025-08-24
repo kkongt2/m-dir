@@ -1600,6 +1600,10 @@ class ExplorerPane(QWidget):
         self.view.viewport().installEventFilter(self)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.filter_edit.returnPressed.connect(self._apply_filter); self.btn_search.clicked.connect(self._apply_filter)
+        self.filter_edit.returnPressed.connect(self._apply_filter)
+        self.btn_search.clicked.connect(self._apply_filter)
+        self.filter_edit.textChanged.connect(self._on_filter_text_changed)  # ← 추가: x로 지우면 브라우즈로
+
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_visible_stats())
         except Exception: pass
 
@@ -1723,6 +1727,11 @@ class ExplorerPane(QWidget):
         # 마무리로 한 번 더 가시 영역 갱신
         QTimer.singleShot(0, self._fill_search_visible_icons)
 
+    def _on_filter_text_changed(self, text: str):
+        # 공백 제거 후 비어 있으면 검색 결과 표시를 중단하고 브라우즈로 복귀
+        if not (text or "").strip():
+            self._enter_browse_mode()
+
     @QtCore.pyqtSlot(str, object, object)
     def _apply_search_stat(self, path: str, size_val, mtime_val):
         # 가시 영역 stat 워커가 알려준 값을 검색 모델에 반영
@@ -1753,33 +1762,71 @@ class ExplorerPane(QWidget):
     def create_text_file(self):
         """
         현재 폴더에 임의(시간기반)의 새 .txt 파일을 생성합니다.
-        ShellNew 템플릿(.txt)이 등록되어 있으면 그것을 사용합니다.
+        생성 후 목록을 새로고침하고, 방금 만든 파일을 선택한 뒤
+        뷰로 포커스를 되돌려 단축키(Del, F2 등)가 곧바로 동작하도록 합니다.
         """
         base_dir = self.current_path()
         try:
-            # 시각 기반 고유 이름 (동일 초에 여러 번 눌러도 unique_dest_path로 충돌 방지)
             name = f"New Document {time.strftime('%Y%m%d-%H%M%S')}.txt"
-            _create_new_file_with_template(base_dir, name, ".txt")
-            self.hard_refresh()
-            self.host.flash_status("Text file created")
+            new_path = _create_new_file_with_template(base_dir, name, ".txt")
         except Exception as e:
             QMessageBox.critical(self, "Create failed", str(e))
+            return
 
+        # 목록 갱신
+        self.hard_refresh()
 
-        # Shortcuts
-        def add_sc(seq, slot):
-            sc=QShortcut(QKeySequence(seq), self.view)
-            sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
-        add_sc("Backspace", self.go_back); add_sc("Alt+Left", self.go_back); add_sc("Alt+Right", self.go_forward)
-        add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit); add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
-        add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current); add_sc("Ctrl+Z", self.undo_last)
-        add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
-        add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
+        # 방금 만든 파일을 선택하고 포커스를 뷰로 돌리는 시도
+        def _try_select():
+            # 단축키가 바로 동작하도록 뷰로 포커스 강제
+            try:
+                if self.view and not self.view.hasFocus():
+                    self.view.setFocus(Qt.ShortcutFocusReason)
+            except Exception:
+                pass
 
-        # 기본 정렬: 크기 내림차순 + 날짜 폭 확장
-        self._apply_default_sort_size()
+            # 검색 모드에선 선택 스킵 (탐색 모드에서만 선택)
+            if self._search_mode:
+                return
 
-        self._update_pane_status()
+            try:
+                if self._using_fast:
+                    # Fast 모델에서 경로로 행 찾기
+                    rows = self._fast_model.rowCount()
+                    for r in range(rows):
+                        rp = self._fast_model.row_path(r)
+                        if rp and os.path.normcase(rp) == os.path.normcase(new_path):
+                            prx_ix = self._fast_proxy.index(r, 0)
+                            sm = self.view.selectionModel()
+                            sm.clearSelection()
+                            sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+                            self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
+                            self.view.setCurrentIndex(prx_ix)
+                            return
+                else:
+                    # Normal 모델 경로 → 인덱스 매핑
+                    src_ix = self.source_model.index(new_path)
+                    if src_ix.isValid():
+                        st_ix = self.stat_proxy.mapFromSource(src_ix)
+                        prx_ix = self.proxy.mapFromSource(st_ix)
+                        sm = self.view.selectionModel()
+                        sm.clearSelection()
+                        sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+                        self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
+                        self.view.setCurrentIndex(prx_ix)
+                        return
+            except Exception:
+                pass
+
+        # fast→normal 전환 타이밍을 고려해 여러 번 재시도
+        for delay in (0, 80, 200, 450):
+            QTimer.singleShot(delay, _try_select)
+
+        try:
+            self.host.flash_status("Text file created")
+        except Exception:
+            pass
+
 
     def _apply_default_sort_size(self):
         v = self.view
@@ -2234,21 +2281,52 @@ class ExplorerPane(QWidget):
 
     # ---- Search ----
     def _enter_browse_mode(self):
-        if not self._search_mode: return
-        self._search_mode=False; self._search_model=None; self._search_proxy=None
-        if self._using_fast: self.view.setModel(self._fast_proxy)
-        else: self.view.setModel(self.proxy)
-        path=self.current_path()
+        # 검색 모드가 아니어도 안전하게 워커/상태를 정리
+        try:
+            if hasattr(self, "_cancel_search_worker"):
+                self._cancel_search_worker()
+        except Exception:
+            pass
+        self._search_item_by_path = {}
+        self._search_stats_done = set()
+        self._search_model = None
+        self._search_proxy = None
+
+        if not self._search_mode:
+            # 이미 브라우즈 모드면 가시 영역 통계만 예약
+            QTimer.singleShot(0, self._schedule_visible_stats)
+            return
+
+        # 검색 모드 → 브라우즈 모드 전환
+        self._search_mode = False
+
+        if self._using_fast:
+            self.view.setModel(self._fast_proxy)
+        else:
+            self.view.setModel(self.proxy)
+
+        path = self.current_path()
         if not self._using_fast:
-            src_idx=self.source_model.index(path)
-            self.view.setRootIndex(self.proxy.mapFromSource(self.stat_proxy.mapFromSource(src_idx)))
-        header=self.view.header(); header.setStretchLastSection(False)
-        for i in range(4): header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90); header.resizeSection(3, 150)
+            try:
+                src_idx = self.source_model.index(path)
+                self.view.setRootIndex(self.proxy.mapFromSource(self.stat_proxy.mapFromSource(src_idx)))
+            except Exception:
+                pass
+
+        header = self.view.header()
+        header.setStretchLastSection(False)
+        for i in range(4):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
+        header.resizeSection(1, 90)
+        header.resizeSection(3, 150)
         self.view.setColumnHidden(2, True)
-        if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
-        header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
+        if not self.view.isSortingEnabled():
+            self.view.setSortingEnabled(True)
+        header.setSortIndicator(0, Qt.AscendingOrder)
+        self.view.sortByColumn(0, Qt.AscendingOrder)
         self._apply_default_sort_size()
+
+        # 화면 준비가 끝난 뒤 가시 영역 통계 수집
         QTimer.singleShot(0, self._schedule_visible_stats)
 
     def _enter_search_mode(self, model:QStandardItemModel):
