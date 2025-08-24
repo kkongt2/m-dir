@@ -1598,6 +1598,8 @@ class ExplorerPane(QWidget):
         self.btn_refresh.clicked.connect(self.hard_refresh)  # 하드 리프레시
         self.view.activated.connect(self._on_double_click)
         self.view.viewport().installEventFilter(self)
+        self.view.viewport().installEventFilter(self)
+        self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.filter_edit.returnPressed.connect(self._apply_filter); self.btn_search.clicked.connect(self._apply_filter)
         self.filter_edit.returnPressed.connect(self._apply_filter)
@@ -1959,24 +1961,51 @@ class ExplorerPane(QWidget):
         v.header().setSortIndicator(col, Qt.AscendingOrder); v.sortByColumn(col, Qt.AscendingOrder)
 
     def eventFilter(self, obj, ev):
+        # ① 필터창에서 ESC → 내용 비우고 브라우즈 모드로 복귀(+ 포커스 목록으로)
+        if obj is self.filter_edit:
+            if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
+                try:
+                    if self.filter_edit.text():
+                        self.filter_edit.clear()  # x 버튼과 동일
+                except Exception:
+                    pass
+                self._enter_browse_mode()
+                try:
+                    self.view.setFocus(Qt.ShortcutFocusReason)
+                except Exception:
+                    pass
+                return True
+            return False
+
+        # ② 파일 목록 뷰의 viewport 처리 (기존 동작 유지)
         if obj is self.view.viewport():
-            if ev.type()==QEvent.MouseButtonPress:
-                if ev.button()==Qt.XButton1: self.go_back(); return True
-                if ev.button()==Qt.XButton2: self.go_forward(); return True
-            if ev.type()==QEvent.MouseMove:
-                ix=self.view.indexAt(ev.pos())
-                if ix!=self._last_hover_index: self._last_hover_index=ix
+            if ev.type() == QEvent.MouseButtonPress:
+                if ev.button() == Qt.XButton1:
+                    self.go_back()
+                    return True
+                if ev.button() == Qt.XButton2:
+                    self.go_forward()
+                    return True
+            if ev.type() == QEvent.MouseMove:
+                ix = self.view.indexAt(ev.pos())
+                if ix != self._last_hover_index:
+                    self._last_hover_index = ix
                 if ix.isValid():
-                    now_ms=time.perf_counter()*1000.0
-                    if (now_ms-self._tooltip_last_ms)>=self._tooltip_interval_ms:
-                        name=ix.sibling(ix.row(),0).data(Qt.DisplayRole); full=self._index_to_full_path(ix)
-                        tip=full if full else name
-                        if tip!=self._tooltip_last_text:
-                            QToolTip.showText(QCursor.pos(), tip, self.view); self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
+                    now_ms = time.perf_counter() * 1000.0
+                    if (now_ms - self._tooltip_last_ms) >= self._tooltip_interval_ms:
+                        name = ix.sibling(ix.row(), 0).data(Qt.DisplayRole)
+                        full = self._index_to_full_path(ix)
+                        tip = full if full else name
+                        if tip != self._tooltip_last_text:
+                            QToolTip.showText(QCursor.pos(), tip, self.view)
+                            self._tooltip_last_text = tip
+                            self._tooltip_last_ms = now_ms
             if ev.type() in (QEvent.Resize, QEvent.Show):
                 QTimer.singleShot(0, self._schedule_visible_stats)
             return False
+
         return super().eventFilter(obj, ev)
+
 
     def _open_cmd_here(self):
         path=self.current_path()
