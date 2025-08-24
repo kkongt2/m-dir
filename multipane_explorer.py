@@ -719,14 +719,56 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
     except Exception: verb=None
     if DEBUG: print(f"[ctx] chosen cmd_id={cmd_id} id_first={id_first} -> idx={idx}, verb='{verb or ''}'")
 
+    # ── 속성(프로퍼티) 처리: 환경별 3단 폴백 ─────────────────────────
     if verb and verb.lower() in ("properties","prop","property"):
         try:
             target = paths[0] if (paths and len(paths)>0) else work_dir
-            shell.SHObjectProperties(owner_hwnd, 0, _normalize_fs_path(target), None)
-            _post_null(owner_hwnd); return True
+            target = _normalize_fs_path(target)
+
+            ok = False
+            # 1) pywin32가 제공하는 SHObjectProperties가 있으면 사용
+            try:
+                fn = getattr(shell, "SHObjectProperties", None)
+                if callable(fn):
+                    # SHOP_FILEPATH = 0x00000002
+                    fn(int(owner_hwnd), 0x00000002, target, None)
+                    ok = True
+            except Exception as e:
+                if DEBUG: print("[ctx] SHObjectProperties (pywin32) failed:", e)
+
+            # 2) ShellExecuteEx + 'properties' verb
+            if not ok:
+                try:
+                    shell.ShellExecuteEx(
+                        hwnd=int(owner_hwnd),
+                        fMask=shellcon.SEE_MASK_INVOKEIDLIST,
+                        lpVerb='properties',
+                        lpFile=target,
+                        nShow=win32con.SW_SHOW
+                    )
+                    ok = True
+                except Exception as e:
+                    if DEBUG: print("[ctx] ShellExecuteEx(properties) failed:", e)
+
+            # 3) ctypes로 SHObjectPropertiesW 직접 호출 (확실한 최후 폴백)
+            if not ok:
+                try:
+                    SHOP_FILEPATH = 0x00000002
+                    shell32 = ctypes.windll.shell32
+                    res = shell32.SHObjectProperties(ctypes.c_void_p(int(owner_hwnd)),
+                                                     ctypes.c_uint(SHOP_FILEPATH),
+                                                     ctypes.c_wchar_p(target),
+                                                     ctypes.c_wchar_p(None))
+                    ok = bool(res)
+                except Exception as e:
+                    if DEBUG: print("[ctx] SHObjectProperties(ctypes) failed:", e)
+
+            if ok:
+                _post_null(owner_hwnd)
+                return True
         except Exception as e:
-            if DEBUG: print("[ctx] SHObjectProperties failed:", e)
-            return False
+            if DEBUG: print("[ctx] open properties failed:", e)
+        return False
 
     try:
         pici_int=(0,int(owner_hwnd),int(idx),None,None,win32con.SW_SHOWNORMAL,0,0)
