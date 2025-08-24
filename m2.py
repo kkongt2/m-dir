@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 # -------------------- Perf / Debug --------------------
-DEBUG = False
+DEBUG = True
 def dlog(msg):
     if DEBUG:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -1267,7 +1267,16 @@ class PathBar(QWidget):
         self._edit.returnPressed.connect(self._on_edit_return)
         wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0); wrap.addWidget(self._scroll,1); wrap.addWidget(self._edit,1)
         self._host.installEventFilter(self); self._edit.installEventFilter(self)
+
+        # 수평 스크롤바가 변할 때마다 항상 오른쪽으로 고정
+        try:
+            self._hbar = self._scroll.horizontalScrollBar()
+            self._hbar.rangeChanged.connect(lambda _min,_max: QTimer.singleShot(0, self._pin_to_right))
+        except Exception:
+            self._hbar = None
+
         self.set_path(self._current_path)
+
     def sizeHint(self): return QSize(200, UI_H)
     def minimumSizeHint(self): return QSize(100, UI_H)
     def eventFilter(self, obj, ev):
@@ -1311,7 +1320,21 @@ class PathBar(QWidget):
             if i < len(parts)-1:
                 s=QLabel("›", self); s.setObjectName("crumbSep"); s.setContentsMargins(0,0,0,0); self._hlay.addWidget(s)
         self._hlay.addStretch(1)
-        QTimer.singleShot(0, lambda: self._scroll.horizontalScrollBar().setValue(self._scroll.horizontalScrollBar().maximum()))
+
+        # 빌드 직후에도 항상 오른쪽(가장 하위 폴더)이 보이도록 고정
+        QTimer.singleShot(0, self._pin_to_right)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # 리사이즈 때도 우측 고정 유지
+        QTimer.singleShot(0, self._pin_to_right)
+
+    def _pin_to_right(self):
+        try:
+            if hasattr(self, "_hbar") and self._hbar:
+                self._hbar.setValue(self._hbar.maximum())
+        except Exception:
+            pass
 
 # -------------------- SearchResultModel --------------------
 class SearchResultModel(QStandardItemModel):
