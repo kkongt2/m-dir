@@ -2894,18 +2894,198 @@ class MultiExplorer(QMainWindow):
         s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
 
     def build_panes(self, n:int, start_paths):
-        cols={4:2,6:3,8:4}.get(n,3); gap=GRID_GAPS.get(cols,3); margin_lr=GRID_MARG_LR.get(cols,6)
-        self.grid.setSpacing(gap); self.grid.setContentsMargins(margin_lr,2,margin_lr,4)
-        while self.grid.count():
-            it=self.grid.takeAt(0); w=it.widget()
-            if w and isinstance(w, ExplorerPane): w.setParent(None)
-        self.panes.clear()
+        # 현재 최대화 여부 기억
+        was_max = self.isMaximized()
+
+        cols = {4: 2, 6: 3, 8: 4}.get(n, 3)
+        gap = GRID_GAPS.get(cols, 3)
+        margin_lr = GRID_MARG_LR.get(cols, 6)
+
+        vmain = self.centralWidget().layout() if self.centralWidget() else None
+
+        # ── 기존 그리드/페인 완전 정리 ─────────────────────────────────
+        if hasattr(self, "grid") and isinstance(self.grid, QGridLayout):
+            while self.grid.count():
+                it = self.grid.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.setParent(None)
+            if vmain:
+                try:
+                    vmain.removeItem(self.grid)
+                except Exception:
+                    pass
+            try:
+                self.grid.setParent(None)
+            except Exception:
+                pass
+
+        # ── 새 그리드 생성/부착 ─────────────────────────────────────────
+        self.grid = QGridLayout()
+        self.grid.setSpacing(gap)
+        self.grid.setContentsMargins(margin_lr, 2, margin_lr, 4)
+        if vmain:
+            vmain.addLayout(self.grid, 1)
+
+        # 새 상태 초기화
+        self.panes = []
+        self.setUpdatesEnabled(False)
+
+        # 열/행 스트레치/최소치 초기화
+        for c in range(cols):
+            self.grid.setColumnStretch(c, 1)
+            self.grid.setColumnMinimumWidth(c, 0)
+        rows = (n + cols - 1) // cols
+        for r in range(rows):
+            self.grid.setRowStretch(r, 1)
+            self.grid.setRowMinimumHeight(r, 0)
+
+        # ── 새 페인 생성/배치 ──────────────────────────────────────────
         for i in range(n):
-            spath=start_paths[i] if i<len(start_paths) else None
-            pane=ExplorerPane(None, start_path=spath, pane_id=i+1, host_main=self)
-            self.panes.append(pane); r=i//cols; c=i%cols; self.grid.addWidget(pane, r, c)
+            spath = start_paths[i] if i < len(start_paths) else None
+            pane = ExplorerPane(None, start_path=spath, pane_id=i + 1, host_main=self)
+            self.panes.append(pane)
+            rr = i // cols
+            cc = i % cols
+            self.grid.addWidget(pane, rr, cc)
+
+        self.setUpdatesEnabled(True)
+
         self.setWindowTitle(f"Multi-Pane File Explorer — {n} panes")
         self._update_theme_dependent_icons()
+
+        # 레이아웃/지오메트리 강제 재계산
+        if was_max:
+            # 최대화 상태였다면: 최대화 해제 → 레이아웃 킥 → 다시 최대화 (깜빡임 최소화 위해 타이머 사용)
+            QTimer.singleShot(0, self._unmax_then_remax)
+        else:
+            QTimer.singleShot(0, self._kick_layout)
+
+    def _unmax_then_remax(self):
+        try:
+            # 최대화 상태가 아니면 일반 킥만
+            if not self.isMaximized():
+                self._kick_layout()
+                return
+
+            # 1) 최대화 해제 (창 크기 변경 경고 피하기 위해 showNormal 사용)
+            self.showNormal()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
+            QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+
+            # 2) 레이아웃 재계산
+            self._kick_layout()
+
+            # 3) 다시 최대화
+            self.showMaximized()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
+            QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+
+            # 4) 마지막으로 한 번 더 레이아웃 킥
+            self._kick_layout()
+        except Exception:
+            pass
+
+    def _kick_layout(self):
+        """
+        레이아웃을 재계산하되, '최대화가 아닌 상태'에서는 현재 창 크기/위치를
+        절대 변경하지 않는다. (전환 시 창이 커지는 문제 방지)
+        """
+        try:
+            cw = self.centralWidget()
+            lay = cw.layout() if cw else None
+
+            keep_geom = not self.isMaximized()   # 최대화가 아니라면 현재 지오메트리 고정
+            if keep_geom:
+                g = self.geometry()
+                # 현재 크기로 일시 고정(레이아웃 중 창이 커지는 것 방지)
+                old_min = self.minimumSize()
+                old_max = self.maximumSize()
+                self.setMinimumSize(g.size())
+                self.setMaximumSize(g.size())
+
+            # ── 레이아웃 강제 패스 (창 크기 변경 없이) ─────────────────
+            if lay:
+                lay.invalidate()
+                lay.activate()
+
+            if hasattr(self, "grid"):
+                self.grid.invalidate()
+                self.grid.update()
+
+            # 각 Pane 내부 위젯 갱신 (확장 정책만 보정: 창 크기에는 영향 없음)
+            for p in getattr(self, "panes", []):
+                try:
+                    p.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                    if hasattr(p, "view") and p.view:
+                        p.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                        p.view.updateGeometries()
+                        p.view.doItemsLayout()
+                        p.view.viewport().update()
+                    # 경로바는 항상 우측(가장 하위 폴더) 고정
+                    if hasattr(p, "path_bar") and hasattr(p.path_bar, "_pin_to_right"):
+                        p.path_bar._pin_to_right()
+                except Exception:
+                    pass
+
+            # 레이아웃 요청 처리(사용자 입력 제외)
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
+            QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+
+            if lay:
+                lay.activate()
+            if hasattr(self, "grid"):
+                self.grid.invalidate()
+            self.repaint()
+
+        except Exception:
+            pass
+        finally:
+            # ── 잠금 해제 & 지오메트리 복원 ─────────────────────────────
+            try:
+                if keep_geom:
+                    # 원래 min/max 복원
+                    try:
+                        self.setMinimumSize(old_min)
+                        self.setMaximumSize(old_max)
+                    except Exception:
+                        # 실패 시 일반 복원값으로
+                        self.setMinimumSize(QtCore.QSize(0, 0))
+                        self.setMaximumSize(QtCore.QSize(16777215, 16777215))
+                    # 레이아웃 중 변경됐으면 원 지오메트리로 되돌림
+                    if self.geometry() != g:
+                        self.setGeometry(g)
+            except Exception:
+                pass
+
+
+    def _safe_restore_geometry(self, ba: QtCore.QByteArray):
+        """
+        저장된 지오메트리를 복원하되, 현재 모니터의 사용 가능 영역을 넘지 않도록 클램프한다.
+        """
+        try:
+            ok = self.restoreGeometry(ba)
+            if not ok:
+                return
+
+            # 현재 화면의 사용 가능 영역
+            win = self.windowHandle()
+            screen = (win.screen().availableGeometry() if win and win.screen()
+                      else QApplication.primaryScreen().availableGeometry())
+            sg = screen
+
+            g = self.geometry()
+            new_w = min(max(600, g.width()), sg.width())
+            new_h = min(max(350, g.height()), sg.height())
+            new_x = min(max(sg.left(), g.x()), sg.right() - new_w)
+            new_y = min(max(sg.top(),  g.y()), sg.bottom() - new_h)
+
+            # 창 크기/위치가 화면을 벗어나면 보정
+            if (new_w != g.width()) or (new_h != g.height()) or (new_x != g.x()) or (new_y != g.y()):
+                self.setGeometry(new_x, new_y, new_w, new_h)
+        except Exception:
+            pass
+
 
     def _current_paths(self): return [p.current_path() for p in self.panes]
     def set_clipboard(self,payload:dict): self._clipboard=payload
