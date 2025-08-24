@@ -2226,34 +2226,133 @@ class ExplorerPane(QWidget):
             st_ix=self.proxy.mapToSource(index); src_ix=self.stat_proxy.mapToSource(st_ix)
             return self.source_model.filePath(src_ix)
 
-    def _use_fast_model(self, path:str):
+    def _use_fast_model(self, path: str):
+        """
+        FastDirModel을 사용해 먼저 빠르게 목록을 보여주고,
+        디렉터리 열거가 끝난 뒤 한 번만 정렬/리페인트/아이콘 채우기를 수행하여
+        대용량(수천 개+) 폴더 진입 속도를 높인다.
+        ※ 아이콘 채우기는 열거 중에는 일시 비활성화하고, 끝난 뒤 복구한다.
+        """
+        # 진행 중인 워커/캐시 정리
         self._cancel_fast_stat_worker()
-        if self._enum_worker and self._enum_worker.isRunning(): self._enum_worker.cancel(); self._enum_worker.wait(100)
-        self.stat_proxy.clear_cache(); self._using_fast=True
-        self._fast_model.reset_dir(path); self.view.setModel(self._fast_proxy)
+        if self._enum_worker and self._enum_worker.isRunning():
+            self._enum_worker.cancel()
+            self._enum_worker.wait(100)
+        try:
+            self.stat_proxy.clear_cache()
+        except Exception:
+            pass
 
-        header=self.view.header()
+        # Fast 모델로 전환
+        self._using_fast = True
+        self._fast_model.reset_dir(path)
+        self.view.setModel(self._fast_proxy)
+
+        # 헤더 구성 (정렬은 '끝난 뒤'에만 적용하여 병목 제거)
+        header = self.view.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.resizeSection(1, 90); header.resizeSection(3, 150)
+        header.resizeSection(1, 90)
+        header.resizeSection(3, 150)
         self.view.setColumnHidden(2, True)
-        if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
-        header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
-        self._apply_default_sort_size()
 
-        # ★ 선택모델 재연결
-        self._hook_selection_model()
+        # ── 아이콘 채우기 임시 비활성화(열거 중만) ─────────────────────
+        #   Fast 모드에서 가시 영역 통계 계산 시 OS 아이콘을 요청하면
+        #   큰 지연이 발생할 수 있어, 열거가 끝날 때까지 무시합니다.
+        _orig_apply_icon = getattr(self._fast_model, "apply_icon", None)
 
-        self._enum_worker=DirEnumWorker(path)
-        self._enum_worker.batchReady.connect(self._fast_model.append_rows, QtCore.Qt.QueuedConnection)
-        self._enum_worker.batchReady.connect(lambda _rows: self._schedule_visible_stats(), QtCore.Qt.QueuedConnection)
-        self._enum_worker.error.connect(lambda msg: self.host.statusBar().showMessage(f"List error: {msg}", 4000))
-        self._enum_worker.finished.connect(lambda: self._schedule_visible_stats())
-        self._enum_worker.start()
+        def _noop_apply_icon(_row, _icon):
+            # 열거 중에는 실제 아이콘을 적용하지 않음
+            return None
+
+        try:
+            self._fast_model.apply_icon = _noop_apply_icon
+        except Exception:
+            _orig_apply_icon = None  # 복구 불가해도 동작에는 지장 없음
+
+        # 열거 중에는 재정렬이 반복되지 않도록 정렬/업데이트를 잠시 끔
+        was_sorting = self.view.isSortingEnabled()
+        if was_sorting:
+            self.view.setSortingEnabled(False)
+        self.view.setUpdatesEnabled(False)
+
+        self._fast_batch_counter = 0
+        self._enum_worker = DirEnumWorker(path)
+
+        # 배치 도착: 모델에 추가 + 과도한 갱신은 스로틀링
+        def _on_batch(rows):
+            self._fast_model.append_rows(rows)
+            self._fast_batch_counter += 1
+            if (self._fast_batch_counter % 6) == 0:
+                QTimer.singleShot(0, self._schedule_visible_stats)
+
+        self._enum_worker.batchReady.connect(_on_batch, QtCore.Qt.QueuedConnection)
+        self._enum_worker.error.connect(
+            lambda msg: self.host.statusBar().showMessage(f"List error: {msg}", 4000)
+        )
+
+        # 열거 종료: 정렬/업데이트 복구 + 아이콘 채우기 복구 후 즉시 가시영역 아이콘/통계를 채움
+        def _on_finished():
+            try:
+                # 화면 업데이트 재개
+                self.view.setUpdatesEnabled(True)
+
+                # 기본 정렬(크기 내림차순) 한 번만 적용
+                self._apply_default_sort_size()
+                self.view.setSortingEnabled(True)
+
+                # 아이콘 apply 함수 원복 → 이제 가시영역 아이콘을 실제로 채움
+                if _orig_apply_icon is not None:
+                    try:
+                        self._fast_model.apply_icon = _orig_apply_icon
+                    except Exception:
+                        pass
+
+                # 가시 영역 통계/아이콘을 즉시 2회 스케줄(첫 패스 후 아이콘 캐시 안정화용)
+                QTimer.singleShot(0, self._schedule_visible_stats)
+                QTimer.singleShot(80, self._schedule_visible_stats)
+            finally:
+                # 사용자가 정렬을 꺼두고 썼다면 원 상태 유지
+                if not was_sorting:
+                    self.view.setSortingEnabled(False)
+
+        self._enum_worker.finished.connect(_on_finished)
+
+        # 초기 화면 빈칸 방지를 위해 첫 패스 예약
         QTimer.singleShot(0, self._schedule_visible_stats)
+
+        # 백그라운드 열거 시작
+        self._enum_worker.start()
+
+
+        # 열거 종료: 이제 한 번만 정렬/리페인트/상태 업데이트
+        def _on_finished():
+            try:
+                # 리스트 추가가 끝났으니 업데이트를 다시 켭니다.
+                self.view.setUpdatesEnabled(True)
+
+                # 기본 정렬(크기 내림차순) 적용 — 이제 한 번만 비용 지불
+                self._apply_default_sort_size()
+                self.view.setSortingEnabled(True)
+
+                # 최초 가시영역 통계 계산
+                QTimer.singleShot(0, self._schedule_visible_stats)
+            finally:
+                # 정렬이 꺼져 있었던 경우만 되돌립니다.
+                if not was_sorting:
+                    # 사용자가 정렬을 끄고 사용 중이었다면 유지
+                    self.view.setSortingEnabled(False)
+
+        self._enum_worker.finished.connect(_on_finished)
+
+        # 시작 직후 한 번 가시영역 통계를 예약(초기 화면 빈칸 방지)
+        QTimer.singleShot(0, self._schedule_visible_stats)
+
+        # 백그라운드 열거 시작
+        self._enum_worker.start()
 
 
     def _start_normal_model_loading(self, path:str):
