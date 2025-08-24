@@ -150,6 +150,65 @@ def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
         if DEBUG: print("[delete] fallback remove failed:", e)
         return False
 
+def icon_bookmark_edit(theme: str):
+    """
+    '북마크 편집' 아이콘:
+      - 큼직한 노란 별(⭐)
+      - 우하단에 연필(편집) 오버레이
+    """
+    def paint(p: QPainter, w, h):
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # ── 별(북마크)
+        cx, cy = w/2 - 2, h/2 - 1
+        r_outer = min(w, h) * 0.40
+        r_inner = r_outer * 0.44
+        pts = []
+        for i in range(10):
+            ang = -math.pi/2 + i * (math.pi / 5.0)
+            r = r_outer if (i % 2 == 0) else r_inner
+            pts.append(QtCore.QPointF(cx + math.cos(ang) * r, cy + math.sin(ang) * r))
+        star = QPolygonF(pts)
+
+        fill = QColor(255, 210, 60) if theme == "dark" else QColor(255, 190, 0)
+        stroke = QColor(160, 120, 0) if theme == "dark" else QColor(150, 110, 0)
+        p.setPen(QPen(stroke, 1.6))
+        p.setBrush(QBrush(fill))
+        p.drawPolygon(star)
+
+        # ── 연필(편집) 오버레이
+        p.save()
+        body = QColor(100, 180, 255) if theme == "dark" else QColor(40, 120, 220)
+        tip  = QColor(240, 200, 80)
+
+        # 우하단에 기울여 배치
+        p.translate(w * 0.64, h * 0.68)
+        p.rotate(-25)
+
+        # 연필 몸통(정수 좌표 OK)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(body))
+        p.drawRect(-5, -2, 12, 4)
+
+        # 연필 촉(삼각형)
+        p.setBrush(QBrush(tip))
+        tri = QPolygonF([
+            QtCore.QPointF(7, -2),
+            QtCore.QPointF(7,  2),
+            QtCore.QPointF(10, 0)
+        ])
+        p.drawPolygon(tri)
+
+        # 지우개 부분 (부동소수 → QRectF 사용)
+        eraser = QColor(230, 230, 240) if theme == "dark" else QColor(250, 250, 255)
+        p.setBrush(QBrush(eraser))
+        p.drawRect(QtCore.QRectF(-6.5, -2.2, 2.6, 4.4))
+
+        p.restore()
+
+    return _make_icon(22, 22, paint)
+
+
 # -------------------- Background File Ops (with per-file conflicts) --------------------
 class FileOpWorker(QtCore.QThread):
     progress = pyqtSignal(int)
@@ -452,6 +511,44 @@ def icon_theme_toggle(theme: str):
             p.setBrush(QBrush(QColor(240,240,250)))
             p.drawEllipse(QtCore.QPointF(cx + r*0.45, cy - r*0.2), r*0.9, r*0.9)
     return _make_icon(22, 22, paint)
+
+def icon_session(theme: str):
+    """
+    '세션' 아이콘:
+      - 겹쳐진 3장의 탭(여러 창/상태를 저장하는 느낌)
+      - 우측하단에 작은 별로 '저장된 세션' 강조
+    """
+    def paint(p: QPainter, w, h):
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # 색 설정
+        line = QColor(190, 195, 210) if theme == "dark" else QColor(90, 100, 120)
+        fill = QColor(60, 66, 80) if theme == "dark" else QColor(245, 247, 250)
+        tab  = QColor(100, 150, 255) if theme == "dark" else QColor(80, 120, 230)
+        star_fill  = QColor(255, 210, 60)
+        star_edge  = QColor(160, 120, 0)
+
+        # 겹친 탭 3장
+        p.setPen(QPen(line, 1.3))
+        p.setBrush(QBrush(fill))
+        p.drawRoundedRect(QtCore.QRectF(3.0, 6.5, 12.5, 9.0), 2.5, 2.5)
+        p.drawRoundedRect(QtCore.QRectF(5.0, 5.0, 12.5, 9.0), 2.5, 2.5)
+        p.setBrush(QBrush(tab))
+        p.drawRoundedRect(QtCore.QRectF(7.0, 3.5, 12.5, 9.0), 2.5, 2.5)
+
+        # 우하단 별(작지만 선명하게)
+        cx, cy, r = w - 6.0, h - 6.0, 3.2
+        pts = []
+        for i in range(10):
+            ang = -math.pi/2 + i * (math.pi/5.0)
+            rad = r if (i % 2 == 0) else r * 0.44
+            pts.append(QtCore.QPointF(cx + math.cos(ang)*rad, cy + math.sin(ang)*rad))
+        p.setPen(QPen(star_edge, 1.0))
+        p.setBrush(QBrush(star_fill))
+        p.drawPolygon(QPolygonF(pts))
+
+    return _make_icon(22, 22, paint)
+
 
 def icon_star(checked: bool, theme: str):
     def paint(p: QPainter, w, h):
@@ -2773,16 +2870,14 @@ class MultiExplorer(QMainWindow):
         if idx>=len(states) or idx<0: idx=0; self._layout_idx=0
         state=states[idx]; self.btn_layout.setIcon(icon_grid_layout(state, self.theme))
     def _update_theme_icon(self):
-        if hasattr(self,"btn_theme") and self.btn_theme: self.btn_theme.setIcon(icon_theme_toggle(self.theme))
-        if hasattr(self,"btn_bm_edit") and self.btn_bm_edit: self.btn_bm_edit.setIcon(icon_edit(self.theme))
-        if hasattr(self,"btn_about") and self.btn_about: self.btn_about.setIcon(icon_info(self.theme))
-        # Session 버튼은 기본 스타일 아이콘 사용 (저장/불러오기 의미)
-        try:
-            if hasattr(self, "btn_session") and self.btn_session:
-                # 다크/라이트 모두 잘 보이는 시스템 아이콘 조합
-                self.btn_session.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        except Exception:
-            pass
+        if hasattr(self, "btn_theme") and self.btn_theme:
+            self.btn_theme.setIcon(icon_theme_toggle(self.theme))
+        if hasattr(self, "btn_bm_edit") and self.btn_bm_edit:
+            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))  # 북마크 편집(별+연필)
+        if hasattr(self, "btn_session") and self.btn_session:
+            self.btn_session.setIcon(icon_session(self.theme))        # ★ 세션 아이콘 지정
+        if hasattr(self, "btn_about") and self.btn_about:
+            self.btn_about.setIcon(icon_info(self.theme))
 
     def _update_theme_dependent_icons(self):
         self._update_layout_icon(); self._update_theme_icon()
