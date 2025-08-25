@@ -408,13 +408,44 @@ def apply_dark_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #2D3550; }
 
+        /* 기본 crumb 버튼 */
         QPushButton#crumb {
             background: rgba(255,255,255,0.05);
             border: 1px solid #2B2E34;
-            padding: 0 3px; border-radius: 6px; text-align: left; color: #E6E9EE;
+            padding: 0 6px; border-radius: 6px; text-align: left; color: #E6E9EE;
         }
         QPushButton#crumb:hover { background: rgba(255,255,255,0.09); }
         QLabel#crumbSep { color: #7F8796; }
+
+        /* breadcrumb 바(스크롤 영역) 자체 외곽선/배경 제거 */
+        QScrollArea#crumbScroll { border: 0px solid transparent; }
+        QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
+        QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
+
+        /* 활성 Pane일 때: crumb 하나하나만 은은한 파랑 배경 */
+        QWidget#paneRoot[active="true"] QPushButton#crumb {
+            background: rgba(94,155,255,0.16);
+            border-color: rgba(94,155,255,0.40);
+        }
+        QWidget#paneRoot[active="true"] QPushButton#crumb:hover {
+            background: rgba(94,155,255,0.22);
+        }
+
+        /* Pane 전체 하이라이트(유지) */
+        QWidget#paneRoot {
+            border: 1px solid transparent;
+            border-radius: 10px;
+        }
+        QWidget#paneRoot[active="true"] {
+            border: 1px solid #5E9BFF;
+            background: rgba(94, 155, 255, 0.06);
+        }
+        QWidget#paneRoot[active="true"] QTreeView { border-color: rgba(94,155,255,0.45); }
+        QWidget#paneRoot[active="true"] QLineEdit { border: 1px solid rgba(94,155,255,0.35); }
+        QWidget#paneRoot[active="true"] QLineEdit:focus { border: 1px solid #5E9BFF; }
+        QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton {
+            border-color: rgba(94,155,255,0.25);
+        }
 
         /* 메시지 박스: 흰 배경/검정 글씨 */
         QMessageBox { background: #FFFFFF; color: #000000; }
@@ -465,14 +496,46 @@ def apply_light_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #EAEFFF; }
 
+        /* 기본 crumb 버튼 */
         QPushButton#crumb {
             background: rgba(0,0,0,0.04);
             border: 1px solid #E5E8EE;
-            padding: 0 3px; border-radius: 6px; text-align: left; color: #1C1C1E;
+            padding: 0 6px; border-radius: 6px; text-align: left; color: #1C1C1E;
         }
         QPushButton#crumb:hover { background: rgba(0,0,0,0.07); }
         QLabel#crumbSep { color: #7A7F89; }
+
+        /* breadcrumb 바(스크롤 영역) 자체 외곽선/배경 제거 */
+        QScrollArea#crumbScroll { border: 0px solid transparent; }
+        QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
+        QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
+
+        /* 활성 Pane일 때: crumb 하나하나만 은은한 파랑 배경 */
+        QWidget#paneRoot[active="true"] QPushButton#crumb {
+            background: rgba(64,128,255,0.12);
+            border-color: rgba(64,128,255,0.40);
+        }
+        QWidget#paneRoot[active="true"] QPushButton#crumb:hover {
+            background: rgba(64,128,255,0.18);
+        }
+
+        /* Pane 전체 하이라이트(유지) */
+        QWidget#paneRoot {
+            border: 1px solid transparent;
+            border-radius: 10px;
+        }
+        QWidget#paneRoot[active="true"] {
+            border: 1px solid #5E9BFF;
+            background: rgba(64, 128, 255, 0.06);
+        }
+        QWidget#paneRoot[active="true"] QTreeView { border-color: rgba(64,128,255,0.40); }
+        QWidget#paneRoot[active="true"] QLineEdit { border: 1px solid rgba(64,128,255,0.35); }
+        QWidget#paneRoot[active="true"] QLineEdit:focus { border: 1px solid #5E9BFF; }
+        QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton {
+            border-color: rgba(64,128,255,0.25);
+        }
     """)
+
 
 # -------------------- Vector Icons --------------------
 def _make_icon(w, h, painter_fn):
@@ -1415,26 +1478,52 @@ class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
     def __init__(self, parent=None):
         super().__init__(parent); self._current_path=QDir.homePath()
+        self.setObjectName("pathbar")
+
         self._host=QWidget(self); self._hlay=QHBoxLayout(self._host)
-        self._hlay.setContentsMargins(4,0,4,0); self._hlay.setSpacing(0)
-        self._scroll=QScrollArea(self); self._scroll.setWidget(self._host)
+        self._hlay.setContentsMargins(4,0,4,0); self._hlay.setSpacing(max(0, ROW_SPACING-2))
+
+        self._scroll=QScrollArea(self); self._scroll.setObjectName("crumbScroll")
+        self._scroll.setWidget(self._host)
         self._scroll.setWidgetResizable(True); self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setViewportMargins(0,0,0,0); self._scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._scroll.setFixedHeight(UI_H); self.setFixedHeight(UI_H)
+
+        # ── viewport에도 이름/배경 허용 속성을 부여(스타일 대상) ──
+        try:
+            vp = self._scroll.viewport()
+            vp.setObjectName("crumbViewport")
+            vp.setAttribute(Qt.WA_StyledBackground, True)
+        except Exception:
+            pass
+
+        # 활성 표시 초기값
+        self._scroll.setProperty("active", False)
+
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
+
         wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0); wrap.addWidget(self._scroll,1); wrap.addWidget(self._edit,1)
+
         self._host.installEventFilter(self); self._edit.installEventFilter(self)
-
-        # 수평 스크롤바가 변할 때마다 항상 오른쪽으로 고정
-        try:
-            self._hbar = self._scroll.horizontalScrollBar()
-            self._hbar.rangeChanged.connect(lambda _min,_max: QTimer.singleShot(0, self._pin_to_right))
-        except Exception:
-            self._hbar = None
-
         self.set_path(self._current_path)
+
+    def set_active(self, active: bool):
+        """
+        Path bar를 활성/비활성 시각 상태로 전환한다.
+        (QSS: QScrollArea#crumbScroll[active="true"] 와 그 viewport)
+        """
+        try:
+            self._scroll.setProperty("active", bool(active))
+            # 재적용 (scroll + viewport 모두)
+            vp = self._scroll.viewport()
+            for w in (self._scroll, vp):
+                w.style().unpolish(w)
+                w.style().polish(w)
+                w.update()
+        except Exception:
+            pass
 
     def sizeHint(self): return QSize(200, UI_H)
     def minimumSizeHint(self): return QSize(100, UI_H)
@@ -1790,7 +1879,9 @@ class ExplorerPane(QWidget):
         self.btn_refresh.clicked.connect(self.hard_refresh)  # 하드 리프레시
         self.view.activated.connect(self._on_double_click)
         self.view.viewport().installEventFilter(self)
-        self.view.viewport().installEventFilter(self)
+        self.view.installEventFilter(self)
+        self.filter_edit.installEventFilter(self)
+        self.path_bar.installEventFilter(self)
         self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
         self._sel_model = None
         self._hook_selection_model()
@@ -1823,6 +1914,49 @@ class ExplorerPane(QWidget):
         self._apply_default_sort_size()
 
         self._update_pane_status()
+
+    def set_active_visual(self, active: bool):
+        """
+        Pane 전체에 'active' 속성을 주어 QSS 하이라이트가 적용되도록 한다.
+        - 루트 위젯 objectName을 'paneRoot'로 보장
+        - 스타일 재적용(repolish)로 즉시 반영
+        - breadcrumb의 각 crumb(QPushButton#crumb)까지 확실히 repolish
+        """
+        try:
+            # paneRoot 보장 + active 속성 토글
+            if self.objectName() != "paneRoot":
+                self.setObjectName("paneRoot")
+            self.setProperty("active", bool(active))
+
+            # 루트와 주요 자식 위젯들 repolish
+            targets = [self,
+                       getattr(self, "view", None),
+                       getattr(self, "filter_edit", None),
+                       getattr(self, "path_bar", None)]
+            for w in targets:
+                if w:
+                    try:
+                        st = w.style()
+                        st.unpolish(w)
+                        st.polish(w)
+                        w.update()
+                    except Exception:
+                        pass
+
+            # breadcrumb의 모든 crumb 버튼도 명시적으로 repolish
+            host = getattr(getattr(self, "path_bar", None), "_host", None)
+            if host:
+                from PyQt5.QtWidgets import QPushButton
+                for btn in host.findChildren(QPushButton, "crumb"):
+                    try:
+                        st = btn.style()
+                        st.unpolish(btn)
+                        st.polish(btn)
+                        btn.update()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _hook_selection_model(self):
         """
@@ -2165,7 +2299,6 @@ class ExplorerPane(QWidget):
         if paths:
             stat_proxy.request_paths(paths)
 
-
     def _on_header_clicked(self, col:int):
         v=self.view
         if not v.isSortingEnabled(): v.setSortingEnabled(True)
@@ -2177,26 +2310,23 @@ class ExplorerPane(QWidget):
             return
         v.header().setSortIndicator(col, Qt.AscendingOrder); v.sortByColumn(col, Qt.AscendingOrder)
 
-    def eventFilter(self, obj, ev):
-        # ① 필터창에서 ESC → 내용 비우고 브라우즈 모드로 복귀(+ 포커스 목록으로)
-        if obj is self.filter_edit:
-            if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
-                try:
-                    if self.filter_edit.text():
-                        self.filter_edit.clear()  # x 버튼과 동일
-                except Exception:
-                    pass
-                self._enter_browse_mode()
-                try:
-                    self.view.setFocus(Qt.ShortcutFocusReason)
-                except Exception:
-                    pass
-                return True
-            return False
+    def _mark_self_active(self):
+        """이 Pane을 활성 Pane으로 표시."""
+        try:
+            if hasattr(self.host, "mark_active_pane"):
+                self.host.mark_active_pane(self)
+        except Exception:
+            pass
 
-        # ② 파일 목록 뷰의 viewport 처리 (기존 동작 유지)
+    def eventFilter(self, obj, ev):
+        # ── 이 Pane을 활성으로 표시: 뷰/뷰포트/필터/패스바에서 포커스 또는 클릭 시 ──
+        if obj in (self.view, self.view.viewport(), getattr(self, "filter_edit", None), getattr(self, "path_bar", None)):
+            if ev.type() in (QEvent.FocusIn, QEvent.MouseButtonPress):
+                self._mark_self_active()
+
         if obj is self.view.viewport():
             if ev.type() == QEvent.MouseButtonPress:
+                # 마우스 XButton으로 뒤/앞 이동
                 if ev.button() == Qt.XButton1:
                     self.go_back()
                     return True
@@ -2222,7 +2352,6 @@ class ExplorerPane(QWidget):
             return False
 
         return super().eventFilter(obj, ev)
-
 
     def _open_cmd_here(self):
         path=self.current_path()
@@ -3096,6 +3225,10 @@ class MultiExplorer(QMainWindow):
         self.btn_about.clicked.connect(self._show_about)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
+        self._install_focus_tracker()
+        if getattr(self, "panes", None):
+            self.mark_active_pane(self.panes[0])
+
         self.statusBar().showMessage("Ready", 1500)
 
         self._wd_timer=QTimer(self); self._wd_timer.setInterval(50); self._wd_last=time.perf_counter()
@@ -3107,6 +3240,56 @@ class MultiExplorer(QMainWindow):
 
         settings=QSettings(ORG_NAME, APP_NAME); geo=settings.value("window/geometry")
         if isinstance(geo, QtCore.QByteArray): self.restoreGeometry(geo)
+
+    def mark_active_pane(self, pane):
+        """
+        활성 Pane을 설정하고, 각 Pane의 PathBar와 Pane 전체 시각 상태를 반영한다.
+        """
+        try:
+            self._active_pane = pane
+            for p in getattr(self, "panes", []):
+                try:
+                    is_active = (p is pane)
+                    # Path bar 하이라이트
+                    p.path_bar.set_active(is_active)
+                    # Pane 전체 하이라이트
+                    if hasattr(p, "set_active_visual"):
+                        p.set_active_visual(is_active)
+                except Exception:
+                    pass
+            dlog(f"[active] pane={getattr(pane, 'pane_id', '?')}")
+        except Exception:
+            pass
+
+    def _install_focus_tracker(self):
+        """앱 전역 포커스 변화에 따라 활성 Pane을 갱신한다."""
+        app = QApplication.instance()
+        if not app:
+            return
+        # 중복 연결 방지
+        try:
+            self._focus_tracker_connected
+        except AttributeError:
+            self._focus_tracker_connected = False
+        if self._focus_tracker_connected:
+            return
+        app.focusChanged.connect(self._on_focus_changed)
+        self._focus_tracker_connected = True
+
+    def _on_focus_changed(self, old, now):
+        """포커스가 바뀔 때, 포커스를 품고 있는 Pane을 활성화한다."""
+        try:
+            if not now:
+                return
+            if not isinstance(now, QWidget):
+                return
+            for p in getattr(self, "panes", []):
+                # now가 Pane의 자손 위젯이면 해당 Pane을 활성화
+                if p.isAncestorOf(now):
+                    self.mark_active_pane(p)
+                    return
+        except Exception:
+            pass
 
 
     def _update_layout_icon(self):
