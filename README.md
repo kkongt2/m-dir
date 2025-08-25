@@ -1,122 +1,77 @@
 # Multi-Pane File Explorer (PyQt5)
 
-*A fast, keyboard-friendly **multi-pane** file explorer for Windows.*  
+A fast, keyboard-friendly **multi-pane (4/6/8)** file explorer for Windows.  
 **by kkongt2 · Built with GPT-5 Thinking**
 
-> Windows 10/11 • Python 3.9–3.12
+> Windows 10/11 · Python 3.9–3.12
 
 ---
 
 ## Features
-
-- **4 / 6 / 8 panes** with quick layout toggle (remembers last session & paths)
-- **Folders first** sorting, then files (size/date work as expected)
-- **Auto refresh (watcher-based)** when contents change
-- **Super-fast listing** for big directories (scandir + incremental rows; switches away from `QFileSystemModel` for huge folders)
-- **Breadcrumbs** with per-crumb highlight for the active pane
-- **Filter / search** (wildcards like `*.txt`, `*report*.xlsx`), **Esc** clears & returns to browse
-- **One-click New**: folder / empty `.txt` (and templates for docx/xlsx/pptx if available)
-- **Copy/Move with conflict resolver** (Overwrite / Skip / Keep both per item)
-- **Native Windows context menu** (incl. Properties) when available
-- **Bookmarks** + **named sessions** (save/restore all pane paths)
-- **Dark / Light themes**, compact toolbar
+- **4 / 6 / 8 panes** with instant layout switch; restores last session & paths
+- **Folders first, then files** sorting (size/date work as expected)
+- **Watcher-based auto refresh** on file system changes
+- **Large folder optimization**: `os.scandir` incremental listing + deferred size/icon stat
+- **Breadcrumb chips**: only the active pane’s crumbs get a subtle blue highlight
+- **Filter / search**: wildcards like `*.txt`, `*report*.xlsx`; **Esc** clears & returns to browse
+- **One-click “New”**: folder / empty `.txt` (docx/xlsx/pptx templates when available)
+- **Copy/Move conflict resolver**: per-item **Overwrite / Skip / Copy (keep both)**
+- **Native Explorer context menu** (with pywin32), Properties supported
+- **Bookmarks + named sessions** (save/restore all pane paths), Dark/Light themes
 
 ---
 
 ## Install
-
 ```bash
 python -m venv .venv
 # PowerShell
 .\.venv\Scripts\Activate.ps1
 pip install PyQt5 send2trash pywin32
 ```
-
-> `pywin32`는 선택 사항이지만 탐색기 컨텍스트 메뉴/속성 창을 활성화합니다.  
-> `send2trash`는 휴지통 이동에 사용됩니다.
+> `pywin32` enables the native Explorer context menu/Properties.  
+> `send2trash` is used for safe recycling.
 
 ---
 
 ## Run
-
 ```bash
 python main.py [--panes 4|6|8] [start_path1 start_path2 ...]
 ```
-
 Examples:
-
 ```bash
 python main.py --panes 6
 python main.py --panes 4 "C:\Windows" "D:\WS" "C:\Users\USER" "C:\Temp"
 ```
 
-Settings are stored via `QSettings`:
-
-- **Organization**: `MultiPane`  
-- **Application**: `Multi-Pane File Explorer`
+Settings are stored via `QSettings`.  
+**Organization**: `MultiPane` · **Application**: `Multi-Pane File Explorer`
 
 ---
 
 ## Keyboard Shortcuts (essentials)
-
 | Key | Action |
 |---|---|
-| **Alt+Left / Alt+Right** | Back / Forward |
-| **Backspace** | Up one folder |
-| **Enter / Ctrl+O** | Open / Navigate |
-| **F2** | Rename |
-| **Delete / Shift+Delete** | Recycle / Delete permanently |
-| **Ctrl+C / Ctrl+X / Ctrl+V** | Copy / Cut / Paste |
+| Alt+Left / Alt+Right | Back / Forward |
+| **Alt+Up** | Go to parent folder |
+| Backspace | Back |
+| Enter / Ctrl+O | Open / Navigate |
+| F2 | Rename |
+| Delete / Shift+Delete | Recycle / Delete permanently |
+| Ctrl+C / X / V | Copy / Cut / Paste |
 | **Ctrl+Shift+C** | Copy full path of selection |
 | **Alt+Shift+C** | Copy folder path only (files → parent folder) |
-| **Ctrl+L / F4** | Focus path bar |
-| **Ctrl+F / F3** | Focus filter box |
-| **Esc** (in filter) | Clear filter and return to browse |
-| **F5** | Hard refresh |
+| Ctrl+L / F4 | Focus path bar |
+| **Ctrl+F / F3** | Focus filter (Esc clears & returns to browse) |
+| F5 | Hard refresh |
 
 ---
 
 ## Tips
-
-- Filtering supports wildcards. Each pane filters independently.  
-- The **active pane** is subtly highlighted; its breadcrumb **chips** turn light blue.  
-- Right-click shows the **native Explorer menu** when `pywin32` is installed; otherwise a lightweight **New …** menu appears.  
-- On name conflicts during copy/move, choose **Overwrite / Skip / Copy (keep both)** per item.  
-- Very large folders use an optimized fast model (`os.scandir`) and incremental stat/icon fill to keep the UI responsive.
+- Each pane filters independently.  
+- The **active pane** gets a subtle blue accent and blue breadcrumb chips.  
+- Very large directories are listed incrementally to keep the UI responsive.
 
 ---
 
-## Platforms
-
-- Windows 10/11 • Python 3.9–3.12  
-- HiDPI / Per-monitor-V2 aware (Segoe UI default)
-
----
-
-## License — MIT
-
-This project is licensed under the **MIT License**.
-
-```
-MIT License
-
-Copyright (c) 2025 kkongt2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+## License
+MIT
