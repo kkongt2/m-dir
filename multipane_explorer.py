@@ -1898,9 +1898,10 @@ class ExplorerPane(QWidget):
             sc=QShortcut(QKeySequence(seq), self.view)
             sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
         add_sc("Backspace", self.go_back); add_sc("Alt+Left", self.go_back); add_sc("Alt+Right", self.go_forward)
+        add_sc("Alt+Up", self.go_up)  # ← Alt+Up으로 상위 폴더 이동
         add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit)
         add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
-        add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))  # ← 추가: Ctrl+F도 필터창으로
+        add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
         add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current); add_sc("Ctrl+Z", self.undo_last)
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
