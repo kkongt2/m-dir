@@ -1586,22 +1586,58 @@ class PathBar(QWidget):
 
 # -------------------- SearchResultModel --------------------
 class SearchResultModel(QStandardItemModel):
+    """
+    검색 결과 전용 모델.
+    - Size 컬럼은 사람이 읽기 쉬운 단위로 표시
+    - 외부 드래그를 위해 text/uri-list (file://...) 로 QMimeData를 생성
+    """
     def data(self, index, role=Qt.DisplayRole):
-        if role==Qt.DisplayRole and index.column()==1:
-            # ▶ 검색 결과에서도 폴더 크기는 숨기기
-            try:
-                is_dir = bool(super().data(self.index(index.row(), 0), IS_DIR_ROLE))
-            except Exception:
-                is_dir = False
-            if is_dir:
-                return ""
-            b=super().data(index, SIZE_BYTES_ROLE)
+        if role == Qt.DisplayRole and index.column() == 1:
+            b = super().data(index, SIZE_BYTES_ROLE)
             if b is None:
-                b=super().data(index, Qt.EditRole)
-            if isinstance(b,(int,float)) and b:
+                b = super().data(index, Qt.EditRole)
+            if isinstance(b, (int, float)) and b:
                 return human_size(int(b))
             return ""
         return super().data(index, role)
+
+    # ---- 드래그 지원: 외부 앱으로 file:// URL 전달 ----
+    def mimeTypes(self):
+        # 외부 드롭 타겟들이 인식하는 표준 파일 목록 MIME
+        return ["text/uri-list"]
+
+    def mimeData(self, indexes):
+        md = QtCore.QMimeData()
+        # 같은 행이 여러 컬럼으로 중복 들어오는 것을 방지
+        rows = set()
+        for ix in indexes:
+            if ix.isValid():
+                rows.add(ix.row())
+
+        from PyQt5.QtCore import QUrl
+        urls = []
+        for r in rows:
+            it = self.item(r, 0)
+            if not it:
+                continue
+            path = it.data(Qt.UserRole)  # ExplorerPane._apply_filter 에서 저장한 실제 경로
+            if path:
+                urls.append(QUrl.fromLocalFile(path))
+
+        md.setUrls(urls)
+        return md
+
+    def flags(self, index):
+        # 선택/활성 + 드래그 가능 플래그 부여
+        f = super().flags(index)
+        if index.isValid():
+            f |= Qt.ItemIsDragEnabled
+        return f
+
+    def supportedDragActions(self):
+        # 보통 외부 드래그는 '복사' 의미로 전달
+        return Qt.CopyAction
+
 
 
 # -------------------- Conflict Resolution Dialog --------------------
