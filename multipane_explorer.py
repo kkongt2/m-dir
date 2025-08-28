@@ -2355,13 +2355,68 @@ class ExplorerPane(QWidget):
         return super().eventFilter(obj, ev)
 
     def _open_cmd_here(self):
-        path=self.current_path()
+        path = self.current_path() or os.getcwd()
         try:
-            flags=getattr(subprocess,"CREATE_NEW_CONSOLE",0)
-            subprocess.Popen(["cmd.exe","/K"], cwd=path, creationflags=flags)
+            path = os.path.abspath(path)
         except Exception:
-            try: subprocess.Popen('start "" cmd.exe', shell=True, cwd=path)
-            except Exception as e: QMessageBox.critical(self,"Command Prompt",f"Failed to launch cmd.exe:\n{e}")
+            pass
+
+        # 1) cmd.exe 경로 결정 (ComSpec 우선)
+        comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+
+        # 2) 우선: pywin32가 있으면 ShellExecute로 안전 실행
+        if HAS_PYWIN32:
+            try:
+                # /K 로 창 유지 + 해당 폴더로 이동
+                # title 지정은 선택적(디버깅 편의를 위해)
+                params = f'/K title Multi-Pane File Explorer & cd /d "{path}"'
+                win32api.ShellExecute(
+                    int(self.window().winId()) if self.window() else 0,
+                    "open",
+                    comspec,
+                    params,
+                    path,  # 작업 디렉터리
+                    win32con.SW_SHOWNORMAL
+                )
+                return
+            except Exception:
+                pass  # 아래 단계로 폴백
+
+        # 3) 표준 subprocess 경로 (새 콘솔/프로세스 그룹으로 확실히 분리)
+        try:
+            flags = 0
+            flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+            # 창 표시 정보(일부 환경에서 창이 즉시 사라지는 걸 방지)
+            si = None
+            try:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 1  # SW_SHOWNORMAL
+            except Exception:
+                si = None
+
+            # /K 로 유지 + /d 로 드라이브 전환 포함
+            subprocess.Popen(
+                [comspec, "/K", f'cd /d "{path}"'],
+                cwd=path,
+                creationflags=flags,
+                startupinfo=si
+            )
+            return
+        except Exception:
+            pass  # 마지막 폴백
+
+        # 4) 최종 폴백: cmd 내장 명령 'start' 사용 (shell=True 필요)
+        try:
+            # 빈 제목("") 필수, /D로 작업폴더 지정 후 cmd 실행
+            cmdline = f'start "" /D "{path}" "{comspec}" /K cd /d "{path}"'
+            subprocess.Popen(cmdline, shell=True)
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Command Prompt", f"Failed to launch cmd.exe:\n{e}")
+
 
     def _on_bookmarks_changed(self,*_): self._update_star_button(); self._rebuild_quick_bookmark_buttons()
     def _on_star_toggle(self): self.host.toggle_bookmark(self.current_path())
