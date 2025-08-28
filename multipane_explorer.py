@@ -1916,7 +1916,6 @@ class ExplorerPane(QWidget):
         self.view.activated.connect(self._on_double_click)
         self.view.viewport().installEventFilter(self)
         self.view.installEventFilter(self)
-        self.filter_edit.installEventFilter(self)
         self.path_bar.installEventFilter(self)
         self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
         self._sel_model = None
@@ -2356,39 +2355,39 @@ class ExplorerPane(QWidget):
             pass
 
     def eventFilter(self, obj, ev):
-        # ── 이 Pane을 활성으로 표시: 뷰/뷰포트/필터/패스바에서 포커스 또는 클릭 시 ──
-        if obj in (self.view, self.view.viewport(), getattr(self, "filter_edit", None), getattr(self, "path_bar", None)):
-            if ev.type() in (QEvent.FocusIn, QEvent.MouseButtonPress):
-                self._mark_self_active()
-
+        # 뷰포트(파일 리스트) 영역: 기존 동작 유지
         if obj is self.view.viewport():
-            if ev.type() == QEvent.MouseButtonPress:
-                # 마우스 XButton으로 뒤/앞 이동
-                if ev.button() == Qt.XButton1:
-                    self.go_back()
-                    return True
-                if ev.button() == Qt.XButton2:
-                    self.go_forward()
-                    return True
-            if ev.type() == QEvent.MouseMove:
-                ix = self.view.indexAt(ev.pos())
-                if ix != self._last_hover_index:
-                    self._last_hover_index = ix
+            if ev.type()==QEvent.MouseButtonPress:
+                if ev.button()==Qt.XButton1: self.go_back(); return True
+                if ev.button()==Qt.XButton2: self.go_forward(); return True
+            if ev.type()==QEvent.MouseMove:
+                ix=self.view.indexAt(ev.pos())
+                if ix!=self._last_hover_index: self._last_hover_index=ix
                 if ix.isValid():
-                    now_ms = time.perf_counter() * 1000.0
-                    if (now_ms - self._tooltip_last_ms) >= self._tooltip_interval_ms:
-                        name = ix.sibling(ix.row(), 0).data(Qt.DisplayRole)
-                        full = self._index_to_full_path(ix)
-                        tip = full if full else name
-                        if tip != self._tooltip_last_text:
-                            QToolTip.showText(QCursor.pos(), tip, self.view)
-                            self._tooltip_last_text = tip
-                            self._tooltip_last_ms = now_ms
+                    now_ms=time.perf_counter()*1000.0
+                    if (now_ms-self._tooltip_last_ms)>=self._tooltip_interval_ms:
+                        name=ix.sibling(ix.row(),0).data(Qt.DisplayRole); full=self._index_to_full_path(ix)
+                        tip=full if full else name
+                        if tip!=self._tooltip_last_text:
+                            QToolTip.showText(QCursor.pos(), tip, self.view); self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
             if ev.type() in (QEvent.Resize, QEvent.Show):
                 QTimer.singleShot(0, self._schedule_visible_stats)
             return False
 
+        # 필터 입력창: Esc로 필터 해제 + 브라우즈 모드 복귀
+        if obj is self.filter_edit:
+            if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
+                try:
+                    self.filter_edit.clear()
+                finally:
+                    # 검색 모드였다면 브라우즈 모드로 복귀
+                    self._enter_browse_mode()
+                ev.accept()
+                return True
+            return False
+
         return super().eventFilter(obj, ev)
+
 
     def _open_cmd_here(self):
         path = self.current_path() or os.getcwd()
