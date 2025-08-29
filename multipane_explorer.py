@@ -538,6 +538,31 @@ def apply_light_style(app: QApplication):
 
 
 # -------------------- Vector Icons --------------------
+def icon_copy_squares(theme: str):
+    def paint(p: QPainter, w, h):
+        # 색상: 흰 채움 + 테마별 스트로크
+        stroke = QColor(210, 214, 225) if theme == "dark" else QColor(85, 95, 115)
+        fill   = QColor(255, 255, 255)
+
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(stroke, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(QBrush(fill))
+
+        # 슬래시(/) 방향 배치
+        front_rect = QtCore.QRect(6, 3, 11, 11)  # 위쪽(앞) 사각형
+        back_rect  = QtCore.QRect(3, 6, 11, 11)  # 아래쪽(뒤) 사각형
+        radius = 3
+
+        # 1) 위 사각형 (흰 채움 + 윤곽)
+        p.drawRoundedRect(front_rect, radius, radius)
+
+        # 2) 아래 사각형을 마지막으로 그려 앞 사각형 윤곽을 덮음
+        p.drawRoundedRect(back_rect, radius, radius)
+
+    return _make_icon(20, 20, paint)
+
+
 def _make_icon(w, h, painter_fn):
     pm = QPixmap(w, h); pm.fill(Qt.transparent)
     p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing, True)
@@ -1504,10 +1529,36 @@ class PathBar(QWidget):
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
-        wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0); wrap.addWidget(self._scroll,1); wrap.addWidget(self._edit,1)
+        # --- Copy Path 버튼 (우측 고정) ---
+        self._btn_copy = QToolButton(self)
+        self._btn_copy.setToolTip("Copy current path")
+        self._btn_copy.setFixedHeight(UI_H)
+        # 아이콘: 테마 감지
+        theme = getattr(getattr(parent, "host", None), "theme", "dark")
+        try:
+            self._btn_copy.setIcon(icon_copy_squares(theme))
+        except Exception:
+            # 폴백: 텍스트
+            self._btn_copy.setText("Copy")
+        self._btn_copy.clicked.connect(self._copy_current_path)
+
+        # 레이아웃: [scroll(breadcrumb) | edit(overlap) | copy-button]
+        wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0)
+        wrap.addWidget(self._scroll, 1)
+        wrap.addWidget(self._edit, 1)
+        wrap.addWidget(self._btn_copy, 0)
 
         self._host.installEventFilter(self); self._edit.installEventFilter(self)
         self.set_path(self._current_path)
+
+    def _copy_current_path(self):
+        # 편집 중이면 입력값 우선, 아니면 현재 경로
+        t = self._edit.text().strip() if self._edit.isVisible() else self._current_path
+        if not t:
+            t = self._current_path
+        QApplication.clipboard().setText(t)
+        QToolTip.showText(QCursor.pos(), f"Copied: {t}", self)
+
 
     def set_active(self, active: bool):
         """
@@ -3401,8 +3452,15 @@ class MultiExplorer(QMainWindow):
     def _update_theme_dependent_icons(self):
         self._update_layout_icon(); self._update_theme_icon()
         for p in getattr(self,"panes",[]):
-            try: p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme)); p.btn_cmd.setIcon(icon_cmd(self.theme))
-            except Exception: pass
+            try:
+                p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
+                p.btn_cmd.setIcon(icon_cmd(self.theme))
+                # PathBar의 복사 아이콘도 갱신
+                if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
+                    p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
+            except Exception:
+                pass
+
     def _cycle_layout(self):
         self._layout_idx=(self._layout_idx+1)%len(self._layout_states); n=self._layout_states[self._layout_idx]; self.build_panes(n, self._current_paths())
     def _toggle_theme(self):
