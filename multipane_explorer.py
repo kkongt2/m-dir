@@ -1689,6 +1689,25 @@ class SearchResultModel(QStandardItemModel):
         # 보통 외부 드래그는 '복사' 의미로 전달
         return Qt.CopyAction
 
+    def startDrag(self, supportedActions):
+        # 외부 앱으로 드래그할 때 항상 파일 URL과 텍스트를 함께 제공
+        from PyQt5.QtGui import QDrag  # 로컬 임포트(추가 전역 임포트 불필요)
+        md = QtCore.QMimeData()
+
+        # 현재 선택 경로(브라우즈/검색 모드 모두 대응)
+        paths = [p for p in self.pane._selected_paths() if p and os.path.exists(p)]
+        if not paths:
+            return
+
+        # 호환성: text/uri-list + text/plain
+        md.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        md.setText("\r\n".join(paths))
+
+        drag = QDrag(self)
+        drag.setMimeData(md)
+
+        # 기본은 Copy로(일부 앱이 Move 거부하는 문제 방지)
+        drag.exec_(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
 
 
 # -------------------- Conflict Resolution Dialog --------------------
