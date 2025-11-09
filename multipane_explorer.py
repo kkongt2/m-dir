@@ -1882,6 +1882,8 @@ class ExplorerPane(QWidget):
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
         self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
         self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None; self._pending_normal_root=None
+        self._sort_column = 0  # 기본값: Name
+        self._sort_order = Qt.AscendingOrder
 
         # Toolbar
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -1972,8 +1974,13 @@ class ExplorerPane(QWidget):
         # Bookmarks, start
         self.host.namedBookmarksChanged.connect(self._on_bookmarks_changed)
         self._dirload_timer={}
+        
+        # 저장된 정렬 설정 복원
+        self._load_sort_settings()
+        
         self.set_path(start_path or QDir.homePath(), push_history=False)
         self._update_star_button(); self._rebuild_quick_bookmark_buttons()
+
 
         # Signals
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
@@ -2015,11 +2022,42 @@ class ExplorerPane(QWidget):
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
 
-
-        # 기본 정렬: 크기 내림차순 + 날짜 폭 확장
-        self._apply_default_sort_size()
-
+        # 초기 정렬 적용 (기본값: Name 오름차순)
+        self._apply_saved_sort()
         self._update_pane_status()
+
+    def _load_sort_settings(self):
+        """저장된 정렬 설정 불러오기"""
+        try:
+            s = QSettings(ORG_NAME, APP_NAME)
+            self._sort_column = s.value(f"pane_{self.pane_id}/sort_column", 0, type=int)
+            order_val = s.value(f"pane_{self.pane_id}/sort_order", Qt.AscendingOrder, type=int)
+            self._sort_order = Qt.DescendingOrder if order_val == Qt.DescendingOrder else Qt.AscendingOrder
+        except Exception:
+            self._sort_column = 0
+            self._sort_order = Qt.AscendingOrder
+    
+    def _save_sort_settings(self):
+        """현재 정렬 설정 저장"""
+        try:
+            s = QSettings(ORG_NAME, APP_NAME)
+            s.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
+            s.setValue(f"pane_{self.pane_id}/sort_order", int(self._sort_order))
+            s.sync()
+        except Exception:
+            pass
+    
+    def _apply_saved_sort(self):
+        """저장된 정렬 설정을 현재 뷰에 적용"""
+        try:
+            v = self.view
+            if not v.isSortingEnabled():
+                v.setSortingEnabled(True)
+            v.header().setSortIndicator(self._sort_column, self._sort_order)
+            v.sortByColumn(self._sort_column, self._sort_order)
+        except Exception:
+            pass
+
 
     def set_active_visual(self, active: bool):
         """
@@ -2289,18 +2327,6 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-
-    def _apply_default_sort_size(self):
-        v = self.view
-        if not v.isSortingEnabled():
-            v.setSortingEnabled(True)
-        v.header().setSortIndicator(1, Qt.DescendingOrder)
-        v.sortByColumn(1, Qt.DescendingOrder)
-        try:
-            v.header().resizeSection(3, 190)
-        except Exception:
-            pass
-
     def _default_icon(self, is_dir: bool) -> QIcon:
         try:
             if ALWAYS_GENERIC_ICONS:
@@ -2406,15 +2432,25 @@ class ExplorerPane(QWidget):
             stat_proxy.request_paths(paths)
 
     def _on_header_clicked(self, col:int):
+        """헤더 클릭 시 정렬 변경 및 저장"""
         v=self.view
-        if not v.isSortingEnabled(): v.setSortingEnabled(True)
-        if col == 1:
-            v.header().setSortIndicator(1, Qt.DescendingOrder)
-            v.sortByColumn(1, Qt.DescendingOrder)
-            try: v.header().resizeSection(3, 190)
-            except Exception: pass
-            return
-        v.header().setSortIndicator(col, Qt.AscendingOrder); v.sortByColumn(col, Qt.AscendingOrder)
+        if not v.isSortingEnabled(): 
+            v.setSortingEnabled(True)
+        
+        # 같은 컬럼 클릭 시 방향 토글, 다른 컬럼은 오름차순
+        if col == self._sort_column:
+            new_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        else:
+            new_order = Qt.AscendingOrder
+        
+        self._sort_column = col
+        self._sort_order = new_order
+        
+        v.header().setSortIndicator(col, new_order)
+        v.sortByColumn(col, new_order)
+        
+        # 설정 저장
+        self._save_sort_settings()
 
     def _mark_self_active(self):
         """이 Pane을 활성 Pane으로 표시."""
@@ -2632,8 +2668,7 @@ class ExplorerPane(QWidget):
                 # 화면 업데이트 재개
                 self.view.setUpdatesEnabled(True)
 
-                # 기본 정렬(크기 내림차순) 한 번만 적용
-                self._apply_default_sort_size()
+                self._apply_saved_sort()
                 self.view.setSortingEnabled(True)
 
                 # 아이콘 apply 함수 원복 → 이제 가시영역 아이콘을 실제로 채움
@@ -2667,7 +2702,7 @@ class ExplorerPane(QWidget):
                 self.view.setUpdatesEnabled(True)
 
                 # 기본 정렬(크기 내림차순) 적용 — 이제 한 번만 비용 지불
-                self._apply_default_sort_size()
+                self._apply_saved_sort()
                 self.view.setSortingEnabled(True)
 
                 # 최초 가시영역 통계 계산
@@ -2872,9 +2907,8 @@ class ExplorerPane(QWidget):
                 self.view.setColumnHidden(2, True)
                 if not self.view.isSortingEnabled():
                     self.view.setSortingEnabled(True)
-                header.setSortIndicator(0, Qt.AscendingOrder)
-                self.view.sortByColumn(0, Qt.AscendingOrder)
-                self._apply_default_sort_size()
+                # 저장된 정렬 적용
+                self._apply_saved_sort()
                 QTimer.singleShot(0, self._schedule_visible_stats)
             except Exception:
                 pass
@@ -3112,9 +3146,8 @@ class ExplorerPane(QWidget):
         self.view.setColumnHidden(2, True)
         if not self.view.isSortingEnabled():
             self.view.setSortingEnabled(True)
-        header.setSortIndicator(0, Qt.AscendingOrder)
-        self.view.sortByColumn(0, Qt.AscendingOrder)
-        self._apply_default_sort_size()
+        # 저장된 정렬 적용
+        self._apply_saved_sort()
 
         QTimer.singleShot(0, self._schedule_visible_stats)
 
