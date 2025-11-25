@@ -65,7 +65,7 @@ ALWAYS_GENERIC_ICONS = False
 HAS_PYWIN32 = True
 try:
     import pythoncom
-    import win32con, win32gui, win32api
+    import win32con, win32gui, win32api, win32clipboard
     from win32com.shell import shell, shellcon
 except Exception:
     HAS_PYWIN32 = False
@@ -1877,15 +1877,42 @@ class ExplorerPane(QWidget):
     def __init__(self, _unused, start_path: str, pane_id: int, host_main):
         super().__init__()
         self.pane_id=pane_id; self.host=host_main
+        self._init_state()
+
+        row_toolbar = self._build_toolbar()
+        row_path = self._build_path_row()
+        row_filter = self._build_filter_row()
+
+        self._init_models()
+        self._setup_view()
+        row_status = self._build_status_row()
+
+        self._apply_layout(row_toolbar, row_path, row_filter, row_status)
+
+        # 저장된 정렬 설정 복원
+        self._load_sort_settings()
+
+        self.set_path(start_path or QDir.homePath(), push_history=False)
+        self._update_star_button(); self._rebuild_quick_bookmark_buttons()
+
+        self._connect_signals()
+        self._register_shortcuts()
+
+        # 초기 정렬 적용 (기본값: Name 오름차순)
+        self._apply_saved_sort()
+        self._update_pane_status()
+
+    def _init_state(self):
         self._search_mode=False; self._search_model=None; self._search_proxy=None
         self._back_stack=[]; self._fwd_stack=[]; self._undo_stack=[]
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
         self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
         self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None; self._pending_normal_root=None
+        self._dirload_timer={}
         self._sort_column = 0  # 기본값: Name
         self._sort_order = Qt.AscendingOrder
 
-        # Toolbar
+    def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
         self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
@@ -1921,20 +1948,23 @@ class ExplorerPane(QWidget):
         for b in (self.btn_cmd, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
             b.setStyleSheet(_tight_css)
             b.setAutoRaise(True)  # 테두리/여백 느낌 최소화
+        return row_toolbar
 
-        # Path
+    def _build_path_row(self):
         self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb — Double-click or F4/Ctrl+L to enter path")
         row_path=QHBoxLayout(); row_path.setContentsMargins(0,0,0,0); row_path.setSpacing(0); row_path.addWidget(self.path_bar,1)
+        return row_path
 
-        # Filter
+    def _build_filter_row(self):
         self.filter_label=QLabel("Filter:", self)
         self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, …)"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
         self.filter_label.setFixedHeight(UI_H); self.filter_label.setAlignment(Qt.AlignVCenter|Qt.AlignLeft)
         self.btn_search=QToolButton(self); self.btn_search.setText("Search"); self.btn_search.setToolTip("Run recursive search"); self.btn_search.setFixedHeight(UI_H)
         row_filter=QHBoxLayout(); row_filter.setContentsMargins(0,0,0,0); row_filter.setSpacing(ROW_SPACING)
         row_filter.addWidget(self.filter_label); row_filter.addWidget(self.filter_edit,1); row_filter.addWidget(self.btn_search,0)
+        return row_filter
 
-        # Models / View
+    def _init_models(self):
         self.source_model=QFileSystemModel(self); self.source_model.setReadOnly(False)
         try: self.source_model.setResolveSymlinks(False)
         except Exception: pass
@@ -1946,6 +1976,7 @@ class ExplorerPane(QWidget):
         self.proxy=FsSortProxy(self); self.proxy.setSourceModel(self.stat_proxy)
         self.source_model.directoryLoaded.connect(self._on_directory_loaded)
 
+    def _setup_view(self):
         self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1960,29 +1991,20 @@ class ExplorerPane(QWidget):
         header.sectionClicked.connect(self._on_header_clicked)
         self.view.setColumnHidden(2, True)
 
-        # Pane status
+    def _build_status_row(self):
         self.lbl_sel=QLabel("", self); self.lbl_free=QLabel("", self)
         row_status=QHBoxLayout(); row_status.setContentsMargins(0,0,0,0); row_status.setSpacing(ROW_SPACING)
         row_status.addWidget(self.lbl_sel,0); row_status.addStretch(1); row_status.addWidget(self.lbl_free,0)
         self._row_status=row_status
+        return row_status
 
-        # Layout
+    def _apply_layout(self, row_toolbar, row_path, row_filter, row_status):
         root_layout=QVBoxLayout(self); root_layout.setContentsMargins(*PANE_MARGIN); root_layout.setSpacing(max(1, ROW_SPACING//2))
         root_layout.addLayout(row_toolbar); root_layout.addLayout(row_path); root_layout.addLayout(row_filter)
         root_layout.addWidget(self.view,1); root_layout.addLayout(row_status)
 
-        # Bookmarks, start
+    def _connect_signals(self):
         self.host.namedBookmarksChanged.connect(self._on_bookmarks_changed)
-        self._dirload_timer={}
-        
-        # 저장된 정렬 설정 복원
-        self._load_sort_settings()
-        
-        self.set_path(start_path or QDir.homePath(), push_history=False)
-        self._update_star_button(); self._rebuild_quick_bookmark_buttons()
-
-
-        # Signals
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
         self.btn_star.clicked.connect(self._on_star_toggle)
         self.btn_cmd.clicked.connect(self._open_cmd_here)
@@ -1997,15 +2019,13 @@ class ExplorerPane(QWidget):
         self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
         self._sel_model = None
         self._hook_selection_model()
-        self.filter_edit.returnPressed.connect(self._apply_filter); self.btn_search.clicked.connect(self._apply_filter)
         self.filter_edit.returnPressed.connect(self._apply_filter)
         self.btn_search.clicked.connect(self._apply_filter)
         self.filter_edit.textChanged.connect(self._on_filter_text_changed)  # ← 추가: x로 지우면 브라우즈로
-
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_visible_stats())
         except Exception: pass
 
-        # Shortcuts
+    def _register_shortcuts(self):
         def add_sc(seq, slot):
             sc=QShortcut(QKeySequence(seq), self.view)
             sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
@@ -2014,17 +2034,13 @@ class ExplorerPane(QWidget):
         add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit)
         add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
         add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
-        add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current); add_sc("Ctrl+Z", self.undo_last)
+        add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current);add_sc("Ctrl+Z", self.undo_last)
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
         # 경로 복사 단축키
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
-
-        # 초기 정렬 적용 (기본값: Name 오름차순)
-        self._apply_saved_sort()
-        self._update_pane_status()
 
     def _load_sort_settings(self):
         """저장된 정렬 설정 불러오기"""
@@ -3001,11 +3017,72 @@ class ExplorerPane(QWidget):
         paths=self._selected_paths()
         if not paths: return
         self.host.set_clipboard({"op":"cut","paths":paths}); self.host.flash_status(f"Cut {len(paths)} item(s)")
+
+    def _external_clipboard_payload(self):
+        try:
+            cb = QApplication.clipboard()
+            md = cb.mimeData()
+        except Exception:
+            return None
+        if not md or not md.hasUrls():
+            return None
+
+        urls = md.urls()
+        # Keep order while removing duplicates to avoid redundant work
+        paths = list(dict.fromkeys(u.toLocalFile() for u in urls if u.isLocalFile()))
+        if not paths:
+            return None
+
+        def _decode_drop_effect_from_qt():
+            if sys.platform != "win32":
+                return None
+            fmt = 'application/x-qt-windows-mime;value="Preferred DropEffect"'
+            if not md.hasFormat(fmt):
+                return None
+            try:
+                data = md.data(fmt)
+                if data and len(data) >= 4:
+                    return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
+            except Exception:
+                return None
+
+        def _decode_drop_effect_from_win32():
+            if not HAS_PYWIN32:
+                return None
+            try:
+                fmt = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
+                win32clipboard.OpenClipboard()
+                try:
+                    data = win32clipboard.GetClipboardData(fmt)
+                    if data and len(bytes(data)) >= 4:
+                        return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                return None
+
+        effect = _decode_drop_effect_from_qt()
+        if effect is None:
+            effect = _decode_drop_effect_from_win32()
+
+        op = "copy"
+        if effect is not None:
+            if effect & 2:
+                op = "move"
+            elif effect & 1:
+                op = "copy"
+
+        return {"op": op, "paths": paths}
+
     def paste_into_current(self):
-        clip=self.host.get_clipboard()
-        if not clip: return
+        clip=self.host.get_clipboard() or self._external_clipboard_payload()
+        if not clip:
+            self.host.flash_status("Clipboard has no files to paste")
+            return
         dst_dir=self.current_path(); op=clip.get("op"); srcs=clip.get("paths") or []
-        if not srcs: return
+        if not srcs:
+            self.host.flash_status("Clipboard has no files to paste")
+            return
         self._start_bg_op("copy" if op=="copy" else "move", srcs, dst_dir)
         if op=="cut": self.host.clear_clipboard()
 
