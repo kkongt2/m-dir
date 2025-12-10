@@ -1815,6 +1815,7 @@ class ExplorerView(QTreeView):
         self.setDragEnabled(True); self.setAcceptDrops(True)
         self.setDropIndicatorShown(True); self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+        self._drag_start_pos = None
         # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
@@ -1834,6 +1835,19 @@ class ExplorerView(QTreeView):
                 self.pane._start_bg_op(op, srcs, self.pane.current_path()); e.acceptProposedAction(); return
         super().dropEvent(e)
 
+    def mouseMoveEvent(self, e):
+        # 일부 창에서 기본 QTreeView 드래그 감지가 실패하는 사례 예방
+        if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
+            if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                sel = self.selectionModel()
+                if sel and sel.selectedIndexes():
+                    try:
+                        self.startDrag(self.model().supportedDragActions())
+                    finally:
+                        self._drag_start_pos = None
+                    return
+        super().mouseMoveEvent(e)
+
     # F5 = 하드 리프레시
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_F5:
@@ -1846,6 +1860,7 @@ class ExplorerView(QTreeView):
 
     # 단일 선택 항목을 재클릭해도 선택 해제되지 않게
     def mousePressEvent(self, e):
+        self._drag_start_pos = e.pos() if e.button() == Qt.LeftButton else None
         # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
         try:
             if not self.hasFocus():
@@ -1869,6 +1884,10 @@ class ExplorerView(QTreeView):
             return
 
         super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(e)
 
 
 # -------------------- Explorer Pane --------------------
