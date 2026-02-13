@@ -1815,6 +1815,11 @@ class ExplorerView(QTreeView):
         self.setDragEnabled(True); self.setAcceptDrops(True)
         self.setDropIndicatorShown(True); self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+        self._drag_start_pos = None
+        self._drag_start_index = QtCore.QModelIndex()
+        self._drag_start_modifiers = Qt.NoModifier
+        self._drag_start_was_selected = False
+        self._drag_ready = False
         # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
@@ -1846,6 +1851,14 @@ class ExplorerView(QTreeView):
 
     # 단일 선택 항목을 재클릭해도 선택 해제되지 않게
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_start_pos = e.pos()
+            self._drag_start_index = self.indexAt(e.pos())
+            self._drag_start_modifiers = e.modifiers()
+            sm = self.selectionModel()
+            self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
+            self._drag_ready = False
+
         # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
         try:
             if not self.hasFocus():
@@ -1869,6 +1882,37 @@ class ExplorerView(QTreeView):
             return
 
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
+            # 일부 Windows 환경에서 드래그-아웃 대신 내부 다중선택이 시작되는 문제를 회피
+            if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                if not self._drag_ready:
+                    ix = self._drag_start_index
+                    sm = self.selectionModel()
+                    if ix.isValid() and sm and sm.isSelected(ix):
+                        # Shift는 범위 선택 제스처이므로 강제 드래그를 막는다.
+                        # Ctrl은 클릭 시점에 이미 선택된 항목에서 시작한 경우(복사 드래그 의도)만 허용한다.
+                        has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
+                        has_ctrl = bool(self._drag_start_modifiers & Qt.ControlModifier)
+                        allow_with_ctrl = (not has_ctrl) or self._drag_start_was_selected
+                        self._drag_ready = (not has_shift) and allow_with_ctrl
+                if self._drag_ready:
+                    self._clear_drag_state()
+                    self.startDrag(Qt.CopyAction | Qt.MoveAction)
+                    return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._clear_drag_state()
+        super().mouseReleaseEvent(e)
+
+    def _clear_drag_state(self):
+        self._drag_start_pos = None
+        self._drag_start_index = QtCore.QModelIndex()
+        self._drag_start_modifiers = Qt.NoModifier
+        self._drag_start_was_selected = False
+        self._drag_ready = False
 
 
 # -------------------- Explorer Pane --------------------
@@ -2787,6 +2831,11 @@ class ExplorerPane(QWidget):
             if not os.path.exists(path):
                 QMessageBox.warning(self, "Path not found", path)
                 return
+
+            # 검색 결과 뷰에서 다른 폴더로 이동할 때는 먼저 검색 모드를 정리한다.
+            # (_search_mode가 남아 있으면 normal 모델 전환이 막혀 외부 드래그가 실패할 수 있음)
+            if self._search_mode:
+                self._enter_browse_mode()
 
             cur = getattr(self.path_bar, "_current_path", None)
             if push_history and cur and os.path.normcase(cur) != os.path.normcase(path):
