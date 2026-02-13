@@ -1818,6 +1818,7 @@ class ExplorerView(QTreeView):
         self._drag_start_pos = None
         self._drag_start_index = QtCore.QModelIndex()
         self._drag_start_modifiers = Qt.NoModifier
+        self._drag_start_was_selected = False
         self._drag_ready = False
         # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1854,6 +1855,8 @@ class ExplorerView(QTreeView):
             self._drag_start_pos = e.pos()
             self._drag_start_index = self.indexAt(e.pos())
             self._drag_start_modifiers = e.modifiers()
+            sm = self.selectionModel()
+            self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
             self._drag_ready = False
 
         # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
@@ -1887,9 +1890,13 @@ class ExplorerView(QTreeView):
                 if not self._drag_ready:
                     ix = self._drag_start_index
                     sm = self.selectionModel()
-                    # 클릭 시점에 선택 확장용 보조키가 없고, 원래 선택되어 있던 항목에서만 강제 드래그
-                    no_select_mod = not (self._drag_start_modifiers & (Qt.ControlModifier | Qt.ShiftModifier))
-                    self._drag_ready = bool(ix.isValid() and sm and sm.isSelected(ix) and no_select_mod)
+                    if ix.isValid() and sm and sm.isSelected(ix):
+                        # Shift는 범위 선택 제스처이므로 강제 드래그를 막는다.
+                        # Ctrl은 클릭 시점에 이미 선택된 항목에서 시작한 경우(복사 드래그 의도)만 허용한다.
+                        has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
+                        has_ctrl = bool(self._drag_start_modifiers & Qt.ControlModifier)
+                        allow_with_ctrl = (not has_ctrl) or self._drag_start_was_selected
+                        self._drag_ready = (not has_shift) and allow_with_ctrl
                 if self._drag_ready:
                     self._clear_drag_state()
                     self.startDrag(Qt.CopyAction | Qt.MoveAction)
@@ -1904,6 +1911,7 @@ class ExplorerView(QTreeView):
         self._drag_start_pos = None
         self._drag_start_index = QtCore.QModelIndex()
         self._drag_start_modifiers = Qt.NoModifier
+        self._drag_start_was_selected = False
         self._drag_ready = False
 
 
