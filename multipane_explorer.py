@@ -774,7 +774,48 @@ def _get_canonical_verb(cm, idx):
         except Exception: pass
     return (verb or "").strip().lower()
 
-def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_first=1):
+def _query_ctx_menu_id_last(cm, hmenu, id_first: int, flags: int, id_limit: int = 0x7FFF) -> int:
+    qret = cm.QueryContextMenu(hmenu, 0, int(id_first), int(id_limit), int(flags))
+    count = int(qret) & 0xFFFF
+    return int(id_first) + int(count) - 1 if count > 0 else int(id_first) - 1
+
+def _menu_item_text(hmenu, cmd_id: int) -> str:
+    try:
+        txt = win32gui.GetMenuString(hmenu, int(cmd_id), win32con.MF_BYCOMMAND)
+        return (txt or "").strip().lower()
+    except Exception:
+        return ""
+
+def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
+    target = work_dir
+    if paths:
+        try:
+            p0 = str(paths[0])
+            target = p0 if os.path.isdir(p0) else (os.path.dirname(p0) or work_dir)
+        except Exception:
+            pass
+    target = _normalize_fs_path(target or os.getcwd())
+    try:
+        target = os.path.abspath(target)
+    except Exception:
+        pass
+
+    # Escape single quotes for PowerShell single-quoted literals.
+    ps_literal = target.replace("'", "''")
+    args = f"-NoExit -Command Set-Location -LiteralPath '{ps_literal}'"
+    try:
+        win32api.ShellExecute(int(owner_hwnd) if owner_hwnd else 0,
+                              "open",
+                              "powershell.exe",
+                              args,
+                              target,
+                              win32con.SW_SHOWNORMAL)
+        return True
+    except Exception as e:
+        if DEBUG: print("[ctx] direct PowerShell launch failed:", e)
+        return False
+
+def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_first=1, id_last=None):
     """
     True  = 명령 실행/취소(폴백 불필요), False = 실패/팝업헤더 선택(폴백 메뉴 제공)
     """
@@ -801,11 +842,23 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
     except Exception:
         pass
 
+    if id_last is not None and (int(cmd_id) < int(id_first) or int(cmd_id) > int(id_last)):
+        if DEBUG: print(f"[ctx] cmd_id={cmd_id} out of range [{id_first}, {id_last}]")
+        return False
+
     idx=int(cmd_id)-int(id_first); verb=None
     try:
         verb = _get_canonical_verb(cm, idx) or None
     except Exception: verb=None
-    if DEBUG: print(f"[ctx] chosen cmd_id={cmd_id} id_first={id_first} -> idx={idx}, verb='{verb or ''}'")
+    menu_text = _menu_item_text(hmenu, cmd_id)
+    if DEBUG: print(f"[ctx] chosen cmd_id={cmd_id} id_first={id_first} -> idx={idx}, verb='{verb or ''}', text='{menu_text}'")
+
+    # Some Windows builds fail for the built-in PowerShell entry via IContextMenu.
+    # Launching directly is reliable and matches Explorer behavior.
+    if (verb and "powershell" in verb.lower()) or ("powershell" in menu_text):
+        if _launch_powershell_here(owner_hwnd, work_dir, paths=paths):
+            _post_null(owner_hwnd)
+            return True
 
     # ── 속성(프로퍼티) 처리: 환경별 3단 폴백 ─────────────────────────
     if verb and verb.lower() in ("properties","prop","property"):
@@ -889,8 +942,8 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
             if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
             id_first=1
             try:
-                cm.QueryContextMenu(hMenu,0,id_first,0x7FFF,flags)
-                ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first)
+                id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+                ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first,id_last=id_last)
                 evf.clear()
                 if ok: return True
             except Exception as e:
@@ -908,8 +961,9 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
         evf.set_context(cm); hMenu=win32gui.CreatePopupMenu()
         flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
-        id_first=1; cm.QueryContextMenu(hMenu,0,id_first,0x7FFF,flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first)
+        id_first=1
+        id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first,id_last=id_last)
         evf.clear(); return ok
     finally:
         pythoncom.CoUninitialize()
@@ -926,8 +980,9 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
         hMenu=win32gui.CreatePopupMenu()
         flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
-        id_first=1; cm.QueryContextMenu(hMenu,0,id_first,0x7FFF,flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=[folder_path],id_first=id_first)
+        id_first=1
+        id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=[folder_path],id_first=id_first,id_last=id_last)
         evf.clear(); return ok
     finally:
         pythoncom.CoUninitialize()
