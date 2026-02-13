@@ -1817,6 +1817,8 @@ class ExplorerView(QTreeView):
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self._drag_start_pos = None
         self._drag_start_index = QtCore.QModelIndex()
+        self._drag_start_modifiers = Qt.NoModifier
+        self._drag_ready = False
         # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
@@ -1851,6 +1853,8 @@ class ExplorerView(QTreeView):
         if e.button() == Qt.LeftButton:
             self._drag_start_pos = e.pos()
             self._drag_start_index = self.indexAt(e.pos())
+            self._drag_start_modifiers = e.modifiers()
+            self._drag_ready = False
 
         # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
         try:
@@ -1880,19 +1884,27 @@ class ExplorerView(QTreeView):
         if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
             # 일부 Windows 환경에서 드래그-아웃 대신 내부 다중선택이 시작되는 문제를 회피
             if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
-                ix = self._drag_start_index
-                sm = self.selectionModel()
-                if ix.isValid() and sm and sm.isSelected(ix):
-                    self._drag_start_pos = None
-                    self._drag_start_index = QtCore.QModelIndex()
+                if not self._drag_ready:
+                    ix = self._drag_start_index
+                    sm = self.selectionModel()
+                    # 클릭 시점에 선택 확장용 보조키가 없고, 원래 선택되어 있던 항목에서만 강제 드래그
+                    no_select_mod = not (self._drag_start_modifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+                    self._drag_ready = bool(ix.isValid() and sm and sm.isSelected(ix) and no_select_mod)
+                if self._drag_ready:
+                    self._clear_drag_state()
                     self.startDrag(Qt.CopyAction | Qt.MoveAction)
                     return
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        self._clear_drag_state()
+        super().mouseReleaseEvent(e)
+
+    def _clear_drag_state(self):
         self._drag_start_pos = None
         self._drag_start_index = QtCore.QModelIndex()
-        super().mouseReleaseEvent(e)
+        self._drag_start_modifiers = Qt.NoModifier
+        self._drag_ready = False
 
 
 # -------------------- Explorer Pane --------------------
@@ -2003,7 +2015,6 @@ class ExplorerPane(QWidget):
     def _setup_view(self):
         self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._on_context_menu)
