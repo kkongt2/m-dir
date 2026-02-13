@@ -1560,14 +1560,18 @@ class PathBar(QWidget):
         super().__init__(parent); self._current_path=QDir.homePath()
         self.setObjectName("pathbar")
 
-        self._host=QWidget(self); self._hlay=QHBoxLayout(self._host)
+        self._host=QWidget(); self._hlay=QHBoxLayout(self._host)
+        self._host.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self._host.setMinimumHeight(UI_H)
         self._hlay.setContentsMargins(4,0,4,0); self._hlay.setSpacing(max(0, ROW_SPACING-2))
 
         self._scroll=QScrollArea(self); self._scroll.setObjectName("crumbScroll")
         self._scroll.setWidget(self._host)
-        self._scroll.setWidgetResizable(True); self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidgetResizable(False); self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setViewportMargins(0,0,0,0); self._scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._scroll.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._hbar = self._scroll.horizontalScrollBar()
         self._scroll.setFixedHeight(UI_H); self.setFixedHeight(UI_H)
 
         # ── viewport에도 이름/배경 허용 속성을 부여(스타일 대상) ──
@@ -1649,16 +1653,29 @@ class PathBar(QWidget):
     def _rebuild(self):
         while self._hlay.count():
             it=self._hlay.takeAt(0); w=it.widget()
-            if w: w.deleteLater()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
         p=self._current_path; parts=[]
-        if p.startswith("\\\\"):
-            comps=[c for c in p.split(os.sep) if c]
+        p_unc = p.replace("/", "\\")
+        if p_unc.startswith("\\\\"):
+            comps=[c for c in p_unc.split("\\") if c]
             if len(comps)>=2:
-                root=f"\\\\{comps[0]}\\{comps[1]}\\"
-                parts.append((root,root)); acc=root
+                server = f"\\\\{comps[0]}"
+                share = comps[1]
+                server_root = server + "\\"
+                share_root = server_root + share + "\\"
+                server_target = server_root if os.path.exists(server_root) else share_root
+                parts.append((server, server_target))
+                parts.append((share, share_root))
+                acc = share_root.rstrip("\\")
                 for c in comps[2:]:
                     acc=os.path.join(acc,c); parts.append((c,acc))
-            else: parts.append((p,p))
+            elif len(comps)==1:
+                server = f"\\\\{comps[0]}"
+                parts.append((server, server + "\\"))
+            else:
+                parts.append((p,p))
         else:
             drive,_=os.path.splitdrive(p); root=(drive+os.sep) if drive else os.sep
             parts.append((root,root)); sub=p[len(root):].strip("\\/")
@@ -1666,16 +1683,31 @@ class PathBar(QWidget):
                 curr=os.path.join(parts[-1][1], seg); parts.append((seg,curr))
         fm=self.fontMetrics()
         for i,(label,target) in enumerate(parts):
-            btn=QPushButton(self); btn.setObjectName("crumb"); btn.setFlat(True); btn.setCursor(Qt.PointingHandCursor)
+            btn=QPushButton(self._host); btn.setObjectName("crumb"); btn.setFlat(True); btn.setCursor(Qt.PointingHandCursor)
             elided=fm.elidedText(label, Qt.ElideMiddle, CRUMB_MAX_SEG_W)
             btn.setText(elided); btn.setToolTip(label); btn.setMinimumHeight(UI_H)
             btn.clicked.connect(lambda _,t=target: self.pathSubmitted.emit(t))
             self._hlay.addWidget(btn)
             if i < len(parts)-1:
-                s=QLabel("›", self); s.setObjectName("crumbSep"); s.setContentsMargins(0,0,0,0); self._hlay.addWidget(s)
-        self._hlay.addStretch(1)
+                s=QLabel("›", self._host); s.setObjectName("crumbSep"); s.setContentsMargins(0,0,0,0); self._hlay.addWidget(s)
+        self._hlay.activate()
+        m = self._hlay.contentsMargins()
+        item_w = 0
+        item_n = 0
+        for i in range(self._hlay.count()):
+            it = self._hlay.itemAt(i)
+            w = it.widget() if it else None
+            if w is None:
+                continue
+            item_w += max(0, w.sizeHint().width())
+            item_n += 1
+        total_w = m.left() + m.right() + item_w + (max(0, item_n - 1) * self._hlay.spacing())
+        total_h = max(UI_H, self._hlay.sizeHint().height(), 1)
+        self._host.setFixedSize(max(1, total_w), total_h)
+        self._host.updateGeometry()
 
         # 빌드 직후에도 항상 오른쪽(가장 하위 폴더)이 보이도록 고정
+        self._pin_to_right()
         QTimer.singleShot(0, self._pin_to_right)
 
     def resizeEvent(self, ev):
@@ -1685,8 +1717,21 @@ class PathBar(QWidget):
 
     def _pin_to_right(self):
         try:
-            if hasattr(self, "_hbar") and self._hbar:
+            if not (hasattr(self, "_hbar") and self._hbar):
+                return
+            vp = self._scroll.viewport()
+            if vp is None:
+                return
+            viewport_w = vp.width()
+            if viewport_w <= 0:
+                return
+            content_w = max(self._host.sizeHint().width(), self._host.width())
+            if content_w > (viewport_w + 1):
+                # Overflow only: show the tail (deepest folder) first.
                 self._hbar.setValue(self._hbar.maximum())
+            else:
+                # Fits fully: keep the normal left-aligned start.
+                self._hbar.setValue(self._hbar.minimum())
         except Exception:
             pass
 
@@ -2017,6 +2062,8 @@ class ExplorerPane(QWidget):
         self._dirload_timer={}
         self._sort_column = 0  # 기본값: Name
         self._sort_order = Qt.AscendingOrder
+        self._header_resize_guard = False
+        self._browse_name_min_width = 140
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -2092,27 +2139,27 @@ class ExplorerPane(QWidget):
         self.view.setUniformRowHeights(True); self.view.setAnimated(False); self.view.setExpandsOnDoubleClick(False); self.view.setRootIsDecorated(False)
         self._configure_header_browse()
         self.view.header().sectionClicked.connect(self._on_header_clicked)
+        self.view.header().sectionResized.connect(self._on_header_section_resized)
 
     def _configure_header_browse(self):
         header = self.view.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for i in (1, 2, 3):
+        for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
         header.resizeSection(1, 90)
         header.resizeSection(3, 150)
         self.view.setColumnHidden(2, True)
+        self._schedule_browse_name_autofit()
 
     def _configure_header_fast(self):
         header = self.view.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        for i in range(4):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
         header.resizeSection(1, 90)
         header.resizeSection(3, 150)
         self.view.setColumnHidden(2, True)
+        self._schedule_browse_name_autofit()
 
     def _configure_header_search(self):
         header = self.view.header()
@@ -2123,6 +2170,45 @@ class ExplorerPane(QWidget):
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         header.resizeSection(1, 90)
         header.resizeSection(2, 150)
+
+    def _schedule_browse_name_autofit(self):
+        if self._search_mode:
+            return
+        QTimer.singleShot(0, self._autofit_browse_name_column)
+
+    def _autofit_browse_name_column(self):
+        if self._search_mode:
+            return
+        v = getattr(self, "view", None)
+        if v is None:
+            return
+        header = v.header()
+        if header is None:
+            return
+        # Browse/Fast mode only (Type column hidden).
+        if not v.isColumnHidden(2):
+            return
+        vp_w = v.viewport().width()
+        if vp_w <= 0:
+            return
+        target = vp_w - header.sectionSize(1) - header.sectionSize(3)
+        target = max(self._browse_name_min_width, target)
+        if abs(header.sectionSize(0) - target) <= 1:
+            return
+        self._header_resize_guard = True
+        try:
+            header.blockSignals(True)
+            header.resizeSection(0, target)
+        finally:
+            header.blockSignals(False)
+            self._header_resize_guard = False
+
+    def _on_header_section_resized(self, logical_index:int, _old_size:int, _new_size:int):
+        if self._header_resize_guard or self._search_mode:
+            return
+        # Keep Name filling the remaining width after Size/Date changes.
+        if logical_index in (1, 3):
+            self._schedule_browse_name_autofit()
 
     def _build_status_row(self):
         self.lbl_sel=QLabel("", self); self.lbl_free=QLabel("", self)
@@ -2627,6 +2713,7 @@ class ExplorerPane(QWidget):
                             QToolTip.showText(QCursor.pos(), tip, self.view); self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
             if ev.type() in (QEvent.Resize, QEvent.Show):
                 QTimer.singleShot(0, self._schedule_visible_stats)
+                self._schedule_browse_name_autofit()
             return False
 
         # 필터 입력창: Esc로 필터 해제 + 브라우즈 모드 복귀
