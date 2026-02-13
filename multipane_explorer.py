@@ -2832,6 +2832,11 @@ class ExplorerPane(QWidget):
                 QMessageBox.warning(self, "Path not found", path)
                 return
 
+            # 검색 결과 뷰에서 다른 폴더로 이동할 때는 먼저 검색 모드를 정리한다.
+            # (_search_mode가 남아 있으면 normal 모델 전환이 막혀 외부 드래그가 실패할 수 있음)
+            if self._search_mode:
+                self._enter_browse_mode()
+
             cur = getattr(self.path_bar, "_current_path", None)
             if push_history and cur and os.path.normcase(cur) != os.path.normcase(path):
                 self._back_stack.append(cur)
