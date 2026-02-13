@@ -1815,6 +1815,8 @@ class ExplorerView(QTreeView):
         self.setDragEnabled(True); self.setAcceptDrops(True)
         self.setDropIndicatorShown(True); self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QAbstractItemView.DragDrop)
+        self._drag_start_pos = None
+        self._drag_start_index = QtCore.QModelIndex()
         # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
@@ -1846,6 +1848,10 @@ class ExplorerView(QTreeView):
 
     # 단일 선택 항목을 재클릭해도 선택 해제되지 않게
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_start_pos = e.pos()
+            self._drag_start_index = self.indexAt(e.pos())
+
         # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
         try:
             if not self.hasFocus():
@@ -1869,6 +1875,24 @@ class ExplorerView(QTreeView):
             return
 
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
+            # 일부 Windows 환경에서 드래그-아웃 대신 내부 다중선택이 시작되는 문제를 회피
+            if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                ix = self._drag_start_index
+                sm = self.selectionModel()
+                if ix.isValid() and sm and sm.isSelected(ix):
+                    self._drag_start_pos = None
+                    self._drag_start_index = QtCore.QModelIndex()
+                    self.startDrag(Qt.CopyAction | Qt.MoveAction)
+                    return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_start_pos = None
+        self._drag_start_index = QtCore.QModelIndex()
+        super().mouseReleaseEvent(e)
 
 
 # -------------------- Explorer Pane --------------------
@@ -1979,6 +2003,7 @@ class ExplorerPane(QWidget):
     def _setup_view(self):
         self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._on_context_menu)
