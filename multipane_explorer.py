@@ -1918,6 +1918,13 @@ class ExplorerView(QTreeView):
 # -------------------- Explorer Pane --------------------
 class ExplorerPane(QWidget):
     requestBackgroundOp=pyqtSignal(str, list, str)
+    _FALLBACK_NEW_ACTION_SPECS = (
+        ("New Folder", "folder", "New Folder", None, "Folder created"),
+        ("New Text File (.txt)", "file", "New Text Document.txt", ".txt", "Text file created"),
+        ("New Word Document (.docx)", "file", "New Word Document.docx", ".docx", "Word document created"),
+        ("New Excel Workbook (.xlsx)", "file", "New Excel Workbook.xlsx", ".xlsx", "Excel workbook created"),
+        ("New PowerPoint Presentation (.pptx)", "file", "New PowerPoint Presentation.pptx", ".pptx", "PowerPoint presentation created"),
+    )
     def __init__(self, _unused, start_path: str, pane_id: int, host_main):
         super().__init__()
         self.pane_id=pane_id; self.host=host_main
@@ -2028,12 +2035,38 @@ class ExplorerPane(QWidget):
         self.view.customContextMenuRequested.connect(self._on_context_menu)
         self.view.setMouseTracking(True)
         self.view.setUniformRowHeights(True); self.view.setAnimated(False); self.view.setExpandsOnDoubleClick(False); self.view.setRootIsDecorated(False)
-        header=self.view.header()
+        self._configure_header_browse()
+        self.view.header().sectionClicked.connect(self._on_header_clicked)
+
+    def _configure_header_browse(self):
+        header = self.view.header()
         header.setStretchLastSection(False)
-        for i in range(4): header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90); header.resizeSection(3, 150)
-        header.sectionClicked.connect(self._on_header_clicked)
+        for i in range(4):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
+        header.resizeSection(1, 90)
+        header.resizeSection(3, 150)
         self.view.setColumnHidden(2, True)
+
+    def _configure_header_fast(self):
+        header = self.view.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.resizeSection(1, 90)
+        header.resizeSection(3, 150)
+        self.view.setColumnHidden(2, True)
+
+    def _configure_header_search(self):
+        header = self.view.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.resizeSection(1, 90)
+        header.resizeSection(2, 150)
 
     def _build_status_row(self):
         self.lbl_sel=QLabel("", self); self.lbl_free=QLabel("", self)
@@ -2675,22 +2708,12 @@ class ExplorerPane(QWidget):
         self._using_fast = True
         self._fast_model.reset_dir(path)
         self.view.setModel(self._fast_proxy)
-
-        # 헤더 구성 (정렬은 '끝난 뒤'에만 적용하여 병목 제거)
-        header = self.view.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        self._configure_header_fast()
 
         # ── 아이콘 채우기 임시 비활성화(열거 중만) ─────────────────────
         #   Fast 모드에서 가시 영역 통계 계산 시 OS 아이콘을 요청하면
         #   큰 지연이 발생할 수 있어, 열거가 끝날 때까지 무시합니다.
-        _orig_apply_icon = getattr(self._fast_model, "apply_icon", None)
+        orig_apply_icon = getattr(self._fast_model, "apply_icon", None)
 
         def _noop_apply_icon(_row, _icon):
             # 열거 중에는 실제 아이콘을 적용하지 않음
@@ -2699,7 +2722,7 @@ class ExplorerPane(QWidget):
         try:
             self._fast_model.apply_icon = _noop_apply_icon
         except Exception:
-            _orig_apply_icon = None  # 복구 불가해도 동작에는 지장 없음
+            orig_apply_icon = None  # 복구 불가해도 동작에는 지장 없음
 
         # 열거 중에는 재정렬이 반복되지 않도록 정렬/업데이트를 잠시 끔
         was_sorting = self.view.isSortingEnabled()
@@ -2722,6 +2745,14 @@ class ExplorerPane(QWidget):
             lambda msg: self.host.statusBar().showMessage(f"List error: {msg}", 4000)
         )
 
+        def _restore_apply_icon():
+            if orig_apply_icon is None:
+                return
+            try:
+                self._fast_model.apply_icon = orig_apply_icon
+            except Exception:
+                pass
+
         # 열거 종료: 정렬/업데이트 복구 + 아이콘 채우기 복구 후 즉시 가시영역 아이콘/통계를 채움
         def _on_finished():
             try:
@@ -2732,11 +2763,7 @@ class ExplorerPane(QWidget):
                 self.view.setSortingEnabled(True)
 
                 # 아이콘 apply 함수 원복 → 이제 가시영역 아이콘을 실제로 채움
-                if _orig_apply_icon is not None:
-                    try:
-                        self._fast_model.apply_icon = _orig_apply_icon
-                    except Exception:
-                        pass
+                _restore_apply_icon()
 
                 # 가시 영역 통계/아이콘을 즉시 2회 스케줄(첫 패스 후 아이콘 캐시 안정화용)
                 QTimer.singleShot(0, self._schedule_visible_stats)
@@ -2749,33 +2776,6 @@ class ExplorerPane(QWidget):
         self._enum_worker.finished.connect(_on_finished)
 
         # 초기 화면 빈칸 방지를 위해 첫 패스 예약
-        QTimer.singleShot(0, self._schedule_visible_stats)
-
-        # 백그라운드 열거 시작
-        self._enum_worker.start()
-
-
-        # 열거 종료: 이제 한 번만 정렬/리페인트/상태 업데이트
-        def _on_finished():
-            try:
-                # 리스트 추가가 끝났으니 업데이트를 다시 켭니다.
-                self.view.setUpdatesEnabled(True)
-
-                # 기본 정렬(크기 내림차순) 적용 — 이제 한 번만 비용 지불
-                self._apply_saved_sort()
-                self.view.setSortingEnabled(True)
-
-                # 최초 가시영역 통계 계산
-                QTimer.singleShot(0, self._schedule_visible_stats)
-            finally:
-                # 정렬이 꺼져 있었던 경우만 되돌립니다.
-                if not was_sorting:
-                    # 사용자가 정렬을 끄고 사용 중이었다면 유지
-                    self.view.setSortingEnabled(False)
-
-        self._enum_worker.finished.connect(_on_finished)
-
-        # 시작 직후 한 번 가시영역 통계를 예약(초기 화면 빈칸 방지)
         QTimer.singleShot(0, self._schedule_visible_stats)
 
         # 백그라운드 열거 시작
@@ -2825,9 +2825,91 @@ class ExplorerPane(QWidget):
         # 일반 모델 비동기 로딩 시작
         _ = self.source_model.setRootPath(path)
 
+    def _unc_share_root(self, path:str)->str:
+        if not path:
+            return ""
+        p = path.replace("/", "\\")
+        if not p.startswith("\\\\"):
+            return ""
+        comps = [c for c in p.split("\\") if c]
+        if len(comps) < 2:
+            return ""
+        return f"\\\\{comps[0]}\\{comps[1]}"
+
+    def _try_network_auth_prompt(self, path:str)->tuple[bool, bool]:
+        """
+        Return (accessible, prompted).
+        - accessible: path became accessible after this call
+        - prompted: a credential/login flow was launched
+        """
+        target = self._unc_share_root(path)
+        prompted = False
+
+        if target:
+            try:
+                class _NETRESOURCEW(ctypes.Structure):
+                    _fields_ = [
+                        ("dwScope", ctypes.c_ulong),
+                        ("dwType", ctypes.c_ulong),
+                        ("dwDisplayType", ctypes.c_ulong),
+                        ("dwUsage", ctypes.c_ulong),
+                        ("lpLocalName", ctypes.c_wchar_p),
+                        ("lpRemoteName", ctypes.c_wchar_p),
+                        ("lpComment", ctypes.c_wchar_p),
+                        ("lpProvider", ctypes.c_wchar_p),
+                    ]
+
+                nr = _NETRESOURCEW()
+                nr.dwType = 1  # RESOURCETYPE_DISK
+                nr.lpRemoteName = target
+
+                CONNECT_INTERACTIVE = 0x00000008
+                CONNECT_PROMPT = 0x00000010
+                CONNECT_TEMPORARY = 0x00000004
+                flags = CONNECT_INTERACTIVE | CONNECT_PROMPT | CONNECT_TEMPORARY
+
+                hwnd = int(self.window().winId()) if self.window() else 0
+                rc = ctypes.windll.mpr.WNetAddConnection3W(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.byref(nr),
+                    None,
+                    None,
+                    flags,
+                )
+                prompted = True
+                if DEBUG:
+                    dlog(f"[net] WNetAddConnection3W rc={rc} target={target}")
+            except Exception as e:
+                if DEBUG:
+                    dlog(f"[net] WNetAddConnection3W failed: {e}")
+
+            if os.path.exists(path) or os.path.exists(target):
+                return True, prompted
+
+        open_target = target or path
+        try:
+            subprocess.Popen(["explorer.exe", open_target])
+            prompted = True
+        except Exception as e:
+            if DEBUG:
+                dlog(f"[net] explorer launch failed ({open_target}): {e}")
+
+        return os.path.exists(path), prompted
+
     def set_path(self, path:str, push_history:bool=True):
         with perf(f"set_path begin -> {path}"):
             path = nice_path(path)
+            if (not os.path.exists(path)) and self._is_network_path(path):
+                accessible, prompted = self._try_network_auth_prompt(path)
+                if accessible:
+                    pass
+                elif prompted:
+                    QMessageBox.information(
+                        self,
+                        "Network Sign-in",
+                        "네트워크 인증 창을 열었습니다.\n인증 후 같은 경로를 다시 열어주세요.",
+                    )
+                    return
             if not os.path.exists(path):
                 QMessageBox.warning(self, "Path not found", path)
                 return
@@ -2964,12 +3046,7 @@ class ExplorerPane(QWidget):
                 # ★ 선택모델 재연결
                 self._hook_selection_model()
 
-                header = self.view.header()
-                for i in range(4):
-                    header.setSectionResizeMode(i, QHeaderView.Interactive)
-                header.resizeSection(1, 90)
-                header.resizeSection(3, 150)
-                self.view.setColumnHidden(2, True)
+                self._configure_header_browse()
                 if not self.view.isSortingEnabled():
                     self.view.setSortingEnabled(True)
                 # 저장된 정렬 적용
@@ -3263,13 +3340,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-        header = self.view.header()
-        header.setStretchLastSection(False)
-        for i in range(4):
-            header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        self._configure_header_browse()
         if not self.view.isSortingEnabled():
             self.view.setSortingEnabled(True)
         # 저장된 정렬 적용
@@ -3290,13 +3361,8 @@ class ExplorerPane(QWidget):
         # ★ 선택모델 재연결
         self._hook_selection_model()
 
-        header=self.view.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.resizeSection(1,90); header.resizeSection(2,150)
+        header = self.view.header()
+        self._configure_header_search()
         if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
         header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
 
@@ -3389,66 +3455,58 @@ class ExplorerPane(QWidget):
             self._search_stat_worker = w
             w.start()
 
+    def _build_fallback_new_actions(self, menu: QMenu):
+        return {
+            menu.addAction(label): (kind, default_name, ext, status)
+            for label, kind, default_name, ext, status in self._FALLBACK_NEW_ACTION_SPECS
+        }
+
+    def _create_fallback_new_item(self, dst_dir: str, kind: str, default_name: str, ext: str | None):
+        if kind == "folder":
+            newp = unique_dest_path(dst_dir, default_name)
+            os.makedirs(newp, exist_ok=False)
+            return
+        _create_new_file_with_template(dst_dir, default_name, ext or "")
+
+    def _context_menu_screen_point(self, pos) -> tuple[int, int]:
+        try:
+            cx, cy = win32api.GetCursorPos()
+            return int(cx), int(cy)
+        except Exception:
+            g = self.view.viewport().mapToGlobal(pos)
+            return g.x(), g.y()
+
+    def _try_native_context_menu(self, pos, owner_hwnd: int, paths: list[str]) -> bool:
+        if not HAS_PYWIN32:
+            return False
+        screen_pt = self._context_menu_screen_point(pos)
+        if paths:
+            return show_explorer_context_menu(owner_hwnd, paths, screen_pt)
+        return show_explorer_background_menu(owner_hwnd, self.current_path(), screen_pt)
+
     def _on_context_menu(self, pos):
         owner_hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
         paths = self._selected_paths()
-        handled = False
 
         # 먼저 윈도우 탐색기 네이티브 메뉴 시도
-        if HAS_PYWIN32:
-            try:
-                cx, cy = win32api.GetCursorPos()
-                screen_pt = (int(cx), int(cy))
-            except Exception:
-                g = self.view.viewport().mapToGlobal(pos)
-                screen_pt = (g.x(), g.y())
-            if paths:
-                handled = show_explorer_context_menu(owner_hwnd, paths, screen_pt)
-            else:
-                handled = show_explorer_background_menu(owner_hwnd, self.current_path(), screen_pt)
-            if handled:
-                return
+        if self._try_native_context_menu(pos, owner_hwnd, paths):
+            return
 
         # ── Fallback: 'New' 항목만 상위 레벨에 바로 표시 ──
         dst_dir = self.current_path()
         global_pt = QCursor.pos()
         menu = QMenu(self)
-
-        a_new_folder = menu.addAction("New Folder")
-        a_new_txt    = menu.addAction("New Text File (.txt)")
-        a_new_docx   = menu.addAction("New Word Document (.docx)")
-        a_new_xlsx   = menu.addAction("New Excel Workbook (.xlsx)")
-        a_new_pptx   = menu.addAction("New PowerPoint Presentation (.pptx)")
-
+        action_map = self._build_fallback_new_actions(menu)
         action = menu.exec_(global_pt)
+        selected = action_map.get(action)
+        if not selected:
+            return
+        kind, default_name, ext, status = selected
 
         try:
-            if action == a_new_folder:
-                newp = unique_dest_path(dst_dir, "New Folder")
-                os.makedirs(newp, exist_ok=False)
-                self.hard_refresh()
-                self.host.flash_status("Folder created")
-                return
-            if action == a_new_txt:
-                _create_new_file_with_template(dst_dir, "New Text Document.txt", ".txt")
-                self.hard_refresh()
-                self.host.flash_status("Text file created")
-                return
-            if action == a_new_docx:
-                _create_new_file_with_template(dst_dir, "New Word Document.docx", ".docx")
-                self.hard_refresh()
-                self.host.flash_status("Word document created")
-                return
-            if action == a_new_xlsx:
-                _create_new_file_with_template(dst_dir, "New Excel Workbook.xlsx", ".xlsx")
-                self.hard_refresh()
-                self.host.flash_status("Excel workbook created")
-                return
-            if action == a_new_pptx:
-                _create_new_file_with_template(dst_dir, "New PowerPoint Presentation.pptx", ".pptx")
-                self.hard_refresh()
-                self.host.flash_status("PowerPoint presentation created")
-                return
+            self._create_fallback_new_item(dst_dir, kind, default_name, ext)
+            self.hard_refresh()
+            self.host.flash_status(status)
         except Exception as e:
             QMessageBox.critical(self, "Create failed", str(e))
 
@@ -3477,6 +3535,26 @@ class ExplorerPane(QWidget):
             comps=[c for c in path.split("\\") if c]
             return f"\\\\{comps[0]}\\{comps[1]}" if len(comps)>=2 else "\\\\"
         drv,_=os.path.splitdrive(path); return drv if drv else os.sep
+
+    def _is_network_path(self, path:str)->bool:
+        if not path:
+            return False
+        try:
+            path = os.path.abspath(path)
+        except Exception:
+            pass
+        path = path.replace("/", "\\")
+        if path.startswith("\\\\"):
+            return True
+        drv, _ = os.path.splitdrive(path)
+        if not drv:
+            return False
+        try:
+            DRIVE_REMOTE = 4
+            return ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(drv + "\\")) == DRIVE_REMOTE
+        except Exception:
+            return False
+
     def _update_pane_status(self):
         sel = self._selected_paths()
         cnt = len(sel)
@@ -3499,11 +3577,14 @@ class ExplorerPane(QWidget):
 
         # 우측 드라이브 여유 공간
         path = self.current_path()
-        try:
-            total, used, free = shutil.disk_usage(path)
-            self.lbl_free.setText(f"{self._drive_label(path)} free {human_size(free)}")
-        except Exception:
+        if self._is_network_path(path):
             self.lbl_free.setText("")
+        else:
+            try:
+                total, used, free = shutil.disk_usage(path)
+                self.lbl_free.setText(f"{self._drive_label(path)} free {human_size(free)}")
+            except Exception:
+                self.lbl_free.setText("")
 
 
 # -------------------- Main Window --------------------
