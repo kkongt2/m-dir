@@ -728,7 +728,16 @@ def _ensure_event_filter(app: QApplication) -> WinCtxMenuEventFilter:
 
 def _as_interface(obj):
     if obj is None: return None
-    if isinstance(obj,(list,tuple)): obj = obj[0] if obj else None
+    if isinstance(obj, (list, tuple)):
+        # Some pywin32 shell calls return (hresult, interface).
+        # Pick the first non-int payload as the COM interface.
+        cand = None
+        for v in obj:
+            if isinstance(v, int):
+                continue
+            cand = v
+            break
+        obj = cand
     if isinstance(obj,int): return None
     return obj
 
@@ -930,12 +939,25 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
     if not HAS_PYWIN32 or not paths: return False
     pythoncom.CoInitialize()
     try:
-        parents={str(Path(p).parent) for p in paths}
-        if len(parents)!=1: paths=[paths[0]]; parents={str(Path(paths[0]).parent)}
-        parent_dir=_normalize_fs_path(next(iter(parents)))
+        # Keep all selected paths even when parents differ (filtered search results).
+        norm_paths = []
+        seen = set()
+        for p in paths:
+            if not p:
+                continue
+            np = _normalize_fs_path(p)
+            key = os.path.normcase(os.path.normpath(np))
+            if key in seen:
+                continue
+            seen.add(key)
+            norm_paths.append(np)
+        if not norm_paths:
+            return False
+
+        parent_dir = _normalize_fs_path(os.path.dirname(norm_paths[0]) or os.getcwd())
         app=QApplication.instance(); evf=_ensure_event_filter(app)
 
-        cm=_icm_via_shellitems(paths)
+        cm=_icm_via_shellitems(norm_paths)
         if cm:
             evf.set_context(cm); hMenu=win32gui.CreatePopupMenu()
             flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
@@ -943,7 +965,7 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
             id_first=1
             try:
                 id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-                ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first,id_last=id_last)
+                ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
                 evf.clear()
                 if ok: return True
             except Exception as e:
@@ -952,7 +974,7 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
 
         try:
             desktop=shell.SHGetDesktopFolder()
-            abs_pidls=tuple(_abs_pidl(p) for p in paths)
+            abs_pidls=tuple(_abs_pidl(p) for p in norm_paths)
             cm=desktop.GetUIObjectOf(0,abs_pidls,shell.IID_IContextMenu,0); cm=_as_interface(cm)
         except Exception as e:
             if DEBUG: print("[ctx] desktop GetUIObjectOf failed:", e); cm=None
@@ -963,7 +985,7 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
         id_first=1
         id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=paths,id_first=id_first,id_last=id_last)
+        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
         evf.clear(); return ok
     finally:
         pythoncom.CoUninitialize()
@@ -3633,6 +3655,10 @@ class ExplorerPane(QWidget):
 
         # 먼저 윈도우 탐색기 네이티브 메뉴 시도
         if self._try_native_context_menu(pos, owner_hwnd, paths):
+            return
+
+        # 선택 항목이 있는 경우, 배경 전용(New) fallback 메뉴는 띄우지 않음
+        if paths:
             return
 
         # ── Fallback: 'New' 항목만 상위 레벨에 바로 표시 ──
