@@ -1,83 +1,94 @@
 # Multi-Pane File Explorer (PyQt5)
 
-A fast, keyboard-friendly **multi-pane (4/6/8)** file explorer for Windows.  
-**by kkongt2 · Built with GPT-5 Thinking**
+A multi-pane file explorer for Windows.
+This README reflects the current behavior of `multipane_explorer.py`.
 
-> Windows 10/11 · Python 3.9–3.12
-
----
+## Requirements
+- Windows 10/11 (recommended)
+- Python 3.10+
+- PyQt5
+- Optional: `pywin32`, `send2trash`
 
 ## Features
-- **4 / 6 / 8 panes** with instant layout switch; restores last session & paths
-- **Folders first, then files** sorting (size/date work as expected)
-- **Watcher-based auto refresh** on file system changes
-- **Large folder optimization**: `os.scandir` incremental listing + deferred size/icon stat
-- **Breadcrumb chips**: only the active pane’s crumbs get a subtle blue highlight
-- **Filter / search**: wildcards like `*.txt`, `*report*.xlsx`; **Esc** clears & returns to browse
-- **One-click “New”**: folder / empty `.txt` (docx/xlsx/pptx templates when available)
-- **Copy/Move conflict resolver**: per-item **Overwrite / Skip / Copy (keep both)**
-- **Native Explorer context menu** (with pywin32), Properties supported
-- **Bookmarks + named sessions** (save/restore all pane paths), Dark/Light themes
-
----
+- 4/6/8 pane layout switching (top toolbar + `--panes`), with last layout/path restore
+- Per-pane back/forward/up navigation history
+- Folders-first sorting, with proper size/date sorting for files
+- Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff
+- Auto-refresh on file system changes via `QFileSystemWatcher`
+- Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
+- Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
+- File operation progress dialog with cancellation
+- Delete to Recycle Bin (`send2trash`/Shell API when available), `Shift+Delete` for permanent delete
+- Bookmark editor and quick bookmark buttons (up to 10 bookmarks)
+- Session save/load/delete (pane count + pane paths)
+- Dark/light theme toggle and active-pane highlighting
+- Native Explorer context menu when `pywin32` is available, fallback menu otherwise
+- Open Command Prompt in the current folder
 
 ## Install
-```bash
+```powershell
 python -m venv .venv
-# PowerShell
 .\.venv\Scripts\Activate.ps1
-pip install PyQt5 send2trash pywin32
+pip install PyQt5 pywin32 send2trash
 ```
-> `pywin32` enables the native Explorer context menu/Properties.  
-> `send2trash` is used for safe recycling.
 
----
+`pywin32` and `send2trash` are optional but recommended for native context-menu integration and reliable Recycle Bin behavior.
 
 ## Run
-```bash
+```powershell
 python multipane_explorer.py [--panes 4|6|8] [--debug] [start_path1 start_path2 ...]
 ```
+
 Examples:
-```bash
+```powershell
 python multipane_explorer.py --panes 6
 python multipane_explorer.py --panes 6 --debug
 python multipane_explorer.py --panes 4 "C:\Windows" "D:\WS" "C:\Users\USER" "C:\Temp"
 ```
 
-PowerShell (env var):
+Enable debug logs with environment variable:
 ```powershell
 $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 ```
 
-Settings are stored via `QSettings`.  
-**Organization**: `MultiPane` · **Application**: `Multi-Pane File Explorer`
+## Search/Filter Behavior
+- Type a filter and press `Enter` (or click `Search`) to run recursive search from the current folder
+- Pattern separators: space, `,`, `;` (OR matching)
+- Press `Esc` in the filter input to clear filter and return to browse mode
+- Search result cap: 50,000 items
 
----
-
-## Keyboard Shortcuts (essentials)
+## Keyboard Shortcuts
 | Key | Action |
 |---|---|
-| Alt+Left / Alt+Right | Back / Forward |
-| **Alt+Up** | Go to parent folder |
-| Backspace | Back |
-| Enter / Ctrl+O | Open / Navigate |
-| F2 | Rename |
-| Delete / Shift+Delete | Recycle / Delete permanently |
-| Ctrl+C / X / V | Copy / Cut / Paste |
-| **Ctrl+Shift+C** | Copy full path of selection |
-| **Alt+Shift+C** | Copy folder path only (files → parent folder) |
-| Ctrl+L / F4 | Focus path bar |
-| **Ctrl+F / F3** | Focus filter (Esc clears & returns to browse) |
-| F5 | Hard refresh |
+| `Backspace` / `Alt+Left` | Back |
+| `Alt+Right` | Forward |
+| `Alt+Up` | Parent folder |
+| `Enter` / `Ctrl+O` | Open |
+| `Ctrl+L` / `F4` | Edit path |
+| `Ctrl+F` / `F3` | Focus filter |
+| `Esc` (in filter input) | Clear filter + return to browse mode |
+| `F5` | Hard refresh |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste |
+| `Ctrl+Z` | Undo (currently focused on new folder / rename actions) |
+| `Delete` / `Shift+Delete` | Recycle / Permanent delete |
+| `F2` | Rename |
+| `Ctrl+Shift+C` | Copy full path |
+| `Alt+Shift+C` | Copy folder path (parent folder if a file is selected) |
 
----
+## Settings
+Uses `QSettings`:
+- Organization: `MultiPane`
+- Application: `Multi-Pane File Explorer`
 
-## Tips
-- Each pane filters independently.  
-- The **active pane** gets a subtle blue accent and blue breadcrumb chips.  
-- Very large directories are listed incrementally to keep the UI responsive.
+Stored values include:
+- Window geometry
+- Theme
+- Pane count and per-pane last path
+- Bookmarks and sessions
+- Per-pane sort column and sort order
 
----
+## Build (optional)
+You can build with PyInstaller using `makeExe.bat` or `MultiPaneExplorer.spec`.
 
 ## License
 MIT

@@ -68,6 +68,24 @@ SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
 
+# Keep this list in sync with the README keyboard-shortcuts section.
+KEYBOARD_SHORTCUTS = [
+    ("Backspace / Alt+Left", "Back"),
+    ("Alt+Right", "Forward"),
+    ("Alt+Up", "Parent folder"),
+    ("Enter / Ctrl+O", "Open"),
+    ("Ctrl+L / F4", "Edit path"),
+    ("Ctrl+F / F3", "Focus filter"),
+    ("Esc (in filter input)", "Clear filter + return to browse mode"),
+    ("F5", "Hard refresh"),
+    ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy / Cut / Paste"),
+    ("Ctrl+Z", "Undo (new folder / rename actions)"),
+    ("Delete / Shift+Delete", "Recycle / Permanent delete"),
+    ("F2", "Rename"),
+    ("Ctrl+Shift+C", "Copy full path"),
+    ("Alt+Shift+C", "Copy folder path (parent folder if a file is selected)"),
+]
+
 
 HAS_PYWIN32 = True
 try:
@@ -814,6 +832,23 @@ def icon_info(theme: str):
         p.setPen(QPen(c, 2)); p.setBrush(Qt.NoBrush)
         p.drawEllipse(3,3,w-6,h-6)
         p.drawPoint(w//2, h//2-4); p.drawLine(w//2, h//2-2, w//2, h//2+6)
+    return _make_icon(22, 22, paint)
+
+def icon_shortcuts(theme: str):
+    def paint(p: QPainter, w, h):
+        border = QColor(180, 200, 255) if theme == "dark" else QColor(70, 100, 210)
+        key_fill = QColor(80, 92, 116) if theme == "dark" else QColor(240, 244, 255)
+        line = QColor(220, 228, 250) if theme == "dark" else QColor(90, 115, 210)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(border, 1.6))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(2, 4, w - 4, h - 7, 4, 4)
+        p.setBrush(QBrush(key_fill))
+        for y in (8, 12):
+            for x in (6, 10, 14):
+                p.drawRoundedRect(x, y, 3, 2, 0.8, 0.8)
+        p.setPen(QPen(line, 1.8))
+        p.drawLine(6, 16, w - 6, 16)
     return _make_icon(22, 22, paint)
 
 def icon_cmd(theme: str):
@@ -4468,10 +4503,12 @@ class MultiExplorer(QMainWindow):
         self.btn_session=QToolButton(top)
         self.btn_session.setToolTip("Session (save/load all pane paths)")
         self.btn_session.setFixedHeight(UI_H)
+        self.btn_shortcuts=QToolButton(top); self.btn_shortcuts.setToolTip("Keyboard Shortcuts"); self.btn_shortcuts.setFixedHeight(UI_H)
 
         self.btn_about=QToolButton(top); self.btn_about.setToolTip("About"); self.btn_about.setFixedHeight(UI_H)
         top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0)
         top_lay.addWidget(self.btn_session,0)
+        top_lay.addWidget(self.btn_shortcuts,0)
         top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
 
         self.central=QWidget(self); self.setCentralWidget(self.central)
@@ -4485,6 +4522,7 @@ class MultiExplorer(QMainWindow):
         self.btn_layout.clicked.connect(self._cycle_layout); self.btn_theme.clicked.connect(self._toggle_theme)
         self.btn_bm_edit.clicked.connect(self._open_bookmark_editor)
         self.btn_session.clicked.connect(self._open_session_manager)
+        self.btn_shortcuts.clicked.connect(self._show_shortcuts)
         self.btn_about.clicked.connect(self._show_about)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
@@ -4564,6 +4602,8 @@ class MultiExplorer(QMainWindow):
             self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))
         if hasattr(self, "btn_session") and self.btn_session:
             self.btn_session.setIcon(icon_session(self.theme))
+        if hasattr(self, "btn_shortcuts") and self.btn_shortcuts:
+            self.btn_shortcuts.setIcon(icon_shortcuts(self.theme))
         if hasattr(self, "btn_about") and self.btn_about:
             self.btn_about.setIcon(icon_info(self.theme))
 
@@ -4863,6 +4903,33 @@ class MultiExplorer(QMainWindow):
             if getattr(self,"_bm_dlg",None): self.namedBookmarksChanged.disconnect(self._bm_dlg.set_items)
         except Exception: pass
         self._bm_dlg=None
+
+    def _show_shortcuts(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        dlg.resize(780, 460)
+
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel("The same shortcut descriptions documented in README.md", dlg)
+        lay.addWidget(lbl)
+
+        table = QTableWidget(dlg)
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Key", "Action"])
+        table.setRowCount(len(KEYBOARD_SHORTCUTS))
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        for r, (key_text, action_text) in enumerate(KEYBOARD_SHORTCUTS):
+            table.setItem(r, 0, QTableWidgetItem(key_text))
+            table.setItem(r, 1, QTableWidgetItem(action_text))
+        lay.addWidget(table, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok, dlg)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        dlg.exec_()
 
     def _show_about(self):
         dlg=QDialog(self); dlg.setWindowTitle("About")
