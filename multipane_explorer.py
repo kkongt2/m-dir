@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import (
     Qt, QDir, QUrl, QDateTime, QSortFilterProxyModel,
     pyqtSignal, QSettings, QEvent, QTimer, QSize, QAbstractTableModel,
-    QIdentityProxyModel, QElapsedTimer
+    QIdentityProxyModel, QElapsedTimer, QStringListModel
 )
 from PyQt5.QtGui import (
     QDesktopServices, QPalette, QColor, QKeySequence, QIcon,
@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QMenu, QStyle, QHeaderView, QScrollArea, QFrame, QLabel, QShortcut,
     QToolButton, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QCheckBox, QFileDialog, QProgressDialog, QToolTip, QSizePolicy, QFileIconProvider,
-    QComboBox, QSpacerItem
+    QComboBox, QSpacerItem, QCompleter, QSpinBox
 )
 
 
@@ -48,7 +48,8 @@ ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
 
 
-FONT_PT = 9.5
+BASE_FONT_PT = 9.5
+FONT_PT = BASE_FONT_PT
 UI_H = max(22, int(round(FONT_PT * 2.6)))
 GRID_GAPS    = {2: 5, 3: 3, 4: 2}
 GRID_MARG_LR = {2: 8, 3: 6, 4: 6}
@@ -67,9 +68,12 @@ ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
+PATH_HISTORY_LIMIT = 30
+VALID_THEMES = ("dark", "light")
 
 # Keep this list in sync with the README keyboard-shortcuts section.
 KEYBOARD_SHORTCUTS = [
+    ("F1", "Open shortcuts help"),
     ("Backspace / Alt+Left", "Back"),
     ("Alt+Right", "Forward"),
     ("Alt+Up", "Parent folder"),
@@ -82,6 +86,7 @@ KEYBOARD_SHORTCUTS = [
     ("Ctrl+Z", "Undo (new folder / rename actions)"),
     ("Delete / Shift+Delete", "Recycle / Permanent delete"),
     ("F2", "Rename"),
+    ("Ctrl+Shift+R", "Bulk rename"),
     ("Ctrl+Shift+C", "Copy full path"),
     ("Alt+Shift+C", "Copy folder path (parent folder if a file is selected)"),
 ]
@@ -562,7 +567,16 @@ def apply_dark_style(app: QApplication):
             background: #26282E; border: 1px solid #33363D; border-radius: 8px;
             color: #E6E9EE; min-height: 0px;
         }
-        QLineEdit:focus { border: 1px solid #5E9BFF; }
+        QToolButton[busy="true"] {
+            background: #2B3E62;
+            border: 1px solid #5E9BFF;
+            color: #EAF1FF;
+            font-weight: 600;
+        }
+        QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus {
+            border: 2px solid #8FC1FF;
+        }
+        QTreeView:focus { border: 2px solid #8FC1FF; }
         QTreeView {
             background: #16181C; alternate-background-color: #1E2026;
             border: 1px solid #2B2E34; border-radius: 10px;
@@ -617,6 +631,13 @@ def apply_dark_style(app: QApplication):
             border-color: rgba(94,155,255,0.25);
         }
 
+        QWidget#paneRoot[drop_target="true"] {
+            border: 2px solid #34C88A;
+            background: rgba(52, 200, 138, 0.14);
+        }
+        QWidget#paneRoot[drop_target="true"] QTreeView { border-color: rgba(52,200,138,0.70); }
+        QWidget#paneRoot[drop_target="true"] QLineEdit { border-color: rgba(52,200,138,0.58); }
+
         /* Message boxes: white background, black text */
         QMessageBox { background: #FFFFFF; color: #000000; }
         QMessageBox QLabel { color: #000000; }
@@ -650,7 +671,16 @@ def apply_light_style(app: QApplication):
             background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 8px;
             color: #1C1C1E; min-height: 0px;
         }
-        QLineEdit:focus { border: 1px solid #5E9BFF; }
+        QToolButton[busy="true"] {
+            background: #EAF2FF;
+            border: 1px solid #5E9BFF;
+            color: #1A3B8A;
+            font-weight: 600;
+        }
+        QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus {
+            border: 2px solid #2A63FF;
+        }
+        QTreeView:focus { border: 2px solid #2A63FF; }
         QTreeView {
             background: #FFFFFF; alternate-background-color: #F6F8FA;
             border: 1px solid #DDE1E6; border-radius: 10px;
@@ -704,7 +734,19 @@ def apply_light_style(app: QApplication):
         QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton {
             border-color: rgba(64,128,255,0.25);
         }
+        QWidget#paneRoot[drop_target="true"] {
+            border: 2px solid #22A96A;
+            background: rgba(34, 169, 106, 0.10);
+        }
+        QWidget#paneRoot[drop_target="true"] QTreeView { border-color: rgba(34,169,106,0.62); }
+        QWidget#paneRoot[drop_target="true"] QLineEdit { border-color: rgba(34,169,106,0.50); }
     """)
+
+def apply_theme_by_name(app: QApplication, theme: str):
+    if theme == "light":
+        apply_light_style(app)
+    else:
+        apply_dark_style(app)
 
 
 
@@ -1367,6 +1409,50 @@ def _create_new_file_with_template(dst_dir: str, filename: str, ext_with_dot: st
             pass
     return target
 
+def load_recent_path_history() -> list[str]:
+    s = QSettings(ORG_NAME, APP_NAME)
+    val = s.value("pathbar/recent_paths", [])
+    out = []
+    if isinstance(val, list):
+        for p in val:
+            try:
+                sp = str(p).strip()
+                if sp:
+                    out.append(_normalize_fs_path(sp))
+            except Exception:
+                pass
+    seen = set()
+    uniq = []
+    for p in out:
+        k = os.path.normcase(_normalize_fs_path(p))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(p)
+    return uniq[:PATH_HISTORY_LIMIT]
+
+def save_recent_path_history(items: list[str]):
+    out = []
+    seen = set()
+    for p in list(items or []):
+        try:
+            sp = str(p).strip()
+        except Exception:
+            continue
+        if not sp:
+            continue
+        np = _normalize_fs_path(sp)
+        k = os.path.normcase(np)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(np)
+        if len(out) >= PATH_HISTORY_LIMIT:
+            break
+    s = QSettings(ORG_NAME, APP_NAME)
+    s.setValue("pathbar/recent_paths", out)
+    s.sync()
+
 
 def load_named_bookmarks() -> list:
     s = QSettings(ORG_NAME, APP_NAME)
@@ -1933,9 +2019,15 @@ class StatOverlayProxy(QIdentityProxyModel):
 
 class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
+    _shared_recent_paths: list[str] | None = None
+
     def __init__(self, parent=None):
         super().__init__(parent); self._current_path=QDir.homePath()
         self.setObjectName("pathbar")
+
+        if PathBar._shared_recent_paths is None:
+            PathBar._shared_recent_paths = load_recent_path_history()
+        self._recent_paths = list(PathBar._shared_recent_paths or [])
 
         self._host=QWidget(); self._hlay=QHBoxLayout(self._host)
         self._host.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
@@ -1951,7 +2043,6 @@ class PathBar(QWidget):
         self._hbar = self._scroll.horizontalScrollBar()
         self._scroll.setFixedHeight(UI_H); self.setFixedHeight(UI_H)
 
-
         try:
             vp = self._scroll.viewport()
             vp.setObjectName("crumbViewport")
@@ -1960,12 +2051,28 @@ class PathBar(QWidget):
         except Exception:
             pass
 
-
         self._scroll.setProperty("active", False)
 
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
+        self._suggest_timer = QTimer(self)
+        self._suggest_timer.setSingleShot(True)
+        self._suggest_timer.setInterval(110)
+        self._suggest_timer.timeout.connect(self._refresh_edit_completer)
+        self._edit_model = QStringListModel(self)
+        self._edit_completer = QCompleter(self._edit_model, self)
+        self._edit_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._edit_completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._edit_completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
+        self._edit.setCompleter(self._edit_completer)
+        self._edit.textEdited.connect(lambda _t: self._queue_suggestions_update(False))
+
+        self._btn_hist = QToolButton(self)
+        self._btn_hist.setToolTip("Recent paths")
+        self._btn_hist.setFixedHeight(UI_H)
+        self._btn_hist.setArrowType(Qt.DownArrow)
+        self._btn_hist.clicked.connect(self._show_recent_paths_menu)
 
         self._btn_copy = QToolButton(self)
         self._btn_copy.setToolTip("Copy current path")
@@ -1975,32 +2082,218 @@ class PathBar(QWidget):
         try:
             self._btn_copy.setIcon(icon_copy_squares(theme))
         except Exception:
-
             self._btn_copy.setText("Copy")
         self._btn_copy.clicked.connect(self._copy_current_path)
-
 
         wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0)
         wrap.addWidget(self._scroll, 1)
         wrap.addWidget(self._edit, 1)
+        wrap.addWidget(self._btn_hist, 0)
         wrap.addWidget(self._btn_copy, 0)
 
         self._host.installEventFilter(self); self._edit.installEventFilter(self)
         self.set_path(self._current_path)
 
     def _copy_current_path(self):
-
         t = self._edit.text().strip() if self._edit.isVisible() else self._current_path
         if not t:
             t = self._current_path
         QApplication.clipboard().setText(t)
         QToolTip.showText(QCursor.pos(), f"Copied: {t}", self)
 
+    def _set_recent_paths(self, items: list[str]):
+        seen = set()
+        out = []
+        for p in list(items or []):
+            sp = str(p).strip()
+            if not sp:
+                continue
+            np = _normalize_fs_path(sp)
+            key = os.path.normcase(np)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(np)
+            if len(out) >= PATH_HISTORY_LIMIT:
+                break
+        self._recent_paths = out
+        PathBar._shared_recent_paths = list(out)
+        save_recent_path_history(out)
+
+    def _reload_recent_paths(self):
+        if PathBar._shared_recent_paths is None:
+            PathBar._shared_recent_paths = load_recent_path_history()
+        self._recent_paths = list(PathBar._shared_recent_paths or [])
+
+    def remember_path(self, path: str):
+        try:
+            np = _normalize_fs_path(nice_path(path))
+        except Exception:
+            np = _normalize_fs_path(str(path))
+        if not np:
+            return
+        key = os.path.normcase(np)
+        merged = [np]
+        for p in self._recent_paths:
+            if os.path.normcase(_normalize_fs_path(p)) != key:
+                merged.append(_normalize_fs_path(p))
+        self._set_recent_paths(merged)
+
+    def _list_root_paths(self) -> list[str]:
+        out = []
+        try:
+            for fi in QDir.drives():
+                try:
+                    p = fi.absoluteFilePath()
+                except Exception:
+                    p = ""
+                if p:
+                    out.append(_normalize_fs_path(p))
+        except Exception:
+            pass
+        if not out:
+            out.append(_normalize_fs_path(QDir.rootPath()))
+        seen = set()
+        uniq = []
+        for p in out:
+            k = os.path.normcase(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(p)
+        return uniq
+
+    def _collect_recent_suggestions(self, typed: str, max_items: int = 30) -> list[str]:
+        self._reload_recent_paths()
+        t = (typed or "").strip().lower()
+        if not t:
+            return self._recent_paths[:max_items]
+        starts = [p for p in self._recent_paths if p.lower().startswith(t)]
+        contains = [p for p in self._recent_paths if t in p.lower() and not p.lower().startswith(t)]
+        return (starts + contains)[:max_items]
+
+    def _collect_filesystem_suggestions(self, typed: str, max_items: int = 45) -> list[str]:
+        t = (typed or "").strip().strip('"')
+        if not t:
+            return self._list_root_paths()[:max_items]
+
+        t = t.replace("/", os.sep)
+        if os.name == "nt" and len(t) == 2 and t[1] == ":":
+            t = t + os.sep
+
+        if t.endswith(("\\", "/")):
+            parent = _normalize_fs_path(t)
+            prefix = ""
+        else:
+            parent = _normalize_fs_path(os.path.dirname(t))
+            prefix = os.path.basename(t)
+
+        if not parent:
+            roots = self._list_root_paths()
+            tl = t.lower()
+            if not tl:
+                return roots[:max_items]
+            return [r for r in roots if r.lower().startswith(tl)][:max_items]
+
+        if not os.path.isdir(parent):
+            return []
+
+        out = []
+        pref_l = prefix.lower()
+        try:
+            with os.scandir(parent) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except Exception:
+                        continue
+                    name = entry.name
+                    if pref_l and not name.lower().startswith(pref_l):
+                        continue
+                    out.append(_normalize_fs_path(os.path.join(parent, name)))
+                    if len(out) >= max_items:
+                        break
+        except Exception:
+            return []
+        if not pref_l and os.path.isdir(parent):
+            out.insert(0, _normalize_fs_path(parent))
+        return out[:max_items]
+
+    def _collect_edit_suggestions(self, typed: str) -> list[str]:
+        out = []
+        seen = set()
+        def add_path(p):
+            if not p:
+                return
+            np = _normalize_fs_path(str(p))
+            key = os.path.normcase(np)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(np)
+
+        raw = (typed or "").strip().strip('"')
+        if raw and os.path.isdir(_normalize_fs_path(raw)):
+            add_path(_normalize_fs_path(raw))
+
+        for p in self._collect_recent_suggestions(raw, 35):
+            add_path(p)
+        for p in self._collect_filesystem_suggestions(raw, 50):
+            add_path(p)
+        return out[:80]
+
+    def _queue_suggestions_update(self, immediate: bool = False):
+        if immediate:
+            self._refresh_edit_completer()
+            return
+        if self._suggest_timer.isActive():
+            self._suggest_timer.stop()
+        self._suggest_timer.start()
+
+    def _refresh_edit_completer(self):
+        typed = self._edit.text().strip()
+        items = self._collect_edit_suggestions(typed)
+        self._edit_model.setStringList(items)
+        self._edit_completer.setCompletionPrefix(typed)
+        if self._edit.isVisible() and self._edit.hasFocus() and items:
+            self._edit_completer.complete()
+
+    def _show_recent_paths_menu(self):
+        self._reload_recent_paths()
+        menu = QMenu(self)
+        action_map = {}
+        for p in self._recent_paths[:PATH_HISTORY_LIMIT]:
+            act = menu.addAction(p)
+            action_map[act] = p
+        if action_map:
+            menu.addSeparator()
+            act_clear = menu.addAction("Clear History")
+        else:
+            act_none = menu.addAction("(No recent paths)")
+            act_none.setEnabled(False)
+            act_clear = None
+        picked = menu.exec_(self._btn_hist.mapToGlobal(QtCore.QPoint(0, self._btn_hist.height())))
+        if not picked:
+            return
+        if act_clear is not None and picked == act_clear:
+            self._set_recent_paths([])
+            self._queue_suggestions_update(True)
+            return
+        selected_path = action_map.get(picked)
+        if not selected_path:
+            return
+        if self._edit.isVisible():
+            self._edit.setText(selected_path)
+            self._edit.setFocus()
+            self._edit.selectAll()
+            self._queue_suggestions_update(True)
+        else:
+            self.pathSubmitted.emit(selected_path)
 
     def set_active(self, active: bool):
         try:
             self._scroll.setProperty("active", bool(active))
-
             vp = self._scroll.viewport()
             for w in (self._scroll, vp):
                 w.style().unpolish(w)
@@ -2028,17 +2321,34 @@ class PathBar(QWidget):
                     return True
             except Exception:
                 return False
-        if obj is self._edit and ev.type()==QEvent.FocusOut: self.cancel_edit()
+        if obj is self._edit and ev.type()==QEvent.FocusOut:
+            try:
+                comp = self._edit.completer()
+                pop = comp.popup() if comp else None
+                if pop and pop.isVisible():
+                    return False
+            except Exception:
+                pass
+            self.cancel_edit()
         return super().eventFilter(obj, ev)
+
     def start_edit(self):
+        self._reload_recent_paths()
         self._edit.setText(self._current_path); self._scroll.hide(); self._edit.show()
         self._edit.setFocus(); self._edit.selectAll()
+        self._queue_suggestions_update(True)
+
     def cancel_edit(self): self._edit.hide(); self._scroll.show()
+
     def _on_edit_return(self):
         t=self._edit.text().strip(); self.cancel_edit()
         if t: self.pathSubmitted.emit(t)
+
     def set_path(self, path:str):
-        self._current_path = nice_path(path); self._rebuild()
+        self._current_path = nice_path(path)
+        self.remember_path(self._current_path)
+        self._rebuild()
+
     def _rebuild(self):
         while self._hlay.count():
             it=self._hlay.takeAt(0); w=it.widget()
@@ -2095,13 +2405,11 @@ class PathBar(QWidget):
         self._host.setFixedSize(max(1, total_w), total_h)
         self._host.updateGeometry()
 
-
         self._pin_to_right()
         QTimer.singleShot(0, self._pin_to_right)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-
         QTimer.singleShot(0, self._pin_to_right)
 
     def _pin_to_right(self):
@@ -2116,10 +2424,8 @@ class PathBar(QWidget):
                 return
             content_w = max(self._host.sizeHint().width(), self._host.width())
             if content_w > (viewport_w + 1):
-
                 self._hbar.setValue(self._hbar.maximum())
             else:
-
                 self._hbar.setValue(self._hbar.minimum())
         except Exception:
             pass
@@ -2193,6 +2499,229 @@ class SearchResultModel(QStandardItemModel):
 
         drag.exec_(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
 
+
+
+class BulkRenameDialog(QDialog):
+    _INVALID_WIN_CHARS = set('<>:"/\\|?*')
+
+    def __init__(self, parent, paths: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Rename")
+        self.resize(980, 560)
+        self._paths = [p for p in list(paths or []) if p and os.path.exists(p)]
+        self._plan = []
+
+        lay = QVBoxLayout(self)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        self.ed_prefix = QLineEdit(self); self.ed_prefix.setPlaceholderText("Prefix")
+        self.ed_suffix = QLineEdit(self); self.ed_suffix.setPlaceholderText("Suffix")
+        self.ed_find = QLineEdit(self); self.ed_find.setPlaceholderText("Find text")
+        self.ed_replace = QLineEdit(self); self.ed_replace.setPlaceholderText("Replace with")
+
+        self.chk_case = QCheckBox("Case sensitive replace", self)
+        self.chk_number = QCheckBox("Append number", self)
+        self.spin_start = QSpinBox(self); self.spin_start.setRange(1, 999999); self.spin_start.setValue(1)
+        self.spin_step = QSpinBox(self); self.spin_step.setRange(1, 9999); self.spin_step.setValue(1)
+        self.spin_pad = QSpinBox(self); self.spin_pad.setRange(1, 8); self.spin_pad.setValue(3)
+        self.ed_sep = QLineEdit(self); self.ed_sep.setText("_"); self.ed_sep.setMaxLength(8)
+
+        grid.addWidget(QLabel("Prefix"), 0, 0)
+        grid.addWidget(self.ed_prefix, 0, 1)
+        grid.addWidget(QLabel("Suffix"), 0, 2)
+        grid.addWidget(self.ed_suffix, 0, 3)
+        grid.addWidget(QLabel("Find"), 1, 0)
+        grid.addWidget(self.ed_find, 1, 1)
+        grid.addWidget(QLabel("Replace"), 1, 2)
+        grid.addWidget(self.ed_replace, 1, 3)
+        grid.addWidget(self.chk_case, 2, 0, 1, 2)
+        grid.addWidget(self.chk_number, 2, 2, 1, 2)
+        grid.addWidget(QLabel("Start"), 3, 0)
+        grid.addWidget(self.spin_start, 3, 1)
+        grid.addWidget(QLabel("Step"), 3, 2)
+        grid.addWidget(self.spin_step, 3, 3)
+        grid.addWidget(QLabel("Padding"), 4, 0)
+        grid.addWidget(self.spin_pad, 4, 1)
+        grid.addWidget(QLabel("Separator"), 4, 2)
+        grid.addWidget(self.ed_sep, 4, 3)
+        lay.addLayout(grid)
+
+        self.lbl_summary = QLabel("", self)
+        lay.addWidget(self.lbl_summary)
+
+        self.tbl = QTableWidget(self)
+        self.tbl.setColumnCount(4)
+        self.tbl.setHorizontalHeaderLabels(["Current Name", "New Name", "Folder", "Status"])
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        lay.addWidget(self.tbl, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.btn_ok = btns.button(QDialogButtonBox.Ok)
+        lay.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        for w in (self.ed_prefix, self.ed_suffix, self.ed_find, self.ed_replace, self.ed_sep):
+            w.textChanged.connect(self._rebuild_preview)
+        for w in (self.chk_case, self.chk_number):
+            w.toggled.connect(self._rebuild_preview)
+        for w in (self.spin_start, self.spin_step, self.spin_pad):
+            w.valueChanged.connect(self._rebuild_preview)
+
+        self._rebuild_preview()
+
+    def _transform_stem(self, stem: str, idx: int) -> str:
+        text = stem
+        find = self.ed_find.text()
+        repl = self.ed_replace.text()
+        if find:
+            if self.chk_case.isChecked():
+                text = text.replace(find, repl)
+            else:
+                try:
+                    text = re.sub(re.escape(find), repl, text, flags=re.IGNORECASE)
+                except Exception:
+                    text = text.replace(find, repl)
+        text = f"{self.ed_prefix.text()}{text}{self.ed_suffix.text()}"
+        if self.chk_number.isChecked():
+            seq = self.spin_start.value() + (idx * self.spin_step.value())
+            num = str(seq).zfill(self.spin_pad.value())
+            text = f"{text}{self.ed_sep.text()}{num}"
+        return text
+
+    def _is_invalid_name(self, name: str) -> str | None:
+        if not name:
+            return "empty name"
+        if os.name == "nt":
+            if any(ch in self._INVALID_WIN_CHARS for ch in name):
+                return "invalid character"
+            if name.endswith(" ") or name.endswith("."):
+                return "trailing space/dot"
+        if os.sep in name:
+            return "contains path separator"
+        if os.altsep and os.altsep in name:
+            return "contains path separator"
+        return None
+
+    def _build_plan(self) -> list[dict]:
+        rows = []
+        selected_keys = set()
+        for p in self._paths:
+            try:
+                key = os.path.normcase(os.path.normpath(p))
+                selected_keys.add(key)
+            except Exception:
+                pass
+            rows.append({
+                "src": p,
+                "folder": os.path.dirname(p),
+                "name": os.path.basename(p),
+                "is_dir": os.path.isdir(p),
+                "new_name": "",
+                "dst": "",
+                "status": "",
+                "error": False,
+            })
+
+        by_folder = {}
+        for r in rows:
+            by_folder.setdefault(r["folder"], []).append(r)
+
+        for folder, items in by_folder.items():
+            items.sort(key=lambda x: x["name"].lower())
+            for idx, r in enumerate(items):
+                old_name = r["name"]
+                if r["is_dir"]:
+                    stem = old_name
+                    ext = ""
+                else:
+                    stem, ext = os.path.splitext(old_name)
+                new_stem = self._transform_stem(stem, idx)
+                new_name = f"{new_stem}{ext}"
+                r["new_name"] = new_name
+                r["dst"] = os.path.join(folder, new_name)
+
+                msg = self._is_invalid_name(new_name)
+                if msg:
+                    r["status"] = msg
+                    r["error"] = True
+                    continue
+
+                if os.path.normcase(os.path.normpath(r["src"])) == os.path.normcase(os.path.normpath(r["dst"])):
+                    r["status"] = "unchanged"
+                else:
+                    r["status"] = "ready"
+
+            by_dst = {}
+            for r in items:
+                key = os.path.normcase(os.path.normpath(r["dst"]))
+                by_dst.setdefault(key, []).append(r)
+            for dup in by_dst.values():
+                if len(dup) <= 1:
+                    continue
+                for r in dup:
+                    r["status"] = "duplicate target name"
+                    r["error"] = True
+
+            for r in items:
+                if r["error"]:
+                    continue
+                dst = r["dst"]
+                dst_key = os.path.normcase(os.path.normpath(dst))
+                src_key = os.path.normcase(os.path.normpath(r["src"]))
+                if src_key == dst_key:
+                    continue
+                if os.path.exists(dst) and dst_key not in selected_keys:
+                    r["status"] = "target already exists"
+                    r["error"] = True
+
+        return rows
+
+    def _rebuild_preview(self):
+        self._plan = self._build_plan()
+        self.tbl.setRowCount(len(self._plan))
+        changed = 0
+        errors = 0
+        for i, r in enumerate(self._plan):
+            folder = r.get("folder", "")
+            old_name = r.get("name", "")
+            new_name = r.get("new_name", "")
+            status = r.get("status", "")
+            if status == "ready":
+                changed += 1
+            if r.get("error"):
+                errors += 1
+            self.tbl.setItem(i, 0, QTableWidgetItem(old_name))
+            self.tbl.setItem(i, 1, QTableWidgetItem(new_name))
+            self.tbl.setItem(i, 2, QTableWidgetItem(folder))
+            self.tbl.setItem(i, 3, QTableWidgetItem(status))
+        self.tbl.resizeColumnsToContents()
+        self.btn_ok.setEnabled(changed > 0 and errors == 0)
+        self.lbl_summary.setText(
+            f"Selected {len(self._plan)} item(s) / will rename {changed} / errors {errors}"
+        )
+
+    def result_operations(self) -> list[tuple[str, str]]:
+        out = []
+        for r in self._plan:
+            if r.get("error"):
+                continue
+            if r.get("status") != "ready":
+                continue
+            src = r.get("src", "")
+            dst = r.get("dst", "")
+            if src and dst:
+                out.append((src, dst))
+        return out
 
 
 class ConflictResolutionDialog(QDialog):
@@ -2298,21 +2827,48 @@ class ExplorerView(QTreeView):
 
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls(): e.acceptProposedAction()
-        else: super().dragEnterEvent(e)
+        if e.mimeData().hasUrls():
+            try:
+                self.pane.set_drop_target_visual(True)
+                self.pane._mark_self_active()
+            except Exception:
+                pass
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
     def dragMoveEvent(self, e):
         if e.mimeData().hasUrls():
-            if e.keyboardModifiers() & Qt.ControlModifier: e.setDropAction(Qt.CopyAction)
-            else: e.setDropAction(Qt.MoveAction)
+            try:
+                self.pane.set_drop_target_visual(True)
+                self.pane._mark_self_active()
+            except Exception:
+                pass
+            if e.keyboardModifiers() & Qt.ControlModifier:
+                e.setDropAction(Qt.CopyAction)
+            else:
+                e.setDropAction(Qt.MoveAction)
             e.accept()
-        else: super().dragMoveEvent(e)
+        else:
+            super().dragMoveEvent(e)
+    def dragLeaveEvent(self, e):
+        try:
+            self.pane.set_drop_target_visual(False)
+        except Exception:
+            pass
+        super().dragLeaveEvent(e)
     def dropEvent(self, e):
-        if e.mimeData().hasUrls():
-            urls=e.mimeData().urls(); srcs=[u.toLocalFile() for u in urls if u.isLocalFile()]
-            if srcs:
-                op="copy" if (e.dropAction()==Qt.CopyAction or (e.keyboardModifiers() & Qt.ControlModifier)) else "move"
-                self.pane._start_bg_op(op, srcs, self.pane.current_path()); e.acceptProposedAction(); return
-        super().dropEvent(e)
+        try:
+            if e.mimeData().hasUrls():
+                urls=e.mimeData().urls(); srcs=[u.toLocalFile() for u in urls if u.isLocalFile()]
+                if srcs:
+                    op="copy" if (e.dropAction()==Qt.CopyAction or (e.keyboardModifiers() & Qt.ControlModifier)) else "move"
+                    self.pane._start_bg_op(op, srcs, self.pane.current_path()); e.acceptProposedAction(); return
+            super().dropEvent(e)
+        finally:
+            try:
+                self.pane.set_drop_target_visual(False)
+            except Exception:
+                pass
 
 
     def keyPressEvent(self, e):
@@ -2413,6 +2969,9 @@ class ExplorerPane(QWidget):
     )
     def __init__(self, _unused, start_path: str, pane_id: int, host_main):
         super().__init__()
+        self.setObjectName("paneRoot")
+        self.setProperty("active", False)
+        self.setProperty("drop_target", False)
         self.pane_id=pane_id; self.host=host_main
         self._init_state()
 
@@ -2443,6 +3002,7 @@ class ExplorerPane(QWidget):
         self._search_mode=False; self._search_model=None; self._search_proxy=None
         self._search_pending_items={}; self._search_stats_done=set(); self._search_stat_worker=None
         self._search_stat_queue=[]; self._search_stat_pending=set()
+        self._search_running = False
         self._back_stack=[]; self._fwd_stack=[]; self._undo_stack=[]
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
         self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
@@ -2518,6 +3078,7 @@ class ExplorerPane(QWidget):
         self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, *.txt)"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
         self.filter_label.setFixedHeight(UI_H); self.filter_label.setAlignment(Qt.AlignVCenter|Qt.AlignLeft)
         self.btn_search=QToolButton(self); self.btn_search.setText("Search"); self.btn_search.setToolTip("Run recursive search"); self.btn_search.setFixedHeight(UI_H)
+        self.btn_search.setProperty("busy", False)
         row_filter=QHBoxLayout(); row_filter.setContentsMargins(0,0,0,0); row_filter.setSpacing(ROW_SPACING)
         row_filter.addWidget(self.filter_label); row_filter.addWidget(self.filter_edit,1); row_filter.addWidget(self.btn_search,0)
         return row_filter
@@ -2651,7 +3212,7 @@ class ExplorerPane(QWidget):
         self._sel_model = None
         self._hook_selection_model()
         self.filter_edit.returnPressed.connect(self._apply_filter)
-        self.btn_search.clicked.connect(self._apply_filter)
+        self.btn_search.clicked.connect(self._on_search_button_clicked)
         self.filter_edit.textChanged.connect(self._on_filter_text_changed)
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._request_visible_stats())
         except Exception: pass
@@ -2673,11 +3234,37 @@ class ExplorerPane(QWidget):
         add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
         add_sc("Ctrl+C", self.copy_selection); add_sc("Ctrl+X", self.cut_selection); add_sc("Ctrl+V", self.paste_into_current);add_sc("Ctrl+Z", self.undo_last)
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
+        add_sc("Ctrl+Shift+R", self.bulk_rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
 
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
+
+    def _set_search_button_state(self, running: bool):
+        self._search_running = bool(running)
+        btn = getattr(self, "btn_search", None)
+        if not btn:
+            return
+        btn.setText("Cancel" if self._search_running else "Search")
+        btn.setToolTip("Cancel running search" if self._search_running else "Run recursive search")
+        btn.setProperty("busy", self._search_running)
+        try:
+            st = btn.style()
+            st.unpolish(btn)
+            st.polish(btn)
+            btn.update()
+        except Exception:
+            pass
+
+    def _on_search_button_clicked(self):
+        w = getattr(self, "_search_worker", None)
+        if w and w.isRunning():
+            self._cancel_search_worker()
+            self._set_search_button_state(False)
+            self.host.flash_status("Search cancelled")
+            return
+        self._apply_filter()
 
     def _load_sort_settings(self):
         try:
@@ -2741,6 +3328,28 @@ class ExplorerPane(QWidget):
                         st.unpolish(btn)
                         st.polish(btn)
                         btn.update()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def set_drop_target_visual(self, active: bool):
+        try:
+            if self.objectName() != "paneRoot":
+                self.setObjectName("paneRoot")
+            self.setProperty("drop_target", bool(active))
+
+            targets = [self,
+                       getattr(self, "view", None),
+                       getattr(self, "filter_edit", None),
+                       getattr(self, "path_bar", None)]
+            for w in targets:
+                if w:
+                    try:
+                        st = w.style()
+                        st.unpolish(w)
+                        st.polish(w)
+                        w.update()
                     except Exception:
                         pass
         except Exception:
@@ -2839,6 +3448,7 @@ class ExplorerPane(QWidget):
                 QApplication.restoreOverrideCursor()
         except Exception:
             pass
+        self._set_search_button_state(False)
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
@@ -2884,6 +3494,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
         self._search_worker = None
+        self._set_search_button_state(False)
         try:
             if self._search_mode and self._search_proxy and self.view.model() is self._search_proxy:
                 hdr = self.view.header()
@@ -4181,6 +4792,52 @@ class ExplorerPane(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"Rename failed",str(e))
 
+    def bulk_rename_selection(self):
+        paths = self._selected_paths()
+        if not paths:
+            self.host.flash_status("Select items to bulk rename")
+            return
+
+        dlg = BulkRenameDialog(self, paths)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        ops = dlg.result_operations()
+        if not ops:
+            self.host.flash_status("No items to rename")
+            return
+
+        temp_pairs = []
+        committed = []
+        try:
+            for src, dst in ops:
+                parent = os.path.dirname(src) or self.current_path()
+                temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
+                while os.path.exists(temp):
+                    temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
+                os.rename(src, temp)
+                temp_pairs.append((src, temp, dst))
+
+            for src, temp, dst in temp_pairs:
+                os.rename(temp, dst)
+                committed.append((dst, src))
+        except Exception as e:
+            # Best-effort rollback for temp names not yet finalized.
+            for src, temp, _dst in reversed(temp_pairs):
+                if os.path.exists(temp):
+                    try:
+                        os.rename(temp, src)
+                    except Exception:
+                        pass
+            QMessageBox.critical(self, "Bulk Rename failed", str(e))
+            self.refresh()
+            return
+
+        if committed:
+            self._undo_stack.append({"type":"move_back","pairs":committed})
+        self.refresh()
+        self.host.flash_status(f"Renamed {len(committed)} item(s)")
+
     def undo_last(self):
         if not self._undo_stack: self.host.flash_status("Nothing to undo"); return
         act=self._undo_stack.pop(); t=act.get("type")
@@ -4215,6 +4872,7 @@ class ExplorerPane(QWidget):
         self._search_stats_done = set()
         self._search_model = None
         self._search_proxy = None
+        self._set_search_button_state(False)
 
         if not self._search_mode:
             self._request_visible_stats(0)
@@ -4270,7 +4928,6 @@ class ExplorerPane(QWidget):
     def _apply_filter(self):
         pattern = self.filter_edit.text().strip()
         if not pattern:
-
             self._enter_browse_mode()
             return
 
@@ -4302,6 +4959,8 @@ class ExplorerPane(QWidget):
         w.finished.connect(self._on_search_finished, Qt.QueuedConnection)
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._set_search_button_state(True)
+        self.host.flash_status("Searching...")
         w.start()
 
 
@@ -4489,7 +5148,7 @@ class MultiExplorer(QMainWindow):
     namedBookmarksChanged=pyqtSignal(list)
     def __init__(self, pane_count:int=6, start_paths=None, initial_theme:str="dark"):
         super().__init__()
-        self.theme=initial_theme if initial_theme in ("dark","light") else "dark"
+        self.theme=initial_theme if initial_theme in VALID_THEMES else "dark"
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
         self.setWindowTitle(f"Multi-Pane File Explorer - {pane_count} panes"); self.resize(1500,900)
 
@@ -4524,6 +5183,9 @@ class MultiExplorer(QMainWindow):
         self.btn_session.clicked.connect(self._open_session_manager)
         self.btn_shortcuts.clicked.connect(self._show_shortcuts)
         self.btn_about.clicked.connect(self._show_about)
+        self._help_shortcut = QShortcut(QKeySequence("F1"), self)
+        self._help_shortcut.setContext(Qt.ApplicationShortcut)
+        self._help_shortcut.activated.connect(self._show_shortcuts)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
         self._install_focus_tracker()
@@ -4621,12 +5283,24 @@ class MultiExplorer(QMainWindow):
 
     def _cycle_layout(self):
         self._layout_idx=(self._layout_idx+1)%len(self._layout_states); n=self._layout_states[self._layout_idx]; self.build_panes(n, self._current_paths())
-    def _toggle_theme(self):
-        self.theme="light" if self.theme=="dark" else "dark"
-        app=QApplication.instance()
-        apply_dark_style(app) if self.theme=="dark" else apply_light_style(app)
+
+    def _apply_theme(self, theme_name: str, persist: bool = True):
+        if theme_name not in VALID_THEMES:
+            theme_name = "dark"
+        self.theme = theme_name
+        app = QApplication.instance()
+        if app:
+            apply_theme_by_name(app, self.theme)
         self._update_theme_dependent_icons()
-        s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
+        if persist:
+            s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
+
+    def _toggle_theme(self):
+        if self.theme == "dark":
+            next_theme = "light"
+        else:
+            next_theme = "dark"
+        self._apply_theme(next_theme, persist=True)
 
     def build_panes(self, n:int, start_paths):
         was_max = self.isMaximized()
@@ -5259,8 +5933,8 @@ def main():
     except Exception: pass
     app.setOrganizationName(ORG_NAME); app.setApplicationName(APP_NAME)
     settings=QSettings(ORG_NAME, APP_NAME); theme=settings.value("ui/theme","dark")
-    if theme not in ("dark","light"): theme="dark"
-    apply_dark_style(app) if theme=="dark" else apply_light_style(app)
+    if theme not in VALID_THEMES: theme="dark"
+    apply_theme_by_name(app, theme)
     start_paths=_load_start_paths(args.panes, args.paths)
     w=MultiExplorer(pane_count=args.panes, start_paths=start_paths, initial_theme=theme); w.show()
     sys.exit(app.exec_())

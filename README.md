@@ -12,11 +12,13 @@ This README reflects the current behavior of `multipane_explorer.py`.
 ## Features
 - 4/6/8 pane layout switching (top toolbar + `--panes`), with last layout/path restore
 - Per-pane back/forward/up navigation history
+- Path-bar edit mode with recent-path dropdown and folder path autocomplete
 - Folders-first sorting, with proper size/date sorting for files
 - Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff
 - Auto-refresh on file system changes via `QFileSystemWatcher`
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
+- Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - File operation progress dialog with cancellation
 - Delete to Recycle Bin (`send2trash`/Shell API when available), `Shift+Delete` for permanent delete
 - Bookmark editor and quick bookmark buttons (up to 10 bookmarks)
@@ -53,6 +55,7 @@ $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 
 ## Search/Filter Behavior
 - Type a filter and press `Enter` (or click `Search`) to run recursive search from the current folder
+- While search is running, the same button becomes `Cancel`
 - Pattern separators: space, `,`, `;` (OR matching)
 - Press `Esc` in the filter input to clear filter and return to browse mode
 - Search result cap: 50,000 items
@@ -60,6 +63,7 @@ $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 ## Keyboard Shortcuts
 | Key | Action |
 |---|---|
+| `F1` | Open shortcuts help dialog |
 | `Backspace` / `Alt+Left` | Back |
 | `Alt+Right` | Forward |
 | `Alt+Up` | Parent folder |
@@ -72,6 +76,7 @@ $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 | `Ctrl+Z` | Undo (currently focused on new folder / rename actions) |
 | `Delete` / `Shift+Delete` | Recycle / Permanent delete |
 | `F2` | Rename |
+| `Ctrl+Shift+R` | Bulk rename |
 | `Ctrl+Shift+C` | Copy full path |
 | `Alt+Shift+C` | Copy folder path (parent folder if a file is selected) |
 
