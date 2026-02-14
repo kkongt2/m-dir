@@ -560,7 +560,7 @@ def apply_dark_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #2D3550; }
 
-        /* ??? crumb ??? */
+        /* Default crumb button */
         QPushButton#crumb {
             background: rgba(255,255,255,0.05);
             border: 1px solid #2B2E34;
@@ -569,12 +569,12 @@ def apply_dark_style(app: QApplication):
         QPushButton#crumb:hover { background: rgba(255,255,255,0.09); }
         QLabel#crumbSep { color: #7F8796; }
 
-        /* breadcrumb ??????????) ??? ???????? ??? */
+        /* Remove border/background from breadcrumb scroll area */
         QScrollArea#crumbScroll { border: 0px solid transparent; }
         QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
 
-        /* ??? Pane???? crumb ????????????????? ??? */
+        /* Active pane: highlight only crumb buttons */
         QWidget#paneRoot[active="true"] QPushButton#crumb {
             background: rgba(94,155,255,0.16);
             border-color: rgba(94,155,255,0.40);
@@ -583,7 +583,7 @@ def apply_dark_style(app: QApplication):
             background: rgba(94,155,255,0.22);
         }
 
-        /* Pane ??? ???????????) */
+        /* Pane-level active highlight */
         QWidget#paneRoot {
             border: 1px solid transparent;
             border-radius: 10px;
@@ -599,7 +599,7 @@ def apply_dark_style(app: QApplication):
             border-color: rgba(94,155,255,0.25);
         }
 
-        /* ????? ???: ?????/????????*/
+        /* Message boxes: white background, black text */
         QMessageBox { background: #FFFFFF; color: #000000; }
         QMessageBox QLabel { color: #000000; }
         QMessageBox QPushButton {
@@ -648,7 +648,7 @@ def apply_light_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #EAEFFF; }
 
-        /* ??? crumb ??? */
+        /* Default crumb button */
         QPushButton#crumb {
             background: rgba(0,0,0,0.04);
             border: 1px solid #E5E8EE;
@@ -657,12 +657,12 @@ def apply_light_style(app: QApplication):
         QPushButton#crumb:hover { background: rgba(0,0,0,0.07); }
         QLabel#crumbSep { color: #7A7F89; }
 
-        /* breadcrumb ??????????) ??? ???????? ??? */
+        /* Remove border/background from breadcrumb scroll area */
         QScrollArea#crumbScroll { border: 0px solid transparent; }
         QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
 
-        /* ??? Pane???? crumb ????????????????? ??? */
+        /* Active pane: highlight only crumb buttons */
         QWidget#paneRoot[active="true"] QPushButton#crumb {
             background: rgba(64,128,255,0.12);
             border-color: rgba(64,128,255,0.40);
@@ -671,7 +671,7 @@ def apply_light_style(app: QApplication):
             background: rgba(64,128,255,0.18);
         }
 
-        /* Pane ??? ???????????) */
+        /* Pane-level active highlight */
         QWidget#paneRoot {
             border: 1px solid transparent;
             border-radius: 10px;
@@ -2458,13 +2458,13 @@ class ExplorerPane(QWidget):
         return row_toolbar
 
     def _build_path_row(self):
-        self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb ??Double-click or F4/Ctrl+L to enter path")
+        self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb - Double-click or F4/Ctrl+L to enter path")
         row_path=QHBoxLayout(); row_path.setContentsMargins(0,0,0,0); row_path.setSpacing(0); row_path.addWidget(self.path_bar,1)
         return row_path
 
     def _build_filter_row(self):
         self.filter_label=QLabel("Filter:", self)
-        self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, ??"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
+        self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, *.txt)"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
         self.filter_label.setFixedHeight(UI_H); self.filter_label.setAlignment(Qt.AlignVCenter|Qt.AlignLeft)
         self.btn_search=QToolButton(self); self.btn_search.setText("Search"); self.btn_search.setToolTip("Run recursive search"); self.btn_search.setFixedHeight(UI_H)
         row_filter=QHBoxLayout(); row_filter.setContentsMargins(0,0,0,0); row_filter.setSpacing(ROW_SPACING)
@@ -2720,7 +2720,7 @@ class ExplorerPane(QWidget):
         sel = self._selected_paths()
         if len(sel) != 1:
             try:
-                self.host.statusBar().showMessage("????????/?????????????", 2000)
+                self.host.statusBar().showMessage("Select exactly one item.", 2000)
             except Exception:
                 pass
             return
@@ -2737,12 +2737,12 @@ class ExplorerPane(QWidget):
         try:
             QApplication.clipboard().setText(p)
             if folder_only:
-                self.host.flash_status("??? ????? ???????????????????")
+                self.host.flash_status("Copied folder path to clipboard")
             else:
-                self.host.flash_status("??? ????? ???????????????????")
+                self.host.flash_status("Copied full path to clipboard")
         except Exception:
             try:
-                self.host.statusBar().showMessage("?????? ??????????????.", 2000)
+                self.host.statusBar().showMessage("Failed to copy path to clipboard.", 2000)
             except Exception:
                 pass
 
@@ -3686,7 +3686,7 @@ class ExplorerPane(QWidget):
                     QMessageBox.information(
                         self,
                         "Network Sign-in",
-                        "?????? ??? ??? ????????\n??? ????? ???????? ????????",
+                        "Network location requires sign-in.\nPlease complete sign-in and try again.",
                     )
                     return
             if not os.path.exists(path):
@@ -4440,11 +4440,11 @@ class MultiExplorer(QMainWindow):
         super().__init__()
         self.theme=initial_theme if initial_theme in ("dark","light") else "dark"
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
-        self.setWindowTitle(f"Multi-Pane File Explorer ??{pane_count} panes"); self.resize(1500,900)
+        self.setWindowTitle(f"Multi-Pane File Explorer - {pane_count} panes"); self.resize(1500,900)
 
 
         top=QWidget(self); top_lay=QHBoxLayout(top); top_lay.setContentsMargins(6,2,6,2); top_lay.setSpacing(ROW_SPACING)
-        self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 ??6 ??8)"); self.btn_layout.setFixedHeight(UI_H)
+        self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 / 6 / 8)"); self.btn_layout.setFixedHeight(UI_H)
         self.btn_theme=QToolButton(top); self.btn_theme.setToolTip("Toggle Light/Dark"); self.btn_theme.setFixedHeight(UI_H)
         self.btn_bm_edit=QToolButton(top); self.btn_bm_edit.setToolTip("Edit Bookmarks"); self.btn_bm_edit.setFixedHeight(UI_H)
 
@@ -4664,7 +4664,7 @@ class MultiExplorer(QMainWindow):
         self.setUpdatesEnabled(True)
 
 
-        self.setWindowTitle(f"Multi-Pane File Explorer ??{n} panes")
+        self.setWindowTitle(f"Multi-Pane File Explorer - {n} panes")
         self._update_theme_dependent_icons()
 
 
@@ -4856,7 +4856,6 @@ class MultiExplorer(QMainWindow):
             "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.0.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
-            "<div style='color:#333; margin-top:6px; font-size:10pt;'>? 2026</div>"
         )
         lay.addWidget(lbl)
         btns=QDialogButtonBox(QDialogButtonBox.Ok, dlg); lay.addWidget(btns); btns.accepted.connect(dlg.accept)
@@ -4909,7 +4908,7 @@ class MultiExplorer(QMainWindow):
     def _save_session(self, name: str):
         name = (name or "").strip()
         if not name:
-            QMessageBox.information(self, "Save Session", "??? ???????????????")
+            QMessageBox.information(self, "Save Session", "Please enter a session name.")
             return
         paths = self._current_paths()
         panes = len(self.panes)
@@ -4940,11 +4939,11 @@ class MultiExplorer(QMainWindow):
             if it.get("name","") == name:
                 target = it; break
         if not target:
-            QMessageBox.warning(self, "Load Session", "???????? ????????."); return
+            QMessageBox.warning(self, "Load Session", "Session not found."); return
         paths = list(target.get("paths", []))
         panes = int(target.get("panes", len(paths)))
         if panes <= 0 or not paths:
-            QMessageBox.warning(self, "Load Session", "??? ?????? ??? ??????."); return
+            QMessageBox.warning(self, "Load Session", "Session data is empty or invalid."); return
 
 
         if panes != len(self.panes):
@@ -5028,7 +5027,7 @@ class SessionManagerDialog(QDialog):
     def _on_load(self):
         name = self._selected_name()
         if not name:
-            QMessageBox.information(self, "Load Session", "???????????????")
+            QMessageBox.information(self, "Load Session", "Please select a session.")
             return
         try:
             self.parent()._load_session(name)
@@ -5038,9 +5037,9 @@ class SessionManagerDialog(QDialog):
     def _on_delete(self):
         name = self._selected_name()
         if not name:
-            QMessageBox.information(self, "Delete Session", "???????????????")
+            QMessageBox.information(self, "Delete Session", "Please select a session.")
             return
-        btn = QMessageBox.question(self, "Delete Session", f"?????????????\n{name}",
+        btn = QMessageBox.question(self, "Delete Session", f"Delete this session?\n{name}",
                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if btn != QMessageBox.Yes:
             return
@@ -5060,7 +5059,7 @@ class SessionManagerDialog(QDialog):
         exists = any(s.get("name","").lower() == name.lower() for s in self.parent()._get_sessions())
         if exists:
             btn = QMessageBox.question(self, "Save Session",
-                                       f"?????????????????????.\n?????????????\n{name}",
+                                       f"A session with this name already exists.\nOverwrite it?\n{name}",
                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if btn != QMessageBox.Yes:
                 return
