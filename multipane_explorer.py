@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
+
 import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QSpacerItem
 )
 
-# -------------------- Perf / Debug --------------------
+
 def _env_flag(name: str) -> bool:
     v = os.environ.get(name, "")
     return str(v).strip().lower() in {"1", "true", "yes", "on", "y"}
@@ -47,7 +47,7 @@ def perf(name):
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
 
-# -------------------- Global UI Tuning --------------------
+
 FONT_PT = 9.5
 UI_H = max(22, int(round(FONT_PT * 2.6)))
 GRID_GAPS    = {2: 5, 3: 3, 4: 2}
@@ -68,7 +68,7 @@ SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
 
-# -------------------- Optional: pywin32 --------------------
+
 HAS_PYWIN32 = True
 try:
     import pythoncom
@@ -77,16 +77,17 @@ try:
 except Exception:
     HAS_PYWIN32 = False
 
-# -------------------- Optional: send2trash --------------------
+
 try:
     from send2trash import send2trash
     HAS_SEND2TRASH = True
 except Exception:
     HAS_SEND2TRASH = False
 
-# -------------------- HiDPI --------------------
+
 def _enable_win_per_monitor_v2():
     if sys.platform != "win32": return
+    # Windows only: try per-monitor DPI awareness with fallbacks.
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)); return
     except Exception: pass
@@ -98,11 +99,13 @@ def _enable_win_per_monitor_v2():
 
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-# -------------------- Helpers --------------------
+
 def _normalize_fs_path(p: str) -> str:
     try: p = os.path.normpath(p)
     except Exception: pass
-    if os.name == "nt" and len(p) == 2 and p[1] == ":": p = p + os.sep
+    if os.name == "nt" and len(p) == 2 and p[1] == ":":
+        # Normalize drive-root paths like "C:" to "C:\\".
+        p = p + os.sep
     return p
 
 def nice_path(p: str) -> str:
@@ -128,7 +131,7 @@ def _is_subpath(child: str, parent: str) -> bool:
     try:
         return os.path.commonpath([child_key, parent_key]) == parent_key
     except Exception:
-        # Different drives on Windows raise ValueError here; not a subpath.
+        # Different drives on Windows can raise ValueError here.
         return False
 
 def human_size(n: int) -> str:
@@ -157,6 +160,7 @@ def move_with_collision(src: str, dst_dir: str) -> str:
 
 def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
     if not paths: return True
+    # Prefer trash providers; fall back to permanent delete.
     if HAS_SEND2TRASH:
         try:
             for p in paths: send2trash(p)
@@ -180,15 +184,10 @@ def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
         return False
 
 def icon_bookmark_edit(theme: str):
-    """
-    '????????' ?????
-      - ???????? ????
-      - ?????? ???(???) ??????
-    """
     def paint(p: QPainter, w, h):
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # ???? ???????
+
         cx, cy = w/2 - 2, h/2 - 1
         r_outer = min(w, h) * 0.40
         r_inner = r_outer * 0.44
@@ -205,21 +204,21 @@ def icon_bookmark_edit(theme: str):
         p.setBrush(QBrush(fill))
         p.drawPolygon(star)
 
-        # ???? ???(???) ??????
+
         p.save()
         body = QColor(100, 180, 255) if theme == "dark" else QColor(40, 120, 220)
         tip  = QColor(240, 200, 80)
 
-        # ?????? ????????
+
         p.translate(w * 0.64, h * 0.68)
         p.rotate(-25)
 
-        # ??? ???(??? ??? OK)
+
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(body))
         p.drawRect(-5, -2, 12, 4)
 
-        # ??? ???????
+
         p.setBrush(QBrush(tip))
         tri = QPolygonF([
             QtCore.QPointF(7, -2),
@@ -228,7 +227,7 @@ def icon_bookmark_edit(theme: str):
         ])
         p.drawPolygon(tri)
 
-        # ????? ????(?????????QRectF ???)
+
         eraser = QColor(230, 230, 240) if theme == "dark" else QColor(250, 250, 255)
         p.setBrush(QBrush(eraser))
         p.drawRect(QtCore.QRectF(-6.5, -2.2, 2.6, 4.4))
@@ -238,7 +237,7 @@ def icon_bookmark_edit(theme: str):
     return _make_icon(22, 22, paint)
 
 
-# -------------------- Background File Ops (with per-file conflicts) --------------------
+
 class FileOpWorker(QtCore.QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
@@ -247,10 +246,10 @@ class FileOpWorker(QtCore.QThread):
 
     def __init__(self, op: str, srcs: list, dst_dir: str, conflict_map: dict | None = None, parent=None):
         super().__init__(parent)
-        self.op = op  # "copy" or "move"
+        self.op = op
         self.srcs = list(srcs)
         self.dst_dir = dst_dir
-        self.conflict_map = dict(conflict_map or {})  # src -> "overwrite"|"skip"|"copy"
+        self.conflict_map = dict(conflict_map or {})
         self._cancel = False
         self._total = 0
         self._done = 0
@@ -294,6 +293,7 @@ class FileOpWorker(QtCore.QThread):
                     total += cur
                     scanned += 1
                     if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
+                        # Switch to count-based progress when size scan is too large/slow.
                         self._src_size_cache[skey] = src_total
                         self._count_progress = True
                         self._total = max(1, scanned, len(self.srcs))
@@ -411,7 +411,7 @@ class FileOpWorker(QtCore.QThread):
                 base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
                 dst = os.path.join(self.dst_dir, base)
 
-                # Guard: source and destination are the same path.
+
                 if _paths_same(src, dst):
                     if self.op == "copy":
                         dst = unique_dest_path(self.dst_dir, base)
@@ -421,17 +421,18 @@ class FileOpWorker(QtCore.QThread):
                         self._emit_source_done()
                         continue
 
-                # Guard: copying/moving a folder into its own subtree is invalid.
+
                 if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+                    # Prevent copying/moving a folder into its own subtree.
                     self.status.emit(f"Skipped nested destination: {base}")
                     self._skip_source_progress(src)
                     self._emit_source_done()
                     continue
 
                 exists = os.path.exists(dst)
-                action = self.conflict_map.get(src) if exists else None  # None for non-conflict
+                action = self.conflict_map.get(src) if exists else None
 
-                # ---- COPY ----
+
                 if self.op == "copy":
                     if os.path.isdir(src) and not os.path.islink(src):
                         if exists:
@@ -450,17 +451,17 @@ class FileOpWorker(QtCore.QThread):
                                 self._skip_source_progress(src); self._emit_source_done(); continue
                             elif action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
-                            # overwrite ???????
+
                         self._copy_file(src, dst)
 
-                # ---- MOVE ----
+
                 else:
                     keep_both = (action == "copy")
                     src_progress_size = self._src_size_cache.get(_path_key(src))
                     if exists:
                         if action == "skip":
                             self._skip_source_progress(src); self._emit_source_done(); continue
-                        elif keep_both:  # keep both ??move with new name
+                        elif keep_both:
                             dst = unique_dest_path(self.dst_dir, base)
                         elif action == "overwrite":
                             try:
@@ -473,7 +474,7 @@ class FileOpWorker(QtCore.QThread):
                             src_progress_size = self._size_of(final if os.path.exists(final) else src)
                         self._tick_progress(src_progress_size)
                     except Exception:
-                        # ???: copy ?????
+                        # Cross-device move or permission failures: fall back to copy.
                         if os.path.isdir(src) and not os.path.islink(src):
                             if os.path.exists(dst) and action == "overwrite":
                                 try: shutil.rmtree(dst)
@@ -505,7 +506,7 @@ class FileOpWorker(QtCore.QThread):
         except Exception as e:
             self.error.emit(str(e))
 
-# -------------------- Styles --------------------
+
 def _common_css():
     return f"""
     QWidget {{ font-family: Segoe UI, Pretendard, "Noto Sans", sans-serif; font-size: {FONT_PT}pt; }}
@@ -688,10 +689,10 @@ def apply_light_style(app: QApplication):
     """)
 
 
-# -------------------- Vector Icons --------------------
+
 def icon_copy_squares(theme: str):
     def paint(p: QPainter, w, h):
-        # ???: ????? + ???????????
+
         stroke = QColor(210, 214, 225) if theme == "dark" else QColor(85, 95, 115)
         fill   = QColor(255, 255, 255)
 
@@ -700,15 +701,15 @@ def icon_copy_squares(theme: str):
         p.setPen(pen)
         p.setBrush(QBrush(fill))
 
-        # ?????/) ??? ???
-        front_rect = QtCore.QRect(6, 3, 11, 11)  # ???(?? ?????
-        back_rect  = QtCore.QRect(3, 6, 11, 11)  # ??????? ?????
+
+        front_rect = QtCore.QRect(6, 3, 11, 11)
+        back_rect  = QtCore.QRect(3, 6, 11, 11)
         radius = 3
 
-        # 1) ???????(????? + ???)
+
         p.drawRoundedRect(front_rect, radius, radius)
 
-        # 2) ??? ?????? ??????????? ???????????????
+
         p.drawRoundedRect(back_rect, radius, radius)
 
     return _make_icon(20, 20, paint)
@@ -752,22 +753,17 @@ def icon_theme_toggle(theme: str):
     return _make_icon(22, 22, paint)
 
 def icon_session(theme: str):
-    """
-    '???' ?????
-      - ?????3??? ????? ?????????????????)
-      - ??????????? ??? '????? ???' ???
-    """
     def paint(p: QPainter, w, h):
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # ?????
+
         line = QColor(190, 195, 210) if theme == "dark" else QColor(90, 100, 120)
         fill = QColor(60, 66, 80) if theme == "dark" else QColor(245, 247, 250)
         tab  = QColor(100, 150, 255) if theme == "dark" else QColor(80, 120, 230)
         star_fill  = QColor(255, 210, 60)
         star_edge  = QColor(160, 120, 0)
 
-        # ??? ??3??
+
         p.setPen(QPen(line, 1.3))
         p.setBrush(QBrush(fill))
         p.drawRoundedRect(QtCore.QRectF(3.0, 6.5, 12.5, 9.0), 2.5, 2.5)
@@ -775,7 +771,7 @@ def icon_session(theme: str):
         p.setBrush(QBrush(tab))
         p.drawRoundedRect(QtCore.QRectF(7.0, 3.5, 12.5, 9.0), 2.5, 2.5)
 
-        # ??????????????????)
+
         cx, cy, r = w - 6.0, h - 6.0, 3.2
         pts = []
         for i in range(10):
@@ -842,7 +838,7 @@ class GenericIconProvider(QFileIconProvider):
         except Exception:
             return self._file
 
-# -------------------- Native Context Menu (pywin32) --------------------
+
 class _MSG(ctypes.Structure):
     _fields_=[("hwnd",ctypes.c_void_p),("message",ctypes.c_uint),("wParam",ctypes.c_size_t),("lParam",ctypes.c_size_t),("time",ctypes.c_uint),("pt_x",ctypes.c_long),("pt_y",ctypes.c_long)]
 
@@ -880,8 +876,8 @@ def _ensure_event_filter(app: QApplication) -> WinCtxMenuEventFilter:
 def _as_interface(obj):
     if obj is None: return None
     if isinstance(obj, (list, tuple)):
-        # Some pywin32 shell calls return (hresult, interface).
-        # Pick the first non-int payload as the COM interface.
+
+
         cand = None
         for v in obj:
             if isinstance(v, int):
@@ -964,7 +960,7 @@ def _context_target_dir(work_dir: str, paths=None) -> str:
 def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
     target = _context_target_dir(work_dir, paths=paths)
 
-    # Escape single quotes for PowerShell single-quoted literals.
+
     ps_literal = target.replace("'", "''")
     args = f"-NoExit -Command Set-Location -LiteralPath '{ps_literal}'"
     try:
@@ -1096,9 +1092,6 @@ def _launch_git_bash_here(owner_hwnd, work_dir: str, paths=None) -> bool:
     return False
 
 def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_first=1, id_last=None):
-    """
-    True  = ??? ???/???(??? ?????, False = ???/?????? ???(??? ??? ???)
-    """
     shown=False
     try:
         win32gui.SetForegroundWindow(owner_hwnd)
@@ -1110,10 +1103,10 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
     except Exception as e:
         if DEBUG: print("[ctx] TrackPopupMenu failed:", e)
         return False
-    if not cmd_id:  # user cancelled
+    if not cmd_id:
         return True
 
-    # ?????? ??? ??? ????? ????????
+
     try:
         state = win32gui.GetMenuState(hmenu, cmd_id, win32con.MF_BYCOMMAND)
         if state & win32con.MF_POPUP:
@@ -1133,38 +1126,38 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
     menu_text = _menu_item_text(hmenu, cmd_id)
     if DEBUG: print(f"[ctx] chosen cmd_id={cmd_id} id_first={id_first} -> idx={idx}, verb='{verb or ''}', text='{menu_text}'")
 
-    # Some Windows builds fail for the built-in PowerShell entry via IContextMenu.
-    # Launching directly is reliable and matches Explorer behavior.
+
+
     if (verb and "powershell" in verb.lower()) or ("powershell" in menu_text):
         if _launch_powershell_here(owner_hwnd, work_dir, paths=paths):
             _post_null(owner_hwnd)
             return True
 
-    # Git Bash shell-extension entries can fail via InvokeCommand on some setups.
-    # Launch directly and consume the command to avoid shell-extension freezes.
+
+
     if _is_git_bash_action(verb, menu_text):
         _launch_git_bash_here(owner_hwnd, work_dir, paths=paths)
         _post_null(owner_hwnd)
         return True
 
-    # ???? ???(??????) ???: ?????3????? ??????????????????????????????????????????????????
+
     if verb and verb.lower() in ("properties","prop","property"):
         try:
             target = paths[0] if (paths and len(paths)>0) else work_dir
             target = _normalize_fs_path(target)
 
             ok = False
-            # 1) pywin32?? ?????? SHObjectProperties?? ????????
+
             try:
                 fn = getattr(shell, "SHObjectProperties", None)
                 if callable(fn):
-                    # SHOP_FILEPATH = 0x00000002
+
                     fn(int(owner_hwnd), 0x00000002, target, None)
                     ok = True
             except Exception as e:
                 if DEBUG: print("[ctx] SHObjectProperties (pywin32) failed:", e)
 
-            # 2) ShellExecuteEx + 'properties' verb
+
             if not ok:
                 try:
                     shell.ShellExecuteEx(
@@ -1178,7 +1171,7 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
                 except Exception as e:
                     if DEBUG: print("[ctx] ShellExecuteEx(properties) failed:", e)
 
-            # 3) ctypes??SHObjectPropertiesW ??? ??? (???????? ???)
+
             if not ok:
                 try:
                     SHOP_FILEPATH = 0x00000002
@@ -1217,7 +1210,7 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
     if not HAS_PYWIN32 or not paths: return False
     pythoncom.CoInitialize()
     try:
-        # Keep all selected paths even when parents differ (filtered search results).
+
         norm_paths = []
         seen = set()
         for p in paths:
@@ -1287,7 +1280,7 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
     finally:
         pythoncom.CoUninitialize()
 
-# --- ShellNew ??? ????? ??? ?????? ------------------------------------
+
 try:
     import winreg
     HAS_WINREG = True
@@ -1295,9 +1288,6 @@ except Exception:
     HAS_WINREG = False
 
 def _shellnew_template_for_ext(ext_with_dot: str) -> tuple[bool, str | None]:
-    """
-    ???: (is_nullfile, template_path_or_None)
-    """
     if not HAS_WINREG:
         return (False, None)
     try:
@@ -1342,7 +1332,7 @@ def _create_new_file_with_template(dst_dir: str, filename: str, ext_with_dot: st
             pass
     return target
 
-# -------------------- Bookmarks Store --------------------
+
 def load_named_bookmarks() -> list:
     s = QSettings(ORG_NAME, APP_NAME)
     val = s.value("bookmarks/named_items", [])
@@ -1383,7 +1373,7 @@ def migrate_legacy_favorites_into_named(items: list) -> list:
     except Exception:
         return items[:10]
 
-# -------------------- Roles & Proxies --------------------
+
 IS_DIR_ROLE = Qt.UserRole + 99
 SIZE_BYTES_ROLE = Qt.UserRole + 100
 SEARCH_ICON_READY_ROLE = Qt.UserRole + 101
@@ -1428,23 +1418,23 @@ class FsSortProxy(QSortFilterProxyModel):
         return super().mapFromSource(sourceIndex)
     def filterAcceptsRow(self, source_row, source_parent): return True
     def sort(self, column, order=Qt.AscendingOrder):
-        # ??? ??? ???????????????? lessThan??? ??? ??? ?????????????
+
         self._sort_order = order
         super().sort(column, order)
     def lessThan(self, left, right):
         col = left.column(); src = self.sourceModel()
 
-        # ????? ??? ?????? ??? ???????? ????????)
+
         try:
             ldir = bool(src.isDir(left)) if hasattr(src, "isDir") else bool(src.data(left, IS_DIR_ROLE))
             rdir = bool(src.isDir(right)) if hasattr(src, "isDir") else bool(src.data(right, IS_DIR_ROLE))
             if ldir != rdir:
                 order = getattr(self, "_sort_order", Qt.AscendingOrder)
                 if order == Qt.AscendingOrder:
-                    # ??????: ??? < ???
+
                     return ldir and not rdir
                 else:
-                    # ??????: ?????? ??????????? ????? ??? ?????? ??? < ????????
+
                     return (not ldir) and rdir
         except Exception:
             pass
@@ -1482,7 +1472,7 @@ class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Type", "Date Modified"]
     def __init__(self, parent=None):
         super().__init__(parent); self._root=""; self._rows=[]
-        # ????????
+
         self._icon_cache = {}
         self._icon_file = None
         self._icon_dir  = None
@@ -1525,7 +1515,7 @@ class FastDirModel(QAbstractTableModel):
         if not index.isValid(): return None
         r=self._rows[index.row()]; c=index.column()
 
-        # ?????
+
         if role == Qt.DecorationRole and c == 0:
             ic = self._icon_cache.get(index.row())
             if ic is not None:
@@ -1543,7 +1533,7 @@ class FastDirModel(QAbstractTableModel):
             if c==0:
                 return r["name"]
             if c==1:
-                # ?????????????????? ??? (???????? EditRole/SIZE_BYTES_ROLE??? 0??? ???)
+
                 if r.get("is_dir", False): return ""
                 if r["size"] is None: return ""
                 return human_size(int(r["size"]))
@@ -1556,7 +1546,7 @@ class FastDirModel(QAbstractTableModel):
         elif role==Qt.EditRole:
             if c==0: return r["name"]
             if c==1:
-                # ???????0, ????? ??? ?????(????????)
+
                 if r.get("is_dir", False): return 0
                 return 0 if r["size"] is None else int(r["size"])
             if c==3:
@@ -1571,7 +1561,7 @@ class FastDirModel(QAbstractTableModel):
         elif role==IS_DIR_ROLE:
             return r["is_dir"]
         elif role==SIZE_BYTES_ROLE:
-            # ???????0, ????? ??? ?????
+
             if r.get("is_dir", False): return 0
             return 0 if r["size"] is None else int(r["size"])
         elif role==NAME_FOLD_ROLE and c==0:
@@ -1652,7 +1642,7 @@ class NormalStatWorker(QtCore.QThread):
             self.finishedCycle.emit()
 
 class SearchWorker(QtCore.QThread):
-    batchReady = pyqtSignal(str, list)   # (base_path, [ {name,path,is_dir,folder} ... ])
+    batchReady = pyqtSignal(str, list)
     finished = pyqtSignal()
     error = pyqtSignal(str)
     truncated = pyqtSignal(int)
@@ -1664,18 +1654,18 @@ class SearchWorker(QtCore.QThread):
         self._max_results = max(1, int(max_results))
         self._matches = 0
         self._truncated = False
-        # ??? ???: ???/??????/??? ??? ???????
+
         raw = (pattern_str or "").replace(",", " ").replace(";", " ").split()
         self._patterns = [p.lower() for p in raw] if raw else ["*"]
-        # ??? ???????? ???????? (*.txt ??? ??? ?????????? endswith???????
+
         self._tests = []
         for p in self._patterns:
             simple_ext = (p.startswith("*.") and ("*" not in p[2:]) and ("?" not in p) and ("[" not in p) and ("]" not in p))
             if simple_ext:
-                ext = p[1:]  # ".txt"
+                ext = p[1:]
                 self._tests.append(lambda name, ext=ext: name.endswith(ext))
             else:
-                # fnmatch?????????????????????? lower-case ???
+
                 self._tests.append(lambda name, pat=p: fnmatch.fnmatchcase(name, pat))
 
     def cancel(self): self._cancel = True
@@ -1724,7 +1714,7 @@ class SearchWorker(QtCore.QThread):
                                     self.batchReady.emit(base, batch)
                                     batch = []
 
-                            # ??? ?????? ??? (????????/?????????? ???)
+
                             if is_dir:
                                 try:
                                     if entry.is_symlink():
@@ -1733,7 +1723,7 @@ class SearchWorker(QtCore.QThread):
                                     pass
                                 stack.append(entry.path)
                 except Exception:
-                    # ??? ??? ??? ?????? ???
+
                     continue
 
             if batch:
@@ -1807,7 +1797,7 @@ class StatOverlayProxy(QIdentityProxyModel):
             except Exception:
                 is_dir = False
 
-        rec = self._cache.get(p) if p else None  # (size, mtime) or None
+        rec = self._cache.get(p) if p else None
 
         if col == 1:
             if is_dir:
@@ -1828,7 +1818,7 @@ class StatOverlayProxy(QIdentityProxyModel):
                 if role == Qt.DisplayRole:
                     return human_size(size_val)
 
-            # Avoid synchronous stat() in UI thread.
+
             if role in (SIZE_BYTES_ROLE, Qt.EditRole):
                 return 0
             if role == Qt.DisplayRole:
@@ -1843,7 +1833,7 @@ class StatOverlayProxy(QIdentityProxyModel):
                 if role == Qt.EditRole:
                     return dt
 
-            # Avoid synchronous getmtime() in UI thread.
+
             if role == Qt.DisplayRole:
                 return ""
             if role == Qt.EditRole:
@@ -1905,7 +1895,7 @@ class StatOverlayProxy(QIdentityProxyModel):
             self._pending.discard(p)
         self._worker = None
         self._start_next_batch()
-# -------------------- Breadcrumb --------------------
+
 class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
     def __init__(self, parent=None):
@@ -1926,7 +1916,7 @@ class PathBar(QWidget):
         self._hbar = self._scroll.horizontalScrollBar()
         self._scroll.setFixedHeight(UI_H); self.setFixedHeight(UI_H)
 
-        # ???? viewport??? ???/??? ??? ?????????????????? ????
+
         try:
             vp = self._scroll.viewport()
             vp.setObjectName("crumbViewport")
@@ -1934,26 +1924,26 @@ class PathBar(QWidget):
         except Exception:
             pass
 
-        # ??? ??? ?????
+
         self._scroll.setProperty("active", False)
 
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
-        # --- Copy Path ??? (??? ???) ---
+
         self._btn_copy = QToolButton(self)
         self._btn_copy.setToolTip("Copy current path")
         self._btn_copy.setFixedHeight(UI_H)
-        # ????? ??? ???
+
         theme = getattr(getattr(parent, "host", None), "theme", "dark")
         try:
             self._btn_copy.setIcon(icon_copy_squares(theme))
         except Exception:
-            # ???: ?????
+
             self._btn_copy.setText("Copy")
         self._btn_copy.clicked.connect(self._copy_current_path)
 
-        # ??????: [scroll(breadcrumb) | edit(overlap) | copy-button]
+
         wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0)
         wrap.addWidget(self._scroll, 1)
         wrap.addWidget(self._edit, 1)
@@ -1963,7 +1953,7 @@ class PathBar(QWidget):
         self.set_path(self._current_path)
 
     def _copy_current_path(self):
-        # ??? ?????????????, ???????? ???
+
         t = self._edit.text().strip() if self._edit.isVisible() else self._current_path
         if not t:
             t = self._current_path
@@ -1972,13 +1962,9 @@ class PathBar(QWidget):
 
 
     def set_active(self, active: bool):
-        """
-        Path bar?????/???????? ???????????.
-        (QSS: QScrollArea#crumbScroll[active="true"] ?? ??viewport)
-        """
         try:
             self._scroll.setProperty("active", bool(active))
-            # ?????(scroll + viewport ???)
+
             vp = self._scroll.viewport()
             for w in (self._scroll, vp):
                 w.style().unpolish(w)
@@ -2058,13 +2044,13 @@ class PathBar(QWidget):
         self._host.setFixedSize(max(1, total_w), total_h)
         self._host.updateGeometry()
 
-        # ??? ?????? ??? ???????????? ???)???????? ???
+
         self._pin_to_right()
         QTimer.singleShot(0, self._pin_to_right)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        # ?????? ??? ??? ??? ???
+
         QTimer.singleShot(0, self._pin_to_right)
 
     def _pin_to_right(self):
@@ -2079,21 +2065,16 @@ class PathBar(QWidget):
                 return
             content_w = max(self._host.sizeHint().width(), self._host.width())
             if content_w > (viewport_w + 1):
-                # Overflow only: show the tail (deepest folder) first.
+
                 self._hbar.setValue(self._hbar.maximum())
             else:
-                # Fits fully: keep the normal left-aligned start.
+
                 self._hbar.setValue(self._hbar.minimum())
         except Exception:
             pass
 
-# -------------------- SearchResultModel --------------------
+
 class SearchResultModel(QStandardItemModel):
-    """
-    ??????? ??? ???.
-    - Size ????? ???????? ??? ????????
-    - ??? ?????? ??? text/uri-list (file://...) ??QMimeData?????
-    """
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and index.column() == 1:
             b = super().data(index, SIZE_BYTES_ROLE)
@@ -2104,14 +2085,14 @@ class SearchResultModel(QStandardItemModel):
             return ""
         return super().data(index, role)
 
-    # ---- ????????? ??? ?????file:// URL ??? ----
+
     def mimeTypes(self):
-        # ??? ??? ????????????? ??? ??? ??? MIME
+
         return ["text/uri-list"]
 
     def mimeData(self, indexes):
         md = QtCore.QMimeData()
-        # ??? ??? ??? ?????? ??? ?????? ??? ???
+
         rows = set()
         for ix in indexes:
             if ix.isValid():
@@ -2123,7 +2104,7 @@ class SearchResultModel(QStandardItemModel):
             it = self.item(r, 0)
             if not it:
                 continue
-            path = it.data(Qt.UserRole)  # ExplorerPane._apply_filter ??? ????? ??? ???
+            path = it.data(Qt.UserRole)
             if path:
                 urls.append(QUrl.fromLocalFile(path))
 
@@ -2131,45 +2112,39 @@ class SearchResultModel(QStandardItemModel):
         return md
 
     def flags(self, index):
-        # ???/??? + ??????????????????
+
         f = super().flags(index)
         if index.isValid():
             f |= Qt.ItemIsDragEnabled
         return f
 
     def supportedDragActions(self):
-        # ??? ??? ?????? '???' ????????
+
         return Qt.CopyAction
 
     def startDrag(self, supportedActions):
-        # ??? ??????????? ????? ??? URL???????? ??? ???
-        from PyQt5.QtGui import QDrag  # ??? ???????? ??? ??????????
+
+        from PyQt5.QtGui import QDrag
         md = QtCore.QMimeData()
 
-        # ??? ??? ???(??????/??????? ??? ????
+
         paths = [p for p in self.pane._selected_paths() if p and os.path.exists(p)]
         if not paths:
             return
 
-        # ????? text/uri-list + text/plain
+
         md.setUrls([QUrl.fromLocalFile(p) for p in paths])
         md.setText("\r\n".join(paths))
 
         drag = QDrag(self)
         drag.setMimeData(md)
 
-        # ????? Copy????? ??? Move ?????? ??? ???)
+
         drag.exec_(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
 
 
-# -------------------- Conflict Resolution Dialog --------------------
+
 class ConflictResolutionDialog(QDialog):
-    """
-    Per-file conflict chooser:
-      - Table with columns: Name, Destination, Action (Overwrite/Skip/Copy)
-      - Top buttons: Overwrite All / Skip All / Copy All
-      - OK / Cancel
-    """
     def __init__(self, parent, conflicts:list[tuple[str,str]], dst_dir:str):
         super().__init__(parent)
         self.setWindowTitle("Resolve name conflicts")
@@ -2179,7 +2154,7 @@ class ConflictResolutionDialog(QDialog):
 
         lay = QVBoxLayout(self)
 
-        # Top "apply to all" row
+
         top = QHBoxLayout()
         lbl = QLabel("Apply to all:", self)
         btn_over = QPushButton("Overwrite All", self)
@@ -2193,7 +2168,7 @@ class ConflictResolutionDialog(QDialog):
         top.addWidget(btn_copy)
         lay.addLayout(top)
 
-        # Table
+
         self.tbl = QTableWidget(self)
         self.tbl.setColumnCount(3)
         self.tbl.setHorizontalHeaderLabels(["Name", "Destination", "Action"])
@@ -2219,12 +2194,12 @@ class ConflictResolutionDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
-        # Apply-to-all handlers
+
         btn_over.clicked.connect(lambda: self._apply_all("Overwrite"))
         btn_skip.clicked.connect(lambda: self._apply_all("Skip"))
         btn_copy.clicked.connect(lambda: self._apply_all("Copy"))
 
-        # ??? ?????? ????? ???
+
         theme = getattr(getattr(parent, "host", None), "theme", "dark")
         if theme == "dark":
             pal = self.palette()
@@ -2250,9 +2225,6 @@ class ConflictResolutionDialog(QDialog):
             if idx >= 0: c.setCurrentIndex(idx)
 
     def result_map(self) -> dict:
-        """
-        Returns: dict[src_path] = "overwrite"|"skip"|"copy"
-        """
         out = {}
         for (src, _dst), combo in zip(self._conflicts, self._combos):
             choice = combo.currentText().strip().lower()
@@ -2260,7 +2232,7 @@ class ConflictResolutionDialog(QDialog):
             out[src] = choice
         return out
 
-# -------------------- Custom View (robust D&D) --------------------
+
 class ExplorerView(QTreeView):
     def __init__(self, pane):
         super().__init__(pane); self.pane=pane
@@ -2272,7 +2244,7 @@ class ExplorerView(QTreeView):
         self._drag_start_modifiers = Qt.NoModifier
         self._drag_start_was_selected = False
         self._drag_ready = False
-        # ???????? ??? ??????? ???????????????? ???
+
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
@@ -2291,7 +2263,7 @@ class ExplorerView(QTreeView):
                 self.pane._start_bg_op(op, srcs, self.pane.current_path()); e.acceptProposedAction(); return
         super().dropEvent(e)
 
-    # F5 = ??? ??????
+
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_F5:
             try:
@@ -2301,7 +2273,7 @@ class ExplorerView(QTreeView):
             return
         super().keyPressEvent(e)
 
-    # ??? ??? ???????????????? ?????? ???
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._drag_start_pos = e.pos()
@@ -2311,14 +2283,14 @@ class ExplorerView(QTreeView):
             self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
             self._drag_ready = False
 
-        # ????? ?????? ??? ????? ?????? ????? ??? ???
+
         try:
             if not self.hasFocus():
                 self.setFocus(Qt.MouseFocusReason)
         except Exception:
             pass
 
-        # ??? ??? ???????????????? ?????? ??? (??? ??? ???)
+
         if e.button() == Qt.LeftButton and e.modifiers() == Qt.NoModifier:
             clicked = self.indexAt(e.pos())
             sm = self.selectionModel()
@@ -2337,14 +2309,14 @@ class ExplorerView(QTreeView):
 
     def mouseMoveEvent(self, e):
         if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
-            # ??? Windows ?????? ???????? ??????? ?????????????? ????????
+
             if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
                 if not self._drag_ready:
                     ix = self._drag_start_index
                     sm = self.selectionModel()
-                    # Ctrl+click on an already-selected row toggles it off on press.
-                    # If user actually starts dragging, restore that row so drag payload
-                    # matches Explorer behavior (keep full original selection).
+
+
+
                     if (ix.isValid() and sm
                         and bool(self._drag_start_modifiers & Qt.ControlModifier)
                         and self._drag_start_was_selected
@@ -2354,8 +2326,8 @@ class ExplorerView(QTreeView):
                         except Exception:
                             pass
                     if ix.isValid() and sm and sm.isSelected(ix):
-                        # Shift????? ??? ????????????? ?????? ?????
-                        # Ctrl?? ??? ???????? ??????????? ????????(??? ????????)????????.
+
+
                         has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
                         has_ctrl = bool(self._drag_start_modifiers & Qt.ControlModifier)
                         allow_with_ctrl = (not has_ctrl) or self._drag_start_was_selected
@@ -2378,7 +2350,7 @@ class ExplorerView(QTreeView):
         self._drag_ready = False
 
 
-# -------------------- Explorer Pane --------------------
+
 class ExplorerPane(QWidget):
     requestBackgroundOp=pyqtSignal(str, list, str)
     _FALLBACK_NEW_ACTION_SPECS = (
@@ -2403,7 +2375,7 @@ class ExplorerPane(QWidget):
 
         self._apply_layout(row_toolbar, row_path, row_filter, row_status)
 
-        # ????? ??? ??? ???
+
         self._load_sort_settings()
 
         self.set_path(start_path or QDir.homePath(), push_history=False)
@@ -2412,7 +2384,7 @@ class ExplorerPane(QWidget):
         self._connect_signals()
         self._register_shortcuts()
 
-        # ??? ??? ??? (????? Name ??????)
+
         self._apply_saved_sort()
         self._update_pane_status()
 
@@ -2431,7 +2403,7 @@ class ExplorerPane(QWidget):
         self._file_worker=None
         self._op_progress_dialog=None
         self._dirload_timer={}
-        self._sort_column = 0  # ????? Name
+        self._sort_column = 0
         self._sort_order = Qt.AscendingOrder
         self._header_resize_guard = False
         self._browse_name_min_width = 140
@@ -2457,7 +2429,7 @@ class ExplorerPane(QWidget):
         self.btn_up=QToolButton(self); self.btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp)); self.btn_up.setToolTip("Up"); self.btn_up.setFixedHeight(UI_H)
         self.btn_new=QToolButton(self); self.btn_new.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder)); self.btn_new.setToolTip("New Folder"); self.btn_new.setFixedHeight(UI_H)
 
-        # ?????(.txt) ???
+
         self.btn_new_file=QToolButton(self)
         self.btn_new_file.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
         self.btn_new_file.setToolTip("New Text File (.txt)")
@@ -2467,7 +2439,7 @@ class ExplorerPane(QWidget):
 
         row_toolbar=QHBoxLayout()
         row_toolbar.setContentsMargins(0,0,0,0)
-        # ??????????????? ??? ???
+
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
         row_toolbar.addWidget(self.btn_star)
         row_toolbar.addWidget(self._bm_btn_container,1)
@@ -2478,11 +2450,11 @@ class ExplorerPane(QWidget):
         row_toolbar.addWidget(self.btn_refresh)
         self._row_toolbar=row_toolbar
 
-        # ??????????????? ??? ???(??? ?????? ???)
+
         _tight_css = "QToolButton{padding-left:4px;padding-right:4px;}"
         for b in (self.btn_cmd, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
             b.setStyleSheet(_tight_css)
-            b.setAutoRaise(True)  # ???????? ??? ?????
+            b.setAutoRaise(True)
         return row_toolbar
 
     def _build_path_row(self):
@@ -2573,7 +2545,7 @@ class ExplorerPane(QWidget):
         header = v.header()
         if header is None:
             return
-        # Browse/Fast mode only (Type column hidden).
+
         if not v.isColumnHidden(2):
             return
         vp_w = v.viewport().width()
@@ -2594,7 +2566,7 @@ class ExplorerPane(QWidget):
     def _on_header_section_resized(self, logical_index:int, _old_size:int, _new_size:int):
         if self._header_resize_guard or self._search_mode:
             return
-        # Keep Name filling the remaining width after Size/Date changes.
+
         if logical_index in (1, 3):
             self._schedule_browse_name_autofit()
 
@@ -2617,19 +2589,19 @@ class ExplorerPane(QWidget):
         self.btn_cmd.clicked.connect(self._open_cmd_here)
         self.btn_up.clicked.connect(self.go_up)
         self.btn_new.clicked.connect(self.create_folder)
-        self.btn_new_file.clicked.connect(self.create_text_file)  # ????? ???
-        self.btn_refresh.clicked.connect(self.hard_refresh)  # ??? ??????
+        self.btn_new_file.clicked.connect(self.create_text_file)
+        self.btn_refresh.clicked.connect(self.hard_refresh)
         self.view.activated.connect(self._on_double_click)
         self.view.viewport().installEventFilter(self)
         self.view.installEventFilter(self)
         self.path_bar.installEventFilter(self)
         self._bm_btn_container.installEventFilter(self)
-        self.filter_edit.installEventFilter(self)  # ?????: ????????ESC ???
+        self.filter_edit.installEventFilter(self)
         self._sel_model = None
         self._hook_selection_model()
         self.filter_edit.returnPressed.connect(self._apply_filter)
         self.btn_search.clicked.connect(self._apply_filter)
-        self.filter_edit.textChanged.connect(self._on_filter_text_changed)  # ?????: x??????? ????????
+        self.filter_edit.textChanged.connect(self._on_filter_text_changed)
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._request_visible_stats())
         except Exception: pass
         try: self.proxy.rowsInserted.connect(lambda *_: self._request_visible_stats(0))
@@ -2644,7 +2616,7 @@ class ExplorerPane(QWidget):
             sc=QShortcut(QKeySequence(seq), self.view)
             sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
         add_sc("Backspace", self.go_back); add_sc("Alt+Left", self.go_back); add_sc("Alt+Right", self.go_forward)
-        add_sc("Alt+Up", self.go_up)  # ??Alt+Up??? ??? ??? ???
+        add_sc("Alt+Up", self.go_up)
         add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit)
         add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
         add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
@@ -2652,12 +2624,11 @@ class ExplorerPane(QWidget):
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
-        # ??? ??? ?????
+
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
 
     def _load_sort_settings(self):
-        """Load persisted sort settings."""
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             self._sort_column = s.value(f"pane_{self.pane_id}/sort_column", 0, type=int)
@@ -2666,9 +2637,8 @@ class ExplorerPane(QWidget):
         except Exception:
             self._sort_column = 0
             self._sort_order = Qt.AscendingOrder
-    
+
     def _save_sort_settings(self):
-        """Persist current sort settings."""
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             s.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
@@ -2676,9 +2646,8 @@ class ExplorerPane(QWidget):
             s.sync()
         except Exception:
             pass
-    
+
     def _apply_saved_sort(self):
-        """Apply persisted sort settings to the current view."""
         try:
             v = self.view
             if not v.isSortingEnabled():
@@ -2690,19 +2659,13 @@ class ExplorerPane(QWidget):
 
 
     def set_active_visual(self, active: bool):
-        """
-        Pane ?????'active' ???????? QSS ????????? ???????????.
-        - ??? ??? objectName??'paneRoot'?????
-        - ??????????repolish)????? ???
-        - breadcrumb????crumb(QPushButton#crumb)??? ?????repolish
-        """
         try:
-            # paneRoot ??? + active ??? ???
+
             if self.objectName() != "paneRoot":
                 self.setObjectName("paneRoot")
             self.setProperty("active", bool(active))
 
-            # ????? ??? ??? ?????repolish
+
             targets = [self,
                        getattr(self, "view", None),
                        getattr(self, "filter_edit", None),
@@ -2717,7 +2680,7 @@ class ExplorerPane(QWidget):
                     except Exception:
                         pass
 
-            # breadcrumb????? crumb ?????????????repolish
+
             host = getattr(getattr(self, "path_bar", None), "_host", None)
             if host:
                 from PyQt5.QtWidgets import QPushButton
@@ -2733,10 +2696,6 @@ class ExplorerPane(QWidget):
             pass
 
     def _hook_selection_model(self):
-        """
-        ??? ??????????? selectionModel????? ?????
-        ??? ??? selectionModel??selectionChanged????? ??????.
-        """
         try:
             old = getattr(self, "_sel_model", None)
             if old is not None:
@@ -2754,14 +2713,10 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # ??? ???????? ???
+
         self._request_selection_status_update(immediate=True)
 
     def _copy_path_shortcut(self, folder_only: bool = False):
-        """
-        Ctrl+Shift+C : ????????????? ??? ???
-        Alt+Shift+C  : ????? ??? ????? ?????????????
-        """
         sel = self._selected_paths()
         if len(sel) != 1:
             try:
@@ -2772,11 +2727,11 @@ class ExplorerPane(QWidget):
 
         p = sel[0]
         try:
-            # ???-only ??????, ???????? dirname ??? (????????)
+
             if folder_only and os.path.isfile(p):
                 p = os.path.dirname(p)
         except Exception:
-            # ??? ??? ??? ?????????
+
             pass
 
         try:
@@ -2802,6 +2757,7 @@ class ExplorerPane(QWidget):
                 except Exception:
                     pass
                 if not w.wait(wait_ms):
+                    # Don't block UI; defer deletion after thread finishes.
                     try:
                         w.finished.connect(w.deleteLater, QtCore.Qt.UniqueConnection)
                     except Exception:
@@ -2818,7 +2774,7 @@ class ExplorerPane(QWidget):
             return False
 
     def _cancel_search_worker(self):
-        # ??????????? stat ??? ??? ???
+
         self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
         self._search_worker = None
         self._stop_worker_thread(getattr(self, "_search_stat_worker", None), 80, "search-stat")
@@ -2851,10 +2807,10 @@ class ExplorerPane(QWidget):
             item_name.setData(str(name).lower(), NAME_FOLD_ROLE)
             item_name.setData(False, SEARCH_ICON_READY_ROLE)
             item_name.setData(full, Qt.ToolTipRole)
-            # ??? ??? ????????)
+
             item_name.setIcon(self._default_icon(isdir))
 
-            # ???/??????????????????????
+
             item_size = QStandardItem()
             item_size.setData(0, Qt.EditRole)
             item_size.setData(0, SIZE_BYTES_ROLE)
@@ -2866,7 +2822,7 @@ class ExplorerPane(QWidget):
 
             root_item.appendRow([item_name, item_size, item_date, item_folder])
 
-        # ????? ??????????????????????????? ??? ???
+
         self._request_visible_stats(0)
 
     @QtCore.pyqtSlot()
@@ -2887,7 +2843,7 @@ class ExplorerPane(QWidget):
                 self.view.sortByColumn(col, order)
         except Exception:
             pass
-        # ?????? ????????????? ???
+
         self._request_visible_stats(0)
 
     def _start_next_search_stat_worker(self, batch_limit: int = 220):
@@ -2929,13 +2885,13 @@ class ExplorerPane(QWidget):
             self._start_next_search_stat_worker()
 
     def _on_filter_text_changed(self, text: str):
-        # ??? ??? ????? ???????????? ??????????? ???????????
+
         if not (text or "").strip():
             self._enter_browse_mode()
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_search_stat(self, path: str, size_val, mtime_val):
-        # ??????? stat ????? ????? ??? ????????????
+
         d = getattr(self, "_search_pending_items", None)
         if not isinstance(d, dict):
             return
@@ -2961,11 +2917,6 @@ class ExplorerPane(QWidget):
 
 
     def create_text_file(self):
-        """
-        ??? ????????(??????)????.txt ?????????????
-        ??? ????????????????, ??? ??? ????????????
-        ??? ?????? ??????????Del, F2 ???? ??????????????????
-        """
         base_dir = self.current_path()
         try:
             name = f"New Document {time.strftime('%Y%m%d-%H%M%S')}.txt"
@@ -2974,25 +2925,25 @@ class ExplorerPane(QWidget):
             QMessageBox.critical(self, "Create failed", str(e))
             return
 
-        # ??? ???
+
         self.hard_refresh()
 
-        # ??? ??? ??????????? ?????? ??? ????????
+
         def _try_select():
-            # ?????? ??? ??????????? ????????
+
             try:
                 if self.view and not self.view.hasFocus():
                     self.view.setFocus(Qt.ShortcutFocusReason)
             except Exception:
                 pass
 
-            # ?????????? ??? ??? (??? ???????????)
+
             if self._search_mode:
                 return
 
             try:
                 if self._using_fast:
-                    # Fast ?????? ??????????
+
                     rows = self._fast_model.rowCount()
                     for r in range(rows):
                         rp = self._fast_model.row_path(r)
@@ -3005,7 +2956,7 @@ class ExplorerPane(QWidget):
                             self.view.setCurrentIndex(prx_ix)
                             return
                 else:
-                    # Normal ??? ??? ??????????
+
                     src_ix = self.source_model.index(new_path)
                     if src_ix.isValid():
                         st_ix = self.stat_proxy.mapFromSource(src_ix)
@@ -3019,7 +2970,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-        # fast??ormal ??? ??????????????? ???????
+
         for delay in (0, 80, 200, 450):
             QTimer.singleShot(delay, _try_select)
 
@@ -3190,23 +3141,17 @@ class ExplorerPane(QWidget):
             self._update_free_space_label(force=False)
 
     def _schedule_visible_stats(self):
-        """
-        ??????????????????????stat(???/??????) ???????????.
-        - ???????: ??????? ??? ??????????? ??? ??? (???????? ???)
-        - fast ???: fast ?????? ???????? ???????? ??? ???
-        - ??? ???: self.proxy ?? ??? ???????? ??? ???
-        """
-        # ??????????????????? ???????????, ??? ????????mapToSource ??????????
+
         if self._search_mode:
             self._fill_search_visible_icons()
             return
 
-        # ??? ??? ????????????? (??????????????? ??? ??? ???)
+
         current_model = self.view.model()
         root_ix = self.view.rootIndex()
         vp = self.view.viewport()
 
-        # ---- Fast(???) ??? ??? ----
+
         if self._using_fast:
             if current_model is not self._fast_proxy:
                 return
@@ -3223,7 +3168,7 @@ class ExplorerPane(QWidget):
             to_rows = []
             for r in range(proxy_start, proxy_end + 1):
                 prx_ix = self._fast_proxy.index(r, 0, root_ix)
-                src_ix = self._fast_proxy.mapToSource(prx_ix)  # -> FastDirModel ?????
+                src_ix = self._fast_proxy.mapToSource(prx_ix)
                 row = src_ix.row()
                 if row is None or row < 0:
                     continue
@@ -3232,7 +3177,7 @@ class ExplorerPane(QWidget):
                     if len(to_rows) >= 220:
                         break
 
-                # OS ???????? ?????
+
                 if not self._fast_model.has_icon(row):
                     p = self._fast_model.row_path(row)
                     if p:
@@ -3258,7 +3203,7 @@ class ExplorerPane(QWidget):
             w.start()
             return
 
-        # ---- ???(???) ??? ??? ----
+
         if current_model is not self.proxy:
             return
 
@@ -3278,13 +3223,13 @@ class ExplorerPane(QWidget):
             end = start
 
         for r in range(start, end + 1):
-            prx_ix = model.index(r, 0, root_ix)        # -> FsSortProxy(self.proxy) ?????
+            prx_ix = model.index(r, 0, root_ix)
             if not prx_ix.isValid():
                 continue
-            st_ix  = model.mapToSource(prx_ix)         # -> StatOverlayProxy ?????
+            st_ix  = model.mapToSource(prx_ix)
             if not st_ix.isValid():
                 continue
-            src_ix = stat_proxy.mapToSource(st_ix)     # -> QFileSystemModel ?????
+            src_ix = stat_proxy.mapToSource(st_ix)
             if not src_ix.isValid():
                 continue
             try:
@@ -3298,28 +3243,26 @@ class ExplorerPane(QWidget):
             stat_proxy.request_paths(paths)
 
     def _on_header_clicked(self, col:int):
-        """Handle header click: toggle sort column/order and persist settings."""
         v=self.view
-        if not v.isSortingEnabled(): 
+        if not v.isSortingEnabled():
             v.setSortingEnabled(True)
-        
-        # ??? ??? ??? ????? ???, ??? ????? ??????
+
+
         if col == self._sort_column:
             new_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
         else:
             new_order = Qt.AscendingOrder
-        
+
         self._sort_column = col
         self._sort_order = new_order
-        
+
         v.header().setSortIndicator(col, new_order)
         v.sortByColumn(col, new_order)
-        
-        # ??? ????
+
+
         self._save_sort_settings()
 
     def _mark_self_active(self):
-        """??Pane????? Pane??? ???."""
         try:
             if hasattr(self.host, "mark_active_pane"):
                 self.host.mark_active_pane(self)
@@ -3327,7 +3270,7 @@ class ExplorerPane(QWidget):
             pass
 
     def eventFilter(self, obj, ev):
-        # ???????? ????? ???: ??? ??? ???
+
         if obj is self.view.viewport():
             if ev.type()==QEvent.MouseButtonPress:
                 if ev.button()==Qt.XButton1: self.go_back(); return True
@@ -3352,13 +3295,13 @@ class ExplorerPane(QWidget):
                 QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
             return False
 
-        # ??? ????? Esc????? ??? + ?????? ??? ???
+
         if obj is self.filter_edit:
             if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
                 try:
                     self.filter_edit.clear()
                 finally:
-                    # ???????????? ?????? ????????
+
                     self._enter_browse_mode()
                 ev.accept()
                 return True
@@ -3374,43 +3317,43 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # 1) cmd.exe ??? ??? (ComSpec ???)
+
         comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
 
-        # 2) ???: pywin32?? ?????ShellExecute????? ???
+
         if HAS_PYWIN32:
             try:
-                # /K ??????? + ??? ????????
-                # title ????? ??????????????????)
+
+
                 params = f'/K title Multi-Pane File Explorer & cd /d "{path}"'
                 win32api.ShellExecute(
                     int(self.window().winId()) if self.window() else 0,
                     "open",
                     comspec,
                     params,
-                    path,  # ??? ??????
+                    path,
                     win32con.SW_SHOWNORMAL
                 )
                 return
             except Exception:
-                pass  # ??? ????????
+                pass
 
-        # 3) ??? subprocess ??? (?????/?????? ?????? ????????)
+
         try:
             flags = 0
             flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-            # ????? ???(??? ?????? ??? ??? ????????????)
+
             si = None
             try:
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = 1  # SW_SHOWNORMAL
+                si.wShowWindow = 1
             except Exception:
                 si = None
 
-            # /K ????? + /d ???????? ??? ???
+
             subprocess.Popen(
                 [comspec, "/K", f'cd /d "{path}"'],
                 cwd=path,
@@ -3419,11 +3362,11 @@ class ExplorerPane(QWidget):
             )
             return
         except Exception:
-            pass  # ????????
+            pass
 
-        # 4) ??? ???: cmd ??? ??? 'start' ??? (shell=True ???)
+
         try:
-            # ?????("") ???, /D???????? ??????cmd ???
+
             cmdline = f'start "" /D "{path}" "{comspec}" /K cd /d "{path}"'
             subprocess.Popen(cmdline, shell=True)
             return
@@ -3488,11 +3431,11 @@ class ExplorerPane(QWidget):
             model = None
 
         try:
-            # Fast/Search models store absolute path in UserRole.
+
             if model in (self._fast_proxy, self._fast_model, self._search_proxy, self._search_model):
                 return index.sibling(index.row(), 0).data(Qt.UserRole)
 
-            # Normal browse chain: proxy -> stat_proxy -> source_model.
+
             if model is self.proxy:
                 st_ix = self.proxy.mapToSource(index)
                 if not st_ix.isValid():
@@ -3507,19 +3450,13 @@ class ExplorerPane(QWidget):
             if model is self.source_model:
                 return self.source_model.filePath(index)
 
-            # Unknown model: avoid proxy mapping with mismatched index model.
+
             return index.sibling(index.row(), 0).data(Qt.UserRole)
         except Exception:
             return None
 
     def _use_fast_model(self, path: str):
-        """
-        FastDirModel?????????? ????????????????,
-        ?????? ????? ??? ??????? ???/??????/??????????? ??????
-        ?????(??? ??) ??? ??? ??????????
-        ????????????? ??? ???????? ?????????, ??? ????????.
-        """
-        # ??? ??? ???/??? ???
+
         self._cancel_fast_stat_worker()
         self._cancel_enum_worker(wait_ms=100)
         try:
@@ -3527,7 +3464,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # Fast ????????
+
         self._using_fast = True
         self._fast_model.reset_dir(path)
         self.view.setModel(self._fast_proxy)
@@ -3537,21 +3474,21 @@ class ExplorerPane(QWidget):
         self._fast_enum_root = path
         self._fast_enum_done = False
 
-        # ???? ????????????? ??????(??? ???) ??????????????????????????????????????????
-        #   Fast ?????? ??????? ??? ??? ??OS ?????? ??????
-        #   ??????? ??????????, ????? ??? ????? ????????
+
+
+
         orig_apply_icon = getattr(self._fast_model, "apply_icon", None)
 
         def _noop_apply_icon(_row, _icon):
-            # ??? ???????? ?????? ?????? ???
+
             return None
 
         try:
             self._fast_model.apply_icon = _noop_apply_icon
         except Exception:
-            orig_apply_icon = None  # ??? ?????? ?????? ???????
+            orig_apply_icon = None
 
-        # ??? ??????????? ?????? ????????/??????????? ??
+
         was_sorting = self.view.isSortingEnabled()
         if was_sorting:
             self.view.setSortingEnabled(False)
@@ -3560,7 +3497,7 @@ class ExplorerPane(QWidget):
         self._fast_batch_counter = 0
         self._enum_worker = DirEnumWorker(path, self)
 
-        # ??? ???: ???????? + ?????????? ???????
+
         def _on_batch(rows):
             self._fast_model.append_rows(rows)
             self._fast_enum_count += len(rows or [])
@@ -3581,20 +3518,20 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-        # ??? ???: ???/?????? ??? + ????????????? ????? ????????????????????
+
         def _on_finished():
             try:
                 self._fast_enum_done = True
-                # ??? ?????? ???
+
                 self.view.setUpdatesEnabled(True)
 
                 self._apply_saved_sort()
                 self.view.setSortingEnabled(True)
 
-                # ?????apply ??? ??? ????? ????????????? ????????
+
                 _restore_apply_icon()
 
-                # ??????? ???/?????? ??? 2???????????? ?????????? ??????)
+
                 self._request_visible_stats(0)
                 self._request_visible_stats(80)
                 try:
@@ -3609,32 +3546,27 @@ class ExplorerPane(QWidget):
                 except Exception:
                     pass
             finally:
-                # ?????? ???????????????????? ???
+
                 if not was_sorting:
                     self.view.setSortingEnabled(False)
 
         self._enum_worker.finished.connect(_on_finished)
 
-        # ??? ??? ??? ???????? ????? ???
+
         self._request_visible_stats(0)
 
-        # ??????????? ???
+
         self._enum_worker.start()
 
 
     def _start_normal_model_loading(self, path:str, known_count: int | None = None):
-        """
-        ????? ??? ??UI ?????????????:
-          - ??? ??? ??? ?????Q&D ????? QFileSystemModel ??????????? fast ????????
-          - ??? ??? ?????? ?????? ?????????????? ?????????? ??? ?????
-        """
         self._pending_normal_root = path
         t = QElapsedTimer(); t.start()
         self._dirload_timer[path.lower()] = t
 
-        # ???? ??? ??? ??? ???: threshold?????????? ???
-        HUGE_THRESHOLD = 3000   # ???????? normal ??? ??? ???
-        GENERIC_THRESHOLD = 1200  # ???????? ?????????????
+
+        HUGE_THRESHOLD = 3000
+        GENERIC_THRESHOLD = 1200
         if known_count is not None:
             try:
                 count = max(0, int(known_count))
@@ -3652,17 +3584,17 @@ class ExplorerPane(QWidget):
                             is_huge = True
                             break
             except Exception:
-                # ??? ?????? normal ??????????????? ???
+
                 pass
 
         if is_huge:
-            # ??? ?????: fast ???????? (normal ??? ???)
+
             dlog(f"[perf] Skip QFileSystemModel for huge folder (>= {HUGE_THRESHOLD} items): {path}")
             self._pending_normal_root = None
             self._request_visible_stats(0)
             return
 
-        # ??? ??? ???: ?????????????(?????????? ??? ???)
+
         try:
             use_generic = ALWAYS_GENERIC_ICONS or count >= GENERIC_THRESHOLD
             if use_generic and self._icon_provider_mode != "generic":
@@ -3674,7 +3606,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # ??? ??? ???????? ???
+
         _ = self.source_model.setRootPath(path)
 
     def _unc_share_root(self, path:str)->str:
@@ -3689,11 +3621,6 @@ class ExplorerPane(QWidget):
         return f"\\\\{comps[0]}\\{comps[1]}"
 
     def _try_network_auth_prompt(self, path:str)->tuple[bool, bool]:
-        """
-        Return (accessible, prompted).
-        - accessible: path became accessible after this call
-        - prompted: a credential/login flow was launched
-        """
         target = self._unc_share_root(path)
         prompted = False
 
@@ -3712,7 +3639,7 @@ class ExplorerPane(QWidget):
                     ]
 
                 nr = _NETRESOURCEW()
-                nr.dwType = 1  # RESOURCETYPE_DISK
+                nr.dwType = 1
                 nr.lpRemoteName = target
 
                 CONNECT_INTERACTIVE = 0x00000008
@@ -3766,8 +3693,8 @@ class ExplorerPane(QWidget):
                 QMessageBox.warning(self, "Path not found", path)
                 return
 
-            # ??????? ???????? ????????????? ??? ???????????????.
-            # (_search_mode?? ??? ?????normal ??? ???????? ??? ?????? ??????????)
+
+
             if self._search_mode:
                 self._enter_browse_mode()
 
@@ -3776,35 +3703,29 @@ class ExplorerPane(QWidget):
                 self._back_stack.append(cur)
                 self._fwd_stack.clear()
 
-            # ??? ???/?????? ??? ???
+
             self.path_bar.set_path(path)
             self._update_star_button()
 
-            # ???? ??????????? ???????? ??????) ????
+
             try:
                 self._bind_fs_watcher(path)
             except Exception:
                 pass
 
-            # ??? ???????? ??? ??????????? QFileSystemModel ???
+
             self._deferred_normal_load_path = path
             self._use_fast_model(path)
             if self._fast_enum_done and os.path.normcase(self._fast_enum_root) == os.path.normcase(path):
                 self._deferred_normal_load_path = None
                 QTimer.singleShot(0, lambda p=path, c=self._fast_enum_count: self._start_normal_model_loading(p, known_count=c))
 
-            # ??????????? ?????? ???
+
             QTimer.singleShot(50, self._update_pane_status)
             self._update_statusbar_selection()
 
     def _bind_fs_watcher(self, folder_path: str):
-        """
-        ??? Pane????? ??? ?????QFileSystemWatcher??????????
-        - ?????? ?????????? ??????(???????? ????????????????
-        - ??? ???(QFileSystemModel)?????????????????????????? ?????
-          ??? ???(FastDirModel/???????)?????????? ?????? ???
-        """
-        # ???/?????? ????? ???????
+
         if not hasattr(self, "_fswatch"):
             self._fswatch = QtCore.QFileSystemWatcher(self)
             self._fswatch.directoryChanged.connect(self._on_fs_changed)
@@ -3813,10 +3734,10 @@ class ExplorerPane(QWidget):
         if not hasattr(self, "_fswatch_debounce"):
             self._fswatch_debounce = QTimer(self)
             self._fswatch_debounce.setSingleShot(True)
-            self._fswatch_debounce.setInterval(600)  # ms: ??????? ????
+            self._fswatch_debounce.setInterval(600)
             self._fswatch_debounce.timeout.connect(self._apply_fs_change)
 
-        # ??? ??? ??? ??? ??????? ???
+
         try:
             dirs = list(self._fswatch.directories())
             if dirs:
@@ -3825,18 +3746,14 @@ class ExplorerPane(QWidget):
             pass
 
         try:
-            # ?????? ???????????
+
             if os.path.isdir(folder_path):
                 self._fswatch.addPath(folder_path)
         except Exception:
-            # ??? ?????????????????? ???(???)
+
             pass
 
     def _on_fs_changed(self, _path: str):
-        """
-        ??? ???????? ???????? ?????????????.
-        (??? ????? _apply_fs_change ??? ??? ???)
-        """
         try:
             if self._fswatch_debounce.isActive():
                 self._fswatch_debounce.stop()
@@ -3845,30 +3762,24 @@ class ExplorerPane(QWidget):
             pass
 
     def _apply_fs_change(self):
-        """
-        ?????? ????? ??? ???.
-        - ???????: ????? ?????????? ??????????? ????????
-        - ??? ???: ??? ???????????????
-        - ??? ???(QFileSystemModel): ???????? ??? ????????? ????????
-        """
         try:
-            # ???????????
+
             if getattr(self, "_search_mode", False):
                 pattern = self.filter_edit.text().strip()
                 if pattern:
-                    # ??? ??? ??????????
+
                     self._apply_filter()
                 else:
-                    # ????? ??? ??????????? ????????
+
                     self._enter_browse_mode()
                 return
 
-            # ??? ???????? ??????????
+
             if getattr(self, "_using_fast", False):
                 self._use_fast_model(self.current_path())
                 return
 
-            # ??? ???(QFileSystemModel)??? ?????? ???????????????? ???
+
             self._request_visible_stats(0)
             self._update_pane_status()
         except Exception:
@@ -3883,7 +3794,7 @@ class ExplorerPane(QWidget):
             dlog(f"directoryLoaded: '{loaded_path}' in {ms} ms")
             self._dirload_timer.pop(key, None)
 
-        # ????????????normal ?????????????? ??? ??? ??? ???
+
         if self._pending_normal_root is None:
             return
 
@@ -3898,13 +3809,13 @@ class ExplorerPane(QWidget):
                 self._using_fast = False
                 self._pending_normal_root = None
 
-                # ???????? ?????
+
                 self._hook_selection_model()
 
                 self._configure_header_browse()
                 if not self.view.isSortingEnabled():
                     self.view.setSortingEnabled(True)
-                # ????? ??? ???
+
                 self._apply_saved_sort()
                 self._request_visible_stats(0)
             except Exception:
@@ -3919,7 +3830,7 @@ class ExplorerPane(QWidget):
         dst=self._fwd_stack.pop(); self._back_stack.append(self.current_path()); self.set_path(dst, push_history=False)
     def go_up(self):
         parent=Path(self.current_path()).parent; self.set_path(str(parent), push_history=True)
-    def refresh(self):  # ???/?????????? ?????? ???
+    def refresh(self):
         self.hard_refresh()
     def hard_refresh(self):
         if self._search_mode:
@@ -3933,7 +3844,7 @@ class ExplorerPane(QWidget):
         self.set_path(self.current_path(), push_history=False)
         self.host.flash_status("Hard refresh")
 
-    # ---- Open helpers ----
+
     def _open_file_with_cwd(self, path:str):
         folder=os.path.dirname(path) or self.current_path()
         try:
@@ -3987,7 +3898,7 @@ class ExplorerPane(QWidget):
             except Exception as e:
                 QMessageBox.critical(self,"Error",str(e))
 
-    # ---- Clipboard ops (w/ conflicts dialog) ----
+
     def copy_selection(self):
         paths=self._selected_paths()
         if not paths: return
@@ -4007,7 +3918,7 @@ class ExplorerPane(QWidget):
             return None
 
         urls = md.urls()
-        # Keep order while removing duplicates to avoid redundant work
+
         paths = list(dict.fromkeys(u.toLocalFile() for u in urls if u.isLocalFile()))
         if not paths:
             return None
@@ -4085,11 +3996,11 @@ class ExplorerPane(QWidget):
 
             if _paths_same(src, dst):
                 if op == "copy":
-                    # Same-folder copy should keep both by default.
+
                     auto_map[src] = "copy"
                     valid_srcs.append(src)
                 else:
-                    # Move to the exact same path is a no-op.
+
                     skipped_same.append(src)
                 continue
 
@@ -4114,7 +4025,7 @@ class ExplorerPane(QWidget):
                 self.host.flash_status("Nothing to move (same source and destination)")
             return
 
-        # 1) Build conflicts (excluding auto-resolved same-path copies)
+
         conflicts=[]
         for src in valid_srcs:
             if src in auto_map:
@@ -4127,10 +4038,10 @@ class ExplorerPane(QWidget):
         if conflicts:
             dlg=ConflictResolutionDialog(self, conflicts, dst_dir)
             if dlg.exec_()!=QDialog.Accepted: return
-            # src -> "overwrite"|"skip"|"copy"
+
             conflict_map.update(dlg.result_map())
 
-        # 2) Run worker
+
         old_dlg = getattr(self, "_op_progress_dialog", None)
         if old_dlg:
             try:
@@ -4182,7 +4093,7 @@ class ExplorerPane(QWidget):
         worker.start()
         dlgp.open()
 
-    # ---- Delete / Rename / Undo ----
+
     def delete_selection(self, permanent:bool=False):
         paths=self._selected_paths()
         if not paths: return
@@ -4241,9 +4152,9 @@ class ExplorerPane(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"Undo failed",str(e))
 
-    # ---- Search ----
+
     def _enter_browse_mode(self):
-        # ???????????/??? ???
+
         try:
             if hasattr(self, "_cancel_search_worker"):
                 self._cancel_search_worker()
@@ -4266,7 +4177,7 @@ class ExplorerPane(QWidget):
         else:
             self.view.setModel(self.proxy)
 
-        # ???????? ?????
+
         self._hook_selection_model()
 
         path = self.current_path()
@@ -4280,7 +4191,7 @@ class ExplorerPane(QWidget):
         self._configure_header_browse()
         if not self.view.isSortingEnabled():
             self.view.setSortingEnabled(True)
-        # ????? ??? ???
+
         self._apply_saved_sort()
 
         self._request_visible_stats(0)
@@ -4296,7 +4207,7 @@ class ExplorerPane(QWidget):
         self.view.setModel(self._search_proxy)
         self.view.setRootIndex(QtCore.QModelIndex())
 
-        # ???????? ?????
+
         self._hook_selection_model()
 
         header = self.view.header()
@@ -4308,28 +4219,28 @@ class ExplorerPane(QWidget):
     def _apply_filter(self):
         pattern = self.filter_edit.text().strip()
         if not pattern:
-            # ????? ????? ??? ???
+
             self._enter_browse_mode()
             return
 
-        # ??? ???????
+
         self._cancel_search_worker()
 
         base = self.current_path()
 
-        # ??????? ??? ????(????? ?????? ??? ????? stat?? ???????? ?????????
+
         model = SearchResultModel(self)
         model.setHorizontalHeaderLabels(["Name", "Size", "Date Modified", "Folder"])
         self._enter_search_mode(model)
 
-        # ??????? ?????(??????? stat ??????)
+
         self._search_pending_items = {}
         self._search_stats_done = set()
         self._search_stat_worker = None
         self._search_stat_queue = []
         self._search_stat_pending = set()
 
-        # ??? ??? (???????????)
+
         w = SearchWorker(base, pattern, self, max_results=SEARCH_RESULT_LIMIT)
         self._search_worker = w
         w.batchReady.connect(self._on_search_batch, Qt.QueuedConnection)
@@ -4377,7 +4288,7 @@ class ExplorerPane(QWidget):
             p = item_name.data(Qt.UserRole)
             isdir = bool(item_name.data(IS_DIR_ROLE))
 
-            # ????? ??? OS ???????????
+
             if p and not bool(item_name.data(SEARCH_ICON_READY_ROLE)):
                 idx = self.source_model.index(p)
                 if idx.isValid():
@@ -4386,7 +4297,7 @@ class ExplorerPane(QWidget):
                         item_name.setIcon(icon)
                 item_name.setData(True, SEARCH_ICON_READY_ROLE)
 
-            # Visible-area stat: queue only once per path.
+
             if p and not isdir and p not in getattr(self, "_search_stats_done", set()):
                 self._search_pending_items[p] = (item_size, item_date)
                 paths_need_stat.append(p)
@@ -4428,11 +4339,11 @@ class ExplorerPane(QWidget):
         owner_hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
         paths = self._selected_paths()
 
-        # ??? ???????????????? ??? ???
+
         if self._try_native_context_menu(pos, owner_hwnd, paths):
             return
 
-        # ??? ???????? ???, ??? ???(New) fallback ?????????? ???
+
         if paths:
             global_pt = QCursor.pos()
             menu = QMenu(self)
@@ -4465,7 +4376,7 @@ class ExplorerPane(QWidget):
                 self.paste_into_current()
             return
 
-        # ???? Fallback: 'New' ???????? ???????? ??? ????
+
         dst_dir = self.current_path()
         global_pt = QCursor.pos()
         menu = QMenu(self)
@@ -4522,7 +4433,7 @@ class ExplorerPane(QWidget):
         super().closeEvent(e)
 
 
-# -------------------- Main Window --------------------
+
 class MultiExplorer(QMainWindow):
     namedBookmarksChanged=pyqtSignal(list)
     def __init__(self, pane_count:int=6, start_paths=None, initial_theme:str="dark"):
@@ -4531,20 +4442,20 @@ class MultiExplorer(QMainWindow):
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
         self.setWindowTitle(f"Multi-Pane File Explorer ??{pane_count} panes"); self.resize(1500,900)
 
-        # Top bar
+
         top=QWidget(self); top_lay=QHBoxLayout(top); top_lay.setContentsMargins(6,2,6,2); top_lay.setSpacing(ROW_SPACING)
         self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 ??6 ??8)"); self.btn_layout.setFixedHeight(UI_H)
         self.btn_theme=QToolButton(top); self.btn_theme.setToolTip("Toggle Light/Dark"); self.btn_theme.setFixedHeight(UI_H)
         self.btn_bm_edit=QToolButton(top); self.btn_bm_edit.setToolTip("Edit Bookmarks"); self.btn_bm_edit.setFixedHeight(UI_H)
 
-        # ??Session ??? ??? (Edit Bookmarks ?????
+
         self.btn_session=QToolButton(top)
         self.btn_session.setToolTip("Session (save/load all pane paths)")
         self.btn_session.setFixedHeight(UI_H)
 
         self.btn_about=QToolButton(top); self.btn_about.setToolTip("About"); self.btn_about.setFixedHeight(UI_H)
         top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0)
-        top_lay.addWidget(self.btn_session,0)  # ??????????
+        top_lay.addWidget(self.btn_session,0)
         top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
 
         self.central=QWidget(self); self.setCentralWidget(self.central)
@@ -4557,7 +4468,7 @@ class MultiExplorer(QMainWindow):
         self._update_layout_icon(); self._update_theme_icon()
         self.btn_layout.clicked.connect(self._cycle_layout); self.btn_theme.clicked.connect(self._toggle_theme)
         self.btn_bm_edit.clicked.connect(self._open_bookmark_editor)
-        self.btn_session.clicked.connect(self._open_session_manager)  # ????? ????? ???
+        self.btn_session.clicked.connect(self._open_session_manager)
         self.btn_about.clicked.connect(self._show_about)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
@@ -4580,17 +4491,14 @@ class MultiExplorer(QMainWindow):
         if isinstance(geo, QtCore.QByteArray): self._safe_restore_geometry(geo)
 
     def mark_active_pane(self, pane):
-        """
-        ??? Pane????????, ??Pane??PathBar?? Pane ??? ??? ???????????.
-        """
         try:
             self._active_pane = pane
             for p in getattr(self, "panes", []):
                 try:
                     is_active = (p is pane)
-                    # Path bar ????????
+
                     p.path_bar.set_active(is_active)
-                    # Pane ??? ????????
+
                     if hasattr(p, "set_active_visual"):
                         p.set_active_visual(is_active)
                 except Exception:
@@ -4600,11 +4508,10 @@ class MultiExplorer(QMainWindow):
             pass
 
     def _install_focus_tracker(self):
-        """????? ?????????? ??? ??? Pane????????."""
         app = QApplication.instance()
         if not app:
             return
-        # ??? ??? ???
+
         try:
             self._focus_tracker_connected
         except AttributeError:
@@ -4615,14 +4522,13 @@ class MultiExplorer(QMainWindow):
         self._focus_tracker_connected = True
 
     def _on_focus_changed(self, old, now):
-        """?????? ?????? ?????? ??? ??? Pane??????????"""
         try:
             if not now:
                 return
             if not isinstance(now, QWidget):
                 return
             for p in getattr(self, "panes", []):
-                # now?? Pane????? ?????? ??? Pane???????
+
                 if p.isAncestorOf(now):
                     self.mark_active_pane(p)
                     return
@@ -4639,9 +4545,9 @@ class MultiExplorer(QMainWindow):
         if hasattr(self, "btn_theme") and self.btn_theme:
             self.btn_theme.setIcon(icon_theme_toggle(self.theme))
         if hasattr(self, "btn_bm_edit") and self.btn_bm_edit:
-            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))  # ????????(?????)
+            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))
         if hasattr(self, "btn_session") and self.btn_session:
-            self.btn_session.setIcon(icon_session(self.theme))        # ????? ?????????
+            self.btn_session.setIcon(icon_session(self.theme))
         if hasattr(self, "btn_about") and self.btn_about:
             self.btn_about.setIcon(icon_info(self.theme))
 
@@ -4651,7 +4557,7 @@ class MultiExplorer(QMainWindow):
             try:
                 p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
                 p.btn_cmd.setIcon(icon_cmd(self.theme))
-                # PathBar????? ?????? ???
+
                 if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
                     p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
             except Exception:
@@ -4667,15 +4573,9 @@ class MultiExplorer(QMainWindow):
         s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
 
     def build_panes(self, n:int, start_paths):
-        """
-        - ???(???) ????????????????? last_paths_{count} ??????
-        - 4??, 6?? ???????????? ?? ??? ???????5~n)??
-          ?????????????? same-count(6 ??? 8) ????????????????
-        - ???????? ??GridLayout??? ???????? ?????????????/???
-        """
         was_max = self.isMaximized()
 
-        # 1) ??? ??????????? ????(?? 4????? ????????last_paths_4 ??????
+
         try:
             prev_count = len(getattr(self, "panes", []))
         except Exception:
@@ -4689,9 +4589,9 @@ class MultiExplorer(QMainWindow):
             except Exception:
                 pass
 
-        # 2) ????????????? ???????? ???
-        #    - start_paths(?????? ??? ??? ??? ?????????? ???
-        #    - ????? ???????last_paths_{n}??? ??? (??? 5~n ?????
+
+
+
         final_paths = list(start_paths or [])[:n]
         if len(final_paths) < n:
             s = QSettings(ORG_NAME, APP_NAME)
@@ -4705,7 +4605,7 @@ class MultiExplorer(QMainWindow):
                     cand = QDir.homePath()
                 final_paths.append(str(cand))
 
-        # 3) ??? ???????? ??? ???
+
         old_panes = list(getattr(self, "panes", []))
         for p in old_panes:
             try:
@@ -4731,7 +4631,7 @@ class MultiExplorer(QMainWindow):
             except Exception:
                 pass
 
-        # 4) ??????????
+
         cols = {4: 2, 6: 3, 8: 4}.get(n, 3)
         gap = GRID_GAPS.get(cols, 3)
         margin_lr = GRID_MARG_LR.get(cols, 6)
@@ -4742,7 +4642,7 @@ class MultiExplorer(QMainWindow):
         if vmain:
             vmain.addLayout(self.grid, 1)
 
-        # ?????? ???
+
         for c in range(cols):
             self.grid.setColumnStretch(c, 1)
             self.grid.setColumnMinimumWidth(c, 0)
@@ -4751,7 +4651,7 @@ class MultiExplorer(QMainWindow):
             self.grid.setRowStretch(r, 1)
             self.grid.setRowMinimumHeight(r, 0)
 
-        # 5) ????? ???/??? (final_paths??????????)
+
         self.panes = []
         self.setUpdatesEnabled(False)
         for i in range(n):
@@ -4763,11 +4663,11 @@ class MultiExplorer(QMainWindow):
             self.grid.addWidget(pane, rr, cc)
         self.setUpdatesEnabled(True)
 
-        # 6) ?????/??????????? ?????
+
         self.setWindowTitle(f"Multi-Pane File Explorer ??{n} panes")
         self._update_theme_dependent_icons()
 
-        # ?????????????: ???????????? ????????????????
+
         if was_max:
             QTimer.singleShot(0, self._unmax_then_remax)
         else:
@@ -4776,48 +4676,44 @@ class MultiExplorer(QMainWindow):
 
     def _unmax_then_remax(self):
         try:
-            # ?????????? ???????? ???
+
             if not self.isMaximized():
                 self._kick_layout()
                 return
 
-            # 1) ???????? (????? ??????? ???????? showNormal ???)
+
             self.showNormal()
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
-            # 2) ?????? ?????
+
             self._kick_layout()
 
-            # 3) ??? ?????
+
             self.showMaximized()
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
-            # 4) ???????????????????? ??
+
             self._kick_layout()
         except Exception:
             pass
 
     def _kick_layout(self):
-        """
-        ???????????????? '?????? ??? ???'???????? ?????/?????
-        ??? ??????? ????? (??? ????? ???????? ???)
-        """
         try:
             cw = self.centralWidget()
             lay = cw.layout() if cw else None
 
-            keep_geom = not self.isMaximized()   # ?????? ?????? ??? ???????? ???
+            keep_geom = not self.isMaximized()
             if keep_geom:
                 g = self.geometry()
-                # ??? ???????? ???(?????? ????? ??????????)
+
                 old_min = self.minimumSize()
                 old_max = self.maximumSize()
                 self.setMinimumSize(g.size())
                 self.setMaximumSize(g.size())
 
-            # ???? ?????? ??? ??? (????? ???????) ??????????????????????????????????
+
             if lay:
                 lay.invalidate()
                 lay.activate()
@@ -4826,7 +4722,7 @@ class MultiExplorer(QMainWindow):
                 self.grid.invalidate()
                 self.grid.update()
 
-            # ??Pane ??? ??? ??? (??? ????????: ???????? ??? ???)
+
             for p in getattr(self, "panes", []):
                 try:
                     p.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4835,13 +4731,13 @@ class MultiExplorer(QMainWindow):
                         p.view.updateGeometries()
                         p.view.doItemsLayout()
                         p.view.viewport().update()
-                    # ?????? ??? ???(??????? ???) ???
+
                     if hasattr(p, "path_bar") and hasattr(p.path_bar, "_pin_to_right"):
                         p.path_bar._pin_to_right()
                 except Exception:
                     pass
 
-            # ?????? ??? ???(???????? ???)
+
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
@@ -4854,18 +4750,18 @@ class MultiExplorer(QMainWindow):
         except Exception:
             pass
         finally:
-            # ???? ??? ??? & ???????? ??? ??????????????????????????????????????????????????????????
+
             try:
                 if keep_geom:
-                    # ??? min/max ???
+
                     try:
                         self.setMinimumSize(old_min)
                         self.setMaximumSize(old_max)
                     except Exception:
-                        # ??? ????? ????????
+
                         self.setMinimumSize(QtCore.QSize(0, 0))
                         self.setMaximumSize(QtCore.QSize(16777215, 16777215))
-                    # ?????? ?????????? ?????????????????
+
                     if self.geometry() != g:
                         self.setGeometry(g)
             except Exception:
@@ -4873,15 +4769,12 @@ class MultiExplorer(QMainWindow):
 
 
     def _safe_restore_geometry(self, ba: QtCore.QByteArray):
-        """
-        ????? ????????????????, ??? ?????? ??? ???????????? ?????????????
-        """
         try:
             ok = self.restoreGeometry(ba)
             if not ok:
                 return
 
-            # ??? ???????? ???????
+
             win = self.windowHandle()
             screen = (win.screen().availableGeometry() if win and win.screen()
                       else QApplication.primaryScreen().availableGeometry())
@@ -4893,7 +4786,7 @@ class MultiExplorer(QMainWindow):
             new_x = min(max(sg.left(), g.x()), sg.right() - new_w)
             new_y = min(max(sg.top(),  g.y()), sg.bottom() - new_h)
 
-            # ?????/????? ??????????? ???
+
             if (new_w != g.width()) or (new_h != g.height()) or (new_x != g.x()) or (new_y != g.y()):
                 self.setGeometry(new_x, new_y, new_w, new_h)
         except Exception:
@@ -4908,7 +4801,7 @@ class MultiExplorer(QMainWindow):
         try: self.statusBar().showMessage(text,2000)
         except Exception: pass
 
-    # Bookmarks
+
     def _find_bookmark_index_by_path(self, path:str):
         np=os.path.normcase(nice_path(path))
         for i,it in enumerate(self.named_bookmarks):
@@ -4991,7 +4884,7 @@ class MultiExplorer(QMainWindow):
             settings.setValue(f"layout/pane_{i}_path", p)
         settings.sync(); super().closeEvent(e)
 
-    # ---- Sessions (save/load all pane paths) ---------------------------------
+
     def _get_sessions(self) -> list:
         s = QSettings(ORG_NAME, APP_NAME)
         val = s.value("sessions/items", [])
@@ -5021,7 +4914,7 @@ class MultiExplorer(QMainWindow):
         paths = self._current_paths()
         panes = len(self.panes)
         items = self._get_sessions()
-        # ??? ????? ????????????? ???
+
         lowered = name.lower()
         replaced = False
         for i, it in enumerate(items):
@@ -5053,7 +4946,7 @@ class MultiExplorer(QMainWindow):
         if panes <= 0 or not paths:
             QMessageBox.warning(self, "Load Session", "??? ?????? ??? ??????."); return
 
-        # ??? ??????????????????
+
         if panes != len(self.panes):
             self.build_panes(panes, paths)
         else:
@@ -5069,7 +4962,7 @@ class MultiExplorer(QMainWindow):
     def _open_session_manager(self):
         dlg = SessionManagerDialog(self, self._get_sessions())
         if dlg.exec_() == QDialog.Accepted:
-            pass  # ??? ???????
+            pass
 
 class SessionManagerDialog(QDialog):
     def __init__(self, parent: MultiExplorer, sessions: list):
@@ -5163,7 +5056,7 @@ class SessionManagerDialog(QDialog):
         if not ok or not name.strip():
             return
         name = name.strip()
-        # ??? ?????? ?????? ???
+
         exists = any(s.get("name","").lower() == name.lower() for s in self.parent()._get_sessions())
         if exists:
             btn = QMessageBox.question(self, "Save Session",
@@ -5178,7 +5071,7 @@ class SessionManagerDialog(QDialog):
             QMessageBox.critical(self, "Save Session", str(e))
 
 
-# -------------------- Bookmark Editor --------------------
+
 class BookmarkEditDialog(QDialog):
     def __init__(self, parent=None, items=None):
         super().__init__(parent)
@@ -5247,7 +5140,7 @@ class BookmarkEditDialog(QDialog):
             path_edit.setText(str(it.get("path", "")))
         self.table.resizeColumnsToContents()
 
-# -------------------- Boot --------------------
+
 def _load_start_paths(desired_panes:int, cli_paths):
     s=QSettings(ORG_NAME, APP_NAME); saved_n=s.value("layout/pane_count", type=int); paths=[]
     if not cli_paths and saved_n:
