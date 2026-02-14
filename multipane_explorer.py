@@ -1921,6 +1921,7 @@ class PathBar(QWidget):
             vp = self._scroll.viewport()
             vp.setObjectName("crumbViewport")
             vp.setAttribute(Qt.WA_StyledBackground, True)
+            vp.installEventFilter(self)
         except Exception:
             pass
 
@@ -1977,6 +1978,21 @@ class PathBar(QWidget):
     def minimumSizeHint(self): return QSize(100, UI_H)
     def eventFilter(self, obj, ev):
         if obj is self._host and ev.type()==QEvent.MouseButtonDblClick: self.start_edit(); return True
+        if obj is self._scroll.viewport() and ev.type()==QEvent.MouseButtonDblClick:
+            try:
+                if self._edit.isVisible():
+                    return True
+                vp = self._scroll.viewport()
+                if vp is None:
+                    return False
+                content_w = max(self._host.sizeHint().width(), self._host.width())
+                pos = ev.pos()
+                # Enter edit mode only when user double-clicks the right-side blank area.
+                if content_w < vp.width() and pos.x() >= content_w:
+                    self.start_edit()
+                    return True
+            except Exception:
+                return False
         if obj is self._edit and ev.type()==QEvent.FocusOut: self.cancel_edit()
         return super().eventFilter(obj, ev)
     def start_edit(self):
