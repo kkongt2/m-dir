@@ -26,7 +26,11 @@ from PyQt5.QtWidgets import (
 )
 
 # -------------------- Perf / Debug --------------------
-DEBUG = True
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name, "")
+    return str(v).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+DEBUG = _env_flag("MULTIPANE_DEBUG")
 def dlog(msg):
     if DEBUG:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -60,6 +64,9 @@ CONTROL_HPAD= 6
 
 CRUMB_MAX_SEG_W = 180
 ALWAYS_GENERIC_ICONS = False
+SEARCH_RESULT_LIMIT = 50000
+FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
+FILEOP_SIZE_SCAN_TIME_MS = 1200
 
 # -------------------- Optional: pywin32 --------------------
 HAS_PYWIN32 = True
@@ -101,6 +108,28 @@ def _normalize_fs_path(p: str) -> str:
 def nice_path(p: str) -> str:
     try: return str(Path(p).resolve())
     except Exception: return _normalize_fs_path(p)
+
+def _path_key(p: str) -> str:
+    try:
+        p = os.path.abspath(_normalize_fs_path(p))
+    except Exception:
+        p = _normalize_fs_path(p)
+    return os.path.normcase(p)
+
+def _paths_same(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except Exception:
+        return _path_key(a) == _path_key(b)
+
+def _is_subpath(child: str, parent: str) -> bool:
+    child_key = _path_key(child)
+    parent_key = _path_key(parent)
+    try:
+        return os.path.commonpath([child_key, parent_key]) == parent_key
+    except Exception:
+        # Different drives on Windows raise ValueError here; not a subpath.
+        return False
 
 def human_size(n: int) -> str:
     if n is None: return ""
@@ -152,14 +181,14 @@ def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
 
 def icon_bookmark_edit(theme: str):
     """
-    '북마크 편집' 아이콘:
-      - 큼직한 노란 별(⭐)
-      - 우하단에 연필(편집) 오버레이
+    '????????' ?????
+      - ???????? ????
+      - ?????? ???(???) ??????
     """
     def paint(p: QPainter, w, h):
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # ── 별(북마크)
+        # ???? ???????
         cx, cy = w/2 - 2, h/2 - 1
         r_outer = min(w, h) * 0.40
         r_inner = r_outer * 0.44
@@ -176,21 +205,21 @@ def icon_bookmark_edit(theme: str):
         p.setBrush(QBrush(fill))
         p.drawPolygon(star)
 
-        # ── 연필(편집) 오버레이
+        # ???? ???(???) ??????
         p.save()
         body = QColor(100, 180, 255) if theme == "dark" else QColor(40, 120, 220)
         tip  = QColor(240, 200, 80)
 
-        # 우하단에 기울여 배치
+        # ?????? ????????
         p.translate(w * 0.64, h * 0.68)
         p.rotate(-25)
 
-        # 연필 몸통(정수 좌표 OK)
+        # ??? ???(??? ??? OK)
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(body))
         p.drawRect(-5, -2, 12, 4)
 
-        # 연필 촉(삼각형)
+        # ??? ???????
         p.setBrush(QBrush(tip))
         tri = QPolygonF([
             QtCore.QPointF(7, -2),
@@ -199,7 +228,7 @@ def icon_bookmark_edit(theme: str):
         ])
         p.drawPolygon(tri)
 
-        # 지우개 부분 (부동소수 → QRectF 사용)
+        # ????? ????(?????????QRectF ???)
         eraser = QColor(230, 230, 240) if theme == "dark" else QColor(250, 250, 255)
         p.setBrush(QBrush(eraser))
         p.drawRect(QtCore.QRectF(-6.5, -2.2, 2.6, 4.4))
@@ -216,8 +245,8 @@ class FileOpWorker(QtCore.QThread):
     finished_ok = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, op: str, srcs: list, dst_dir: str, conflict_map: dict | None = None):
-        super().__init__()
+    def __init__(self, op: str, srcs: list, dst_dir: str, conflict_map: dict | None = None, parent=None):
+        super().__init__(parent)
         self.op = op  # "copy" or "move"
         self.srcs = list(srcs)
         self.dst_dir = dst_dir
@@ -225,6 +254,10 @@ class FileOpWorker(QtCore.QThread):
         self._cancel = False
         self._total = 0
         self._done = 0
+        self._count_progress = False
+        self._last_progress_pct = -1
+        self._last_progress_emit_ts = 0.0
+        self._src_size_cache = {}
 
     def cancel(self): self._cancel = True
 
@@ -245,11 +278,96 @@ class FileOpWorker(QtCore.QThread):
         return sum(sz for _, sz in self._iter_files(path))
 
     def _calc_total(self):
-        self._total = max(1, sum(self._size_of(s) for s in self.srcs))
+        scanned = 0
+        total = 0
+        self._src_size_cache = {}
+        deadline = time.perf_counter() + (FILEOP_SIZE_SCAN_TIME_MS / 1000.0)
+        for s in self.srcs:
+            if self._cancel:
+                break
+            skey = _path_key(s)
+            if os.path.isdir(s) and not os.path.islink(s):
+                src_total = 0
+                for _fp, sz in self._iter_files(s):
+                    cur = max(0, int(sz or 0))
+                    src_total += cur
+                    total += cur
+                    scanned += 1
+                    if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
+                        self._src_size_cache[skey] = src_total
+                        self._count_progress = True
+                        self._total = max(1, scanned, len(self.srcs))
+                        self._done = 0
+                        return
+                self._src_size_cache[skey] = src_total
+            else:
+                src_total = 0
+                try:
+                    src_total = max(0, int(os.path.getsize(s)))
+                    total += src_total
+                except Exception:
+                    pass
+                self._src_size_cache[skey] = src_total
+                scanned += 1
+                if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
+                    self._count_progress = True
+                    self._total = max(1, scanned, len(self.srcs))
+                    self._done = 0
+                    return
+        self._count_progress = False
+        self._total = max(1, total)
+        self._last_progress_pct = -1
+        self._last_progress_emit_ts = 0.0
+
+    def _emit_progress(self, force: bool = False):
+        total = max(1, int(self._total or 1))
+        pct = min(100, int(self._done * 100 / total))
+        now = time.perf_counter()
+        should_emit = (
+            force
+            or pct >= 100
+            or self._last_progress_pct < 0
+            or pct > self._last_progress_pct
+            and (
+                (pct - self._last_progress_pct) >= 1
+                or (now - self._last_progress_emit_ts) >= 0.05
+            )
+        )
+        if not should_emit:
+            return
+        self._last_progress_pct = pct
+        self._last_progress_emit_ts = now
+        self.progress.emit(pct)
 
     def _tick_progress(self, delta_bytes):
+        if self._count_progress:
+            return
         self._done += max(0, int(delta_bytes))
-        self.progress.emit(min(100, int(self._done * 100 / self._total)))
+        self._emit_progress()
+
+    def _tick_count_unit(self, units: int = 1):
+        if not self._count_progress:
+            return
+        self._done += max(0, int(units))
+        self._emit_progress()
+
+    def _skip_source_progress(self, src):
+        if self._count_progress:
+            return
+        try:
+            delta = self._src_size_cache.get(_path_key(src))
+        except Exception:
+            delta = None
+        if delta is None:
+            delta = self._size_of(src)
+        self._tick_progress(delta)
+
+    def _emit_source_done(self):
+        if self._count_progress:
+            self._done += 1
+            self._emit_progress()
+            return
+        self._emit_progress()
 
     def _copy_file(self, src, dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -260,6 +378,7 @@ class FileOpWorker(QtCore.QThread):
                 if not buf: break
                 fdst.write(buf)
                 self._tick_progress(len(buf))
+        self._tick_count_unit(1)
         try: shutil.copystat(src, dst, follow_symlinks=True)
         except Exception: pass
 
@@ -278,12 +397,37 @@ class FileOpWorker(QtCore.QThread):
     def run(self):
         try:
             self._calc_total()
-            self.status.emit(f"Preparing {self.op} …")
+            if self._count_progress:
+                self.status.emit(f"Preparing {self.op} (quick estimate) ...")
+            else:
+                self.status.emit(f"Preparing {self.op} ...")
 
             for src in self.srcs:
                 if self._cancel: break
-                base = os.path.basename(src)
+                if not os.path.exists(src):
+                    self._emit_source_done()
+                    continue
+
+                base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
                 dst = os.path.join(self.dst_dir, base)
+
+                # Guard: source and destination are the same path.
+                if _paths_same(src, dst):
+                    if self.op == "copy":
+                        dst = unique_dest_path(self.dst_dir, base)
+                    else:
+                        self.status.emit(f"Skipped same path: {base}")
+                        self._skip_source_progress(src)
+                        self._emit_source_done()
+                        continue
+
+                # Guard: copying/moving a folder into its own subtree is invalid.
+                if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+                    self.status.emit(f"Skipped nested destination: {base}")
+                    self._skip_source_progress(src)
+                    self._emit_source_done()
+                    continue
+
                 exists = os.path.exists(dst)
                 action = self.conflict_map.get(src) if exists else None  # None for non-conflict
 
@@ -292,7 +436,7 @@ class FileOpWorker(QtCore.QThread):
                     if os.path.isdir(src) and not os.path.islink(src):
                         if exists:
                             if action == "skip":
-                                self._tick_progress(self._size_of(src)); continue
+                                self._skip_source_progress(src); self._emit_source_done(); continue
                             elif action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
                             elif action == "overwrite":
@@ -303,18 +447,20 @@ class FileOpWorker(QtCore.QThread):
                     else:
                         if exists:
                             if action == "skip":
-                                self._tick_progress(self._size_of(src)); continue
+                                self._skip_source_progress(src); self._emit_source_done(); continue
                             elif action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
-                            # overwrite → 덮어씀
+                            # overwrite ???????
                         self._copy_file(src, dst)
 
                 # ---- MOVE ----
                 else:
+                    keep_both = (action == "copy")
+                    src_progress_size = self._src_size_cache.get(_path_key(src))
                     if exists:
                         if action == "skip":
-                            self._tick_progress(self._size_of(src)); continue
-                        elif action == "copy":  # keep both → move with new name
+                            self._skip_source_progress(src); self._emit_source_done(); continue
+                        elif keep_both:  # keep both ??move with new name
                             dst = unique_dest_path(self.dst_dir, base)
                         elif action == "overwrite":
                             try:
@@ -322,10 +468,12 @@ class FileOpWorker(QtCore.QThread):
                                 else: os.remove(dst)
                             except Exception: pass
                     try:
-                        final = shutil.move(src, dst if exists and action=="copy" else self.dst_dir)
-                        self._tick_progress(self._size_of(final if os.path.exists(final) else src))
+                        final = shutil.move(src, dst if keep_both else self.dst_dir)
+                        if src_progress_size is None:
+                            src_progress_size = self._size_of(final if os.path.exists(final) else src)
+                        self._tick_progress(src_progress_size)
                     except Exception:
-                        # 폴백: copy 후 삭제
+                        # ???: copy ?????
                         if os.path.isdir(src) and not os.path.islink(src):
                             if os.path.exists(dst) and action == "overwrite":
                                 try: shutil.rmtree(dst)
@@ -347,11 +495,13 @@ class FileOpWorker(QtCore.QThread):
                                 try: os.remove(src)
                                 except Exception: pass
 
-                self.progress.emit(min(100, int(self._done * 100 / self._total)))
+                self._emit_source_done()
 
             if self._cancel:
                 self.error.emit("Operation cancelled."); return
-            self.progress.emit(100); self.finished_ok.emit()
+            self._done = max(self._done, self._total)
+            self._emit_progress(force=True)
+            self.finished_ok.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -368,6 +518,7 @@ def _common_css():
     QTreeView::item {{ padding: {ITEM_VPAD}px 6px; }}
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
+    QToolButton#quickBookmarkBtn {{ text-align: left; }}
 
     QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
@@ -408,7 +559,7 @@ def apply_dark_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #2D3550; }
 
-        /* 기본 crumb 버튼 */
+        /* ??? crumb ??? */
         QPushButton#crumb {
             background: rgba(255,255,255,0.05);
             border: 1px solid #2B2E34;
@@ -417,12 +568,12 @@ def apply_dark_style(app: QApplication):
         QPushButton#crumb:hover { background: rgba(255,255,255,0.09); }
         QLabel#crumbSep { color: #7F8796; }
 
-        /* breadcrumb 바(스크롤 영역) 자체 외곽선/배경 제거 */
+        /* breadcrumb ??????????) ??? ???????? ??? */
         QScrollArea#crumbScroll { border: 0px solid transparent; }
         QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
 
-        /* 활성 Pane일 때: crumb 하나하나만 은은한 파랑 배경 */
+        /* ??? Pane???? crumb ????????????????? ??? */
         QWidget#paneRoot[active="true"] QPushButton#crumb {
             background: rgba(94,155,255,0.16);
             border-color: rgba(94,155,255,0.40);
@@ -431,7 +582,7 @@ def apply_dark_style(app: QApplication):
             background: rgba(94,155,255,0.22);
         }
 
-        /* Pane 전체 하이라이트(유지) */
+        /* Pane ??? ???????????) */
         QWidget#paneRoot {
             border: 1px solid transparent;
             border-radius: 10px;
@@ -447,7 +598,7 @@ def apply_dark_style(app: QApplication):
             border-color: rgba(94,155,255,0.25);
         }
 
-        /* 메시지 박스: 흰 배경/검정 글씨 */
+        /* ????? ???: ?????/????????*/
         QMessageBox { background: #FFFFFF; color: #000000; }
         QMessageBox QLabel { color: #000000; }
         QMessageBox QPushButton {
@@ -496,7 +647,7 @@ def apply_light_style(app: QApplication):
         QMenu::item { padding: 6px 12px; }
         QMenu::item:selected { background: #EAEFFF; }
 
-        /* 기본 crumb 버튼 */
+        /* ??? crumb ??? */
         QPushButton#crumb {
             background: rgba(0,0,0,0.04);
             border: 1px solid #E5E8EE;
@@ -505,12 +656,12 @@ def apply_light_style(app: QApplication):
         QPushButton#crumb:hover { background: rgba(0,0,0,0.07); }
         QLabel#crumbSep { color: #7A7F89; }
 
-        /* breadcrumb 바(스크롤 영역) 자체 외곽선/배경 제거 */
+        /* breadcrumb ??????????) ??? ???????? ??? */
         QScrollArea#crumbScroll { border: 0px solid transparent; }
         QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
 
-        /* 활성 Pane일 때: crumb 하나하나만 은은한 파랑 배경 */
+        /* ??? Pane???? crumb ????????????????? ??? */
         QWidget#paneRoot[active="true"] QPushButton#crumb {
             background: rgba(64,128,255,0.12);
             border-color: rgba(64,128,255,0.40);
@@ -519,7 +670,7 @@ def apply_light_style(app: QApplication):
             background: rgba(64,128,255,0.18);
         }
 
-        /* Pane 전체 하이라이트(유지) */
+        /* Pane ??? ???????????) */
         QWidget#paneRoot {
             border: 1px solid transparent;
             border-radius: 10px;
@@ -540,7 +691,7 @@ def apply_light_style(app: QApplication):
 # -------------------- Vector Icons --------------------
 def icon_copy_squares(theme: str):
     def paint(p: QPainter, w, h):
-        # 색상: 흰 채움 + 테마별 스트로크
+        # ???: ????? + ???????????
         stroke = QColor(210, 214, 225) if theme == "dark" else QColor(85, 95, 115)
         fill   = QColor(255, 255, 255)
 
@@ -549,15 +700,15 @@ def icon_copy_squares(theme: str):
         p.setPen(pen)
         p.setBrush(QBrush(fill))
 
-        # 슬래시(/) 방향 배치
-        front_rect = QtCore.QRect(6, 3, 11, 11)  # 위쪽(앞) 사각형
-        back_rect  = QtCore.QRect(3, 6, 11, 11)  # 아래쪽(뒤) 사각형
+        # ?????/) ??? ???
+        front_rect = QtCore.QRect(6, 3, 11, 11)  # ???(?? ?????
+        back_rect  = QtCore.QRect(3, 6, 11, 11)  # ??????? ?????
         radius = 3
 
-        # 1) 위 사각형 (흰 채움 + 윤곽)
+        # 1) ???????(????? + ???)
         p.drawRoundedRect(front_rect, radius, radius)
 
-        # 2) 아래 사각형을 마지막으로 그려 앞 사각형 윤곽을 덮음
+        # 2) ??? ?????? ??????????? ???????????????
         p.drawRoundedRect(back_rect, radius, radius)
 
     return _make_icon(20, 20, paint)
@@ -602,21 +753,21 @@ def icon_theme_toggle(theme: str):
 
 def icon_session(theme: str):
     """
-    '세션' 아이콘:
-      - 겹쳐진 3장의 탭(여러 창/상태를 저장하는 느낌)
-      - 우측하단에 작은 별로 '저장된 세션' 강조
+    '???' ?????
+      - ?????3??? ????? ?????????????????)
+      - ??????????? ??? '????? ???' ???
     """
     def paint(p: QPainter, w, h):
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # 색 설정
+        # ?????
         line = QColor(190, 195, 210) if theme == "dark" else QColor(90, 100, 120)
         fill = QColor(60, 66, 80) if theme == "dark" else QColor(245, 247, 250)
         tab  = QColor(100, 150, 255) if theme == "dark" else QColor(80, 120, 230)
         star_fill  = QColor(255, 210, 60)
         star_edge  = QColor(160, 120, 0)
 
-        # 겹친 탭 3장
+        # ??? ??3??
         p.setPen(QPen(line, 1.3))
         p.setBrush(QBrush(fill))
         p.drawRoundedRect(QtCore.QRectF(3.0, 6.5, 12.5, 9.0), 2.5, 2.5)
@@ -624,7 +775,7 @@ def icon_session(theme: str):
         p.setBrush(QBrush(tab))
         p.drawRoundedRect(QtCore.QRectF(7.0, 3.5, 12.5, 9.0), 2.5, 2.5)
 
-        # 우하단 별(작지만 선명하게)
+        # ??????????????????)
         cx, cy, r = w - 6.0, h - 6.0, 3.2
         pts = []
         for i in range(10):
@@ -795,7 +946,7 @@ def _menu_item_text(hmenu, cmd_id: int) -> str:
     except Exception:
         return ""
 
-def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
+def _context_target_dir(work_dir: str, paths=None) -> str:
     target = work_dir
     if paths:
         try:
@@ -808,6 +959,10 @@ def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
         target = os.path.abspath(target)
     except Exception:
         pass
+    return target
+
+def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
+    target = _context_target_dir(work_dir, paths=paths)
 
     # Escape single quotes for PowerShell single-quoted literals.
     ps_literal = target.replace("'", "''")
@@ -824,9 +979,125 @@ def _launch_powershell_here(owner_hwnd, work_dir: str, paths=None) -> bool:
         if DEBUG: print("[ctx] direct PowerShell launch failed:", e)
         return False
 
+def _is_git_bash_action(verb: str | None, menu_text: str | None) -> bool:
+    v = (verb or "").strip().lower()
+    t = (menu_text or "").strip().lower()
+    if not v and not t:
+        return False
+    if ("git bash" in v) or ("git bash" in t):
+        return True
+    if ("git-bash" in v) or ("git_bash" in v) or ("gitbash" in v):
+        return True
+    if "git_shell" in v:
+        return True
+    return ("git" in v and "bash" in v) or ("git" in t and "bash" in t)
+
+def _first_existing_path(candidates: list[str]) -> str | None:
+    seen = set()
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            pp = os.path.abspath(_normalize_fs_path(str(p)))
+        except Exception:
+            pp = _normalize_fs_path(str(p))
+        key = os.path.normcase(pp)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(pp):
+            return pp
+    return None
+
+def _discover_git_for_windows_tools() -> tuple[str | None, str | None]:
+    git_bash_candidates = []
+    bash_candidates = []
+
+    wb = shutil.which("git-bash.exe")
+    if wb:
+        git_bash_candidates.append(wb)
+
+    wgit = shutil.which("git.exe")
+    if wgit:
+        try:
+            gdir = os.path.dirname(os.path.abspath(wgit))
+            roots = [os.path.dirname(gdir), os.path.dirname(os.path.dirname(gdir))]
+            for root in roots:
+                if not root:
+                    continue
+                git_bash_candidates.append(os.path.join(root, "git-bash.exe"))
+                bash_candidates.append(os.path.join(root, "bin", "bash.exe"))
+                bash_candidates.append(os.path.join(root, "usr", "bin", "bash.exe"))
+        except Exception:
+            pass
+
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        root = os.path.join(base, "Git")
+        git_bash_candidates.append(os.path.join(root, "git-bash.exe"))
+        bash_candidates.append(os.path.join(root, "bin", "bash.exe"))
+        bash_candidates.append(os.path.join(root, "usr", "bin", "bash.exe"))
+
+    lad = os.environ.get("LocalAppData")
+    if lad:
+        for root in (os.path.join(lad, "Programs", "Git"), os.path.join(lad, "Git")):
+            git_bash_candidates.append(os.path.join(root, "git-bash.exe"))
+            bash_candidates.append(os.path.join(root, "bin", "bash.exe"))
+            bash_candidates.append(os.path.join(root, "usr", "bin", "bash.exe"))
+
+    wbash = shutil.which("bash.exe")
+    if wbash:
+        bash_candidates.append(wbash)
+
+    git_bash = _first_existing_path(git_bash_candidates)
+    bash_exe = _first_existing_path(bash_candidates)
+    return git_bash, bash_exe
+
+def _notify_git_bash_not_found():
+    msg = "Git Bash executable was not found. Install Git for Windows or add it to PATH."
+    try:
+        QTimer.singleShot(0, lambda m=msg: QMessageBox.warning(None, "Git Bash", m))
+    except Exception:
+        pass
+
+def _launch_git_bash_here(owner_hwnd, work_dir: str, paths=None) -> bool:
+    target = _context_target_dir(work_dir, paths=paths)
+    git_bash, bash_exe = _discover_git_for_windows_tools()
+
+    if git_bash:
+        args = f'--cd="{target}"'
+        try:
+            win32api.ShellExecute(int(owner_hwnd) if owner_hwnd else 0,
+                                  "open",
+                                  git_bash,
+                                  args,
+                                  target,
+                                  win32con.SW_SHOWNORMAL)
+            return True
+        except Exception as e:
+            if DEBUG: print("[ctx] direct Git Bash launch failed:", e)
+        try:
+            subprocess.Popen([git_bash], cwd=target)
+            return True
+        except Exception as e:
+            if DEBUG: print("[ctx] Git Bash fallback launch failed:", e)
+
+    if bash_exe:
+        try:
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            subprocess.Popen([bash_exe, "--login", "-i"], cwd=target, creationflags=flags)
+            return True
+        except Exception as e:
+            if DEBUG: print("[ctx] bash.exe launch failed:", e)
+
+    _notify_git_bash_not_found()
+    return False
+
 def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_first=1, id_last=None):
     """
-    True  = 명령 실행/취소(폴백 불필요), False = 실패/팝업헤더 선택(폴백 메뉴 제공)
+    True  = ??? ???/???(??? ?????, False = ???/?????? ???(??? ??? ???)
     """
     shown=False
     try:
@@ -842,7 +1113,7 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
     if not cmd_id:  # user cancelled
         return True
 
-    # 서브메뉴 헤더 클릭 → 폴백 메뉴로 처리
+    # ?????? ??? ??? ????? ????????
     try:
         state = win32gui.GetMenuState(hmenu, cmd_id, win32con.MF_BYCOMMAND)
         if state & win32con.MF_POPUP:
@@ -869,14 +1140,21 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
             _post_null(owner_hwnd)
             return True
 
-    # ── 속성(프로퍼티) 처리: 환경별 3단 폴백 ─────────────────────────
+    # Git Bash shell-extension entries can fail via InvokeCommand on some setups.
+    # Launch directly and consume the command to avoid shell-extension freezes.
+    if _is_git_bash_action(verb, menu_text):
+        _launch_git_bash_here(owner_hwnd, work_dir, paths=paths)
+        _post_null(owner_hwnd)
+        return True
+
+    # ???? ???(??????) ???: ?????3????? ??????????????????????????????????????????????????
     if verb and verb.lower() in ("properties","prop","property"):
         try:
             target = paths[0] if (paths and len(paths)>0) else work_dir
             target = _normalize_fs_path(target)
 
             ok = False
-            # 1) pywin32가 제공하는 SHObjectProperties가 있으면 사용
+            # 1) pywin32?? ?????? SHObjectProperties?? ????????
             try:
                 fn = getattr(shell, "SHObjectProperties", None)
                 if callable(fn):
@@ -900,7 +1178,7 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
                 except Exception as e:
                     if DEBUG: print("[ctx] ShellExecuteEx(properties) failed:", e)
 
-            # 3) ctypes로 SHObjectPropertiesW 직접 호출 (확실한 최후 폴백)
+            # 3) ctypes??SHObjectPropertiesW ??? ??? (???????? ???)
             if not ok:
                 try:
                     SHOP_FILEPATH = 0x00000002
@@ -1009,7 +1287,7 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
     finally:
         pythoncom.CoUninitialize()
 
-# --- ShellNew 기반 새 파일 생성 유틸리티 ------------------------------------
+# --- ShellNew ??? ????? ??? ?????? ------------------------------------
 try:
     import winreg
     HAS_WINREG = True
@@ -1018,7 +1296,7 @@ except Exception:
 
 def _shellnew_template_for_ext(ext_with_dot: str) -> tuple[bool, str | None]:
     """
-    반환: (is_nullfile, template_path_or_None)
+    ???: (is_nullfile, template_path_or_None)
     """
     if not HAS_WINREG:
         return (False, None)
@@ -1108,6 +1386,8 @@ def migrate_legacy_favorites_into_named(items: list) -> list:
 # -------------------- Roles & Proxies --------------------
 IS_DIR_ROLE = Qt.UserRole + 99
 SIZE_BYTES_ROLE = Qt.UserRole + 100
+SEARCH_ICON_READY_ROLE = Qt.UserRole + 101
+NAME_FOLD_ROLE = Qt.UserRole + 102
 
 class FsSortProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -1115,26 +1395,56 @@ class FsSortProxy(QSortFilterProxyModel):
         self.setDynamicSortFilter(True)
         self.setSortCaseSensitivity(Qt.CaseInsensitive)
         self.setSortRole(Qt.EditRole)
-        self.setSortLocaleAware(True)
+        self.setSortLocaleAware(False)
+    def _same_model(self, a, b) -> bool:
+        if a is None or b is None:
+            return False
+        if a is b:
+            return True
+        try:
+            return bool(a == b)
+        except Exception:
+            return False
+    def mapToSource(self, proxyIndex):
+        if not proxyIndex.isValid():
+            return QtCore.QModelIndex()
+        try:
+            if not self._same_model(proxyIndex.model(), self):
+                return QtCore.QModelIndex()
+        except Exception:
+            return QtCore.QModelIndex()
+        return super().mapToSource(proxyIndex)
+    def mapFromSource(self, sourceIndex):
+        if not sourceIndex.isValid():
+            return QtCore.QModelIndex()
+        src = self.sourceModel()
+        if src is None:
+            return QtCore.QModelIndex()
+        try:
+            if not self._same_model(sourceIndex.model(), src):
+                return QtCore.QModelIndex()
+        except Exception:
+            return QtCore.QModelIndex()
+        return super().mapFromSource(sourceIndex)
     def filterAcceptsRow(self, source_row, source_parent): return True
     def sort(self, column, order=Qt.AscendingOrder):
-        # 현재 정렬 방향을 기억해 두었다가 lessThan에서 폴더 우선 규칙을 유지합니다.
+        # ??? ??? ???????????????? lessThan??? ??? ??? ?????????????
         self._sort_order = order
         super().sort(column, order)
     def lessThan(self, left, right):
         col = left.column(); src = self.sourceModel()
 
-        # 폴더가 항상 파일보다 먼저 오도록(정렬 방향과 무관)
+        # ????? ??? ?????? ??? ???????? ????????)
         try:
             ldir = bool(src.isDir(left)) if hasattr(src, "isDir") else bool(src.data(left, IS_DIR_ROLE))
             rdir = bool(src.isDir(right)) if hasattr(src, "isDir") else bool(src.data(right, IS_DIR_ROLE))
             if ldir != rdir:
                 order = getattr(self, "_sort_order", Qt.AscendingOrder)
                 if order == Qt.AscendingOrder:
-                    # 오름차순: 폴더 < 파일
+                    # ??????: ??? < ???
                     return ldir and not rdir
                 else:
-                    # 내림차순: 오름차순 기준을 뒤집어도 폴더가 먼저 보이도록 파일 < 폴더로 판단
+                    # ??????: ?????? ??????????? ????? ??? ?????? ??? < ????????
                     return (not ldir) and rdir
         except Exception:
             pass
@@ -1144,6 +1454,15 @@ class FsSortProxy(QSortFilterProxyModel):
                 lv = int(src.data(left, SIZE_BYTES_ROLE) or src.data(left, Qt.EditRole) or 0)
                 rv = int(src.data(right, SIZE_BYTES_ROLE) or src.data(right, Qt.EditRole) or 0)
                 return lv < rv
+            except Exception:
+                pass
+
+        if col == 0:
+            try:
+                lv = src.data(left, NAME_FOLD_ROLE)
+                rv = src.data(right, NAME_FOLD_ROLE)
+                if lv is not None and rv is not None:
+                    return str(lv) < str(rv)
             except Exception:
                 pass
 
@@ -1163,7 +1482,7 @@ class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Type", "Date Modified"]
     def __init__(self, parent=None):
         super().__init__(parent); self._root=""; self._rows=[]
-        # 아이콘 캐시
+        # ????????
         self._icon_cache = {}
         self._icon_file = None
         self._icon_dir  = None
@@ -1206,7 +1525,7 @@ class FastDirModel(QAbstractTableModel):
         if not index.isValid(): return None
         r=self._rows[index.row()]; c=index.column()
 
-        # 아이콘
+        # ?????
         if role == Qt.DecorationRole and c == 0:
             ic = self._icon_cache.get(index.row())
             if ic is not None:
@@ -1224,7 +1543,7 @@ class FastDirModel(QAbstractTableModel):
             if c==0:
                 return r["name"]
             if c==1:
-                # ▶ 폴더의 크기는 표시하지 않음 (정렬용 값은 EditRole/SIZE_BYTES_ROLE에서 0으로 유지)
+                # ?????????????????? ??? (???????? EditRole/SIZE_BYTES_ROLE??? 0??? ???)
                 if r.get("is_dir", False): return ""
                 if r["size"] is None: return ""
                 return human_size(int(r["size"]))
@@ -1237,7 +1556,7 @@ class FastDirModel(QAbstractTableModel):
         elif role==Qt.EditRole:
             if c==0: return r["name"]
             if c==1:
-                # ▶ 폴더는 0, 파일은 실제 바이트 (정렬에 사용)
+                # ???????0, ????? ??? ?????(????????)
                 if r.get("is_dir", False): return 0
                 return 0 if r["size"] is None else int(r["size"])
             if c==3:
@@ -1252,9 +1571,11 @@ class FastDirModel(QAbstractTableModel):
         elif role==IS_DIR_ROLE:
             return r["is_dir"]
         elif role==SIZE_BYTES_ROLE:
-            # ▶ 폴더는 0, 파일은 실제 바이트
+            # ???????0, ????? ??? ?????
             if r.get("is_dir", False): return 0
             return 0 if r["size"] is None else int(r["size"])
+        elif role==NAME_FOLD_ROLE and c==0:
+            return r.get("name_l") or str(r.get("name", "")).lower()
 
         return None
 
@@ -1282,7 +1603,7 @@ class FastStatWorker(QtCore.QThread):
 
 class DirEnumWorker(QtCore.QThread):
     batchReady=QtCore.pyqtSignal(list); finished=QtCore.pyqtSignal(); error=QtCore.pyqtSignal(str)
-    def __init__(self, root:str): super().__init__(); self.root=root; self._cancel=False
+    def __init__(self, root:str, parent=None): super().__init__(parent); self.root=root; self._cancel=False
     def cancel(self): self._cancel=True
     def run(self):
         batch, BATCH=[], 400
@@ -1295,7 +1616,15 @@ class DirEnumWorker(QtCore.QThread):
                     except Exception: is_dir=os.path.isdir(p)
                     ext=os.path.splitext(name)[1]
                     typ="Folder" if is_dir else (ext.lstrip(".").upper()+" file" if ext else "File")
-                    batch.append({"name":name,"path":p,"is_dir":is_dir,"size":None,"mtime":None,"type":typ})
+                    batch.append({
+                        "name": name,
+                        "name_l": name.lower(),
+                        "path": p,
+                        "is_dir": is_dir,
+                        "size": None,
+                        "mtime": None,
+                        "type": typ,
+                    })
                     if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
                 if batch: self.batchReady.emit(batch)
         except Exception as e:
@@ -1326,15 +1655,19 @@ class SearchWorker(QtCore.QThread):
     batchReady = pyqtSignal(str, list)   # (base_path, [ {name,path,is_dir,folder} ... ])
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    truncated = pyqtSignal(int)
 
-    def __init__(self, base_path: str, pattern_str: str, parent=None):
+    def __init__(self, base_path: str, pattern_str: str, parent=None, max_results: int = SEARCH_RESULT_LIMIT):
         super().__init__(parent)
         self.base = base_path
         self._cancel = False
-        # 패턴 분해: 콤마/세미콜론/공백 구분 → 소문자
+        self._max_results = max(1, int(max_results))
+        self._matches = 0
+        self._truncated = False
+        # ??? ???: ???/??????/??? ??? ???????
         raw = (pattern_str or "").replace(",", " ").replace(";", " ").split()
         self._patterns = [p.lower() for p in raw] if raw else ["*"]
-        # 빠른 확장자 체크 함수들 구성 (*.txt 처럼 단순 확장자 패턴은 endswith로 최적화)
+        # ??? ???????? ???????? (*.txt ??? ??? ?????????? endswith???????
         self._tests = []
         for p in self._patterns:
             simple_ext = (p.startswith("*.") and ("*" not in p[2:]) and ("?" not in p) and ("[" not in p) and ("]" not in p))
@@ -1342,7 +1675,7 @@ class SearchWorker(QtCore.QThread):
                 ext = p[1:]  # ".txt"
                 self._tests.append(lambda name, ext=ext: name.endswith(ext))
             else:
-                # fnmatch의 대소문자 민감도 회피를 위해 lower-case 고정
+                # fnmatch?????????????????????? lower-case ???
                 self._tests.append(lambda name, pat=p: fnmatch.fnmatchcase(name, pat))
 
     def cancel(self): self._cancel = True
@@ -1373,6 +1706,11 @@ class SearchWorker(QtCore.QThread):
 
                             name_l = entry.name.lower()
                             if self._match(name_l):
+                                if self._matches >= self._max_results:
+                                    self._truncated = True
+                                    self._cancel = True
+                                    break
+                                self._matches += 1
                                 rel = os.path.relpath(d, base)
                                 if rel == ".":
                                     rel = ""
@@ -1386,7 +1724,7 @@ class SearchWorker(QtCore.QThread):
                                     self.batchReady.emit(base, batch)
                                     batch = []
 
-                            # 하위 디렉토리 탐색 (심볼릭 링크/재분석 지점은 피함)
+                            # ??? ?????? ??? (????????/?????????? ???)
                             if is_dir:
                                 try:
                                     if entry.is_symlink():
@@ -1395,11 +1733,13 @@ class SearchWorker(QtCore.QThread):
                                     pass
                                 stack.append(entry.path)
                 except Exception:
-                    # 접근 거부 등은 무시하고 계속
+                    # ??? ??? ??? ?????? ???
                     continue
 
             if batch:
                 self.batchReady.emit(base, batch)
+            if self._truncated:
+                self.truncated.emit(self._matches)
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -1407,34 +1747,53 @@ class SearchWorker(QtCore.QThread):
 
 class StatOverlayProxy(QIdentityProxyModel):
     def __init__(self, parent=None):
-        super().__init__(parent); self._cache={}; self._pending=set(); self._worker=None
+        super().__init__(parent)
+        self._cache = {}
+        self._pending = set()
+        self._queue = []
+        self._worker = None
+        self._batch_limit = 256
+
     def filePath(self, index):
-        src=self.sourceModel(); s=self.mapToSource(index); return src.filePath(s)
+        src = self.sourceModel()
+        s = self.mapToSource(index)
+        return src.filePath(s)
+
     def isDir(self, index):
-        src=self.sourceModel(); s=self.mapToSource(index)
-        try: return src.isDir(s)
+        src = self.sourceModel()
+        s = self.mapToSource(index)
+        try:
+            return src.isDir(s)
         except Exception:
-            try: return os.path.isdir(src.filePath(s))
-            except Exception: return False
+            try:
+                return os.path.isdir(src.filePath(s))
+            except Exception:
+                return False
+
     def clear_cache(self):
-        self._cache.clear(); self._pending.clear(); self._cancel_worker()
+        self._cache.clear()
+        self._pending.clear()
+        self._queue.clear()
+        self._cancel_worker()
+
     def _cancel_worker(self):
-        w=self._worker
-        if w and w.isRunning(): w.cancel(); w.wait(100)
-        self._worker=None
+        w = self._worker
+        if w and w.isRunning():
+            w.cancel()
+            w.wait(100)
+        self._worker = None
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
 
         col = index.column()
-        # Size(1), Date Modified(3)만 오버레이 처리
         if col not in (1, 3):
             return super().data(index, role)
 
         src = self.sourceModel()
         sidx = self.mapToSource(index)
 
-        # 파일 경로 / 폴더 여부
         try:
             p = src.filePath(sidx)
         except Exception:
@@ -1450,9 +1809,7 @@ class StatOverlayProxy(QIdentityProxyModel):
 
         rec = self._cache.get(p) if p else None  # (size, mtime) or None
 
-        # ---------------- Size Column ----------------
         if col == 1:
-            # 폴더는 항상 0/빈 문자열
             if is_dir:
                 if role == SIZE_BYTES_ROLE:
                     return 0
@@ -1462,7 +1819,6 @@ class StatOverlayProxy(QIdentityProxyModel):
                     return ""
                 return super().data(index, role)
 
-            # 캐시에 있으면 즉시 사용
             if rec is not None:
                 size_val = int(rec[0] or 0)
                 if role == SIZE_BYTES_ROLE:
@@ -1472,109 +1828,83 @@ class StatOverlayProxy(QIdentityProxyModel):
                 if role == Qt.DisplayRole:
                     return human_size(size_val)
 
-            # 캐시가 없으면 즉시 stat으로 계산해서 표시 (초기 진입 직후 F5 없이도 보이게)
-            if p:
-                try:
-                    st = os.stat(p, follow_symlinks=False)
-                    size_val = int(st.st_size)
-                    # 캐시에 적재하여 이후 정렬/표시에 활용
-                    old_mtime = rec[1] if (rec is not None and len(rec) > 1) else None
-                    self._cache[p] = (size_val, old_mtime)
-
-                    if role == SIZE_BYTES_ROLE:
-                        return size_val
-                    if role == Qt.EditRole:
-                        return size_val
-                    if role == Qt.DisplayRole:
-                        return human_size(size_val)
-                except Exception:
-                    pass
-
-            # 마지막으로 원본 모델 값 시도
-            try:
-                if role == SIZE_BYTES_ROLE:
-                    v = src.data(sidx, Qt.EditRole)
-                    return int(v) if isinstance(v, int) else 0
-                if role == Qt.EditRole:
-                    v = src.data(sidx, Qt.EditRole)
-                    return int(v) if isinstance(v, int) else 0
-                if role == Qt.DisplayRole:
-                    v = src.data(sidx, Qt.EditRole)
-                    return human_size(int(v)) if isinstance(v, int) else ""
-            except Exception:
-                return 0 if role in (Qt.EditRole, SIZE_BYTES_ROLE) else ""
-
+            # Avoid synchronous stat() in UI thread.
+            if role in (SIZE_BYTES_ROLE, Qt.EditRole):
+                return 0
+            if role == Qt.DisplayRole:
+                return ""
             return super().data(index, role)
 
-        # ---------------- Date Modified Column ----------------
         if col == 3:
-            # 캐시에 mtime 있으면 사용
             if rec and rec[1] is not None:
+                dt = QDateTime.fromSecsSinceEpoch(int(rec[1]))
                 if role == Qt.DisplayRole:
-                    dt = QDateTime.fromSecsSinceEpoch(int(rec[1]))
                     return dt.toString("yyyy-MM-dd HH:mm:ss")
                 if role == Qt.EditRole:
-                    return QDateTime.fromSecsSinceEpoch(int(rec[1]))
+                    return dt
 
-            # 캐시가 없으면 파일 시스템에서 즉시 조회 (표시 용도)
-            if p:
-                try:
-                    mtime = os.path.getmtime(p)
-                    # 캐시에 병합 저장 (size는 유지)
-                    old_size = rec[0] if rec else None
-                    self._cache[p] = (int(old_size or 0), float(mtime))
-
-                    if role == Qt.DisplayRole:
-                        dt = QDateTime.fromSecsSinceEpoch(int(mtime))
-                        return dt.toString("yyyy-MM-dd HH:mm:ss")
-                    if role == Qt.EditRole:
-                        return QDateTime.fromSecsSinceEpoch(int(mtime))
-                except Exception:
-                    pass
-
-            # 원본 모델 값으로 폴백
-            try:
-                if role == Qt.DisplayRole:
-                    v = src.data(sidx, Qt.DisplayRole)
-                    return v
-                if role == Qt.EditRole:
-                    v = src.data(sidx, Qt.EditRole)
-                    return v if isinstance(v, QDateTime) else QDateTime()
-            except Exception:
-                if role == Qt.DisplayRole:
-                    return ""
-                if role == Qt.EditRole:
-                    return QDateTime()
-
+            # Avoid synchronous getmtime() in UI thread.
+            if role == Qt.DisplayRole:
+                return ""
+            if role == Qt.EditRole:
+                return QDateTime()
             return super().data(index, role)
 
-    def request_paths(self, paths:list[str], batch_limit:int=256):
-        todo=[]
-        for p in paths:
-            if not p: continue
-            if p in self._cache or p in self._pending: continue
-            self._pending.add(p); todo.append(p)
-            if len(todo)>=batch_limit: break
-        if not todo: return
-        self._cancel_worker()
-        w=NormalStatWorker(todo, self)
-        w.statReady.connect(self._apply_stat, Qt.QueuedConnection)
-        w.finishedCycle.connect(lambda: self._on_cycle_finished(todo))
-        self._worker=w; w.start()
-    @QtCore.pyqtSlot(str, object, object)
-    def _apply_stat(self, path:str, size_val, mtime_val):
-        self._cache[path]=(int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
+    def request_paths(self, paths: list[str], batch_limit: int = 256):
         try:
-            src=self.sourceModel(); sidx0=src.index(path)
-            if sidx0.isValid():
-                for col in (1,3):
-                    sidx=sidx0.sibling(sidx0.row(), col)
-                    pidx=self.mapFromSource(sidx)
-                    self.dataChanged.emit(pidx,pidx,[Qt.DisplayRole,Qt.EditRole,SIZE_BYTES_ROLE])
-        except Exception: pass
-    def _on_cycle_finished(self, batch):
-        for p in batch: self._pending.discard(p)
+            self._batch_limit = max(1, int(batch_limit))
+        except Exception:
+            self._batch_limit = 256
 
+        added = False
+        for p in paths:
+            if not p:
+                continue
+            if p in self._cache or p in self._pending:
+                continue
+            self._pending.add(p)
+            self._queue.append(p)
+            added = True
+
+        if added:
+            self._start_next_batch()
+
+    def _start_next_batch(self):
+        if self._worker and self._worker.isRunning():
+            return
+        if not self._queue:
+            self._worker = None
+            return
+
+        batch_size = max(1, int(self._batch_limit))
+        batch = self._queue[:batch_size]
+        del self._queue[:batch_size]
+
+        w = NormalStatWorker(batch, self)
+        w.statReady.connect(self._apply_stat, Qt.QueuedConnection)
+        w.finishedCycle.connect(lambda b=batch: self._on_cycle_finished(b), Qt.QueuedConnection)
+        self._worker = w
+        w.start()
+
+    @QtCore.pyqtSlot(str, object, object)
+    def _apply_stat(self, path: str, size_val, mtime_val):
+        self._cache[path] = (int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
+        try:
+            src = self.sourceModel()
+            sidx0 = src.index(path)
+            if sidx0.isValid():
+                for col in (1, 3):
+                    sidx = sidx0.sibling(sidx0.row(), col)
+                    pidx = self.mapFromSource(sidx)
+                    self.dataChanged.emit(pidx, pidx, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
+        except Exception:
+            pass
+
+    def _on_cycle_finished(self, batch):
+        for p in batch:
+            self._pending.discard(p)
+        self._worker = None
+        self._start_next_batch()
 # -------------------- Breadcrumb --------------------
 class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
@@ -1596,7 +1926,7 @@ class PathBar(QWidget):
         self._hbar = self._scroll.horizontalScrollBar()
         self._scroll.setFixedHeight(UI_H); self.setFixedHeight(UI_H)
 
-        # ── viewport에도 이름/배경 허용 속성을 부여(스타일 대상) ──
+        # ???? viewport??? ???/??? ??? ?????????????????? ????
         try:
             vp = self._scroll.viewport()
             vp.setObjectName("crumbViewport")
@@ -1604,26 +1934,26 @@ class PathBar(QWidget):
         except Exception:
             pass
 
-        # 활성 표시 초기값
+        # ??? ??? ?????
         self._scroll.setProperty("active", False)
 
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
-        # --- Copy Path 버튼 (우측 고정) ---
+        # --- Copy Path ??? (??? ???) ---
         self._btn_copy = QToolButton(self)
         self._btn_copy.setToolTip("Copy current path")
         self._btn_copy.setFixedHeight(UI_H)
-        # 아이콘: 테마 감지
+        # ????? ??? ???
         theme = getattr(getattr(parent, "host", None), "theme", "dark")
         try:
             self._btn_copy.setIcon(icon_copy_squares(theme))
         except Exception:
-            # 폴백: 텍스트
+            # ???: ?????
             self._btn_copy.setText("Copy")
         self._btn_copy.clicked.connect(self._copy_current_path)
 
-        # 레이아웃: [scroll(breadcrumb) | edit(overlap) | copy-button]
+        # ??????: [scroll(breadcrumb) | edit(overlap) | copy-button]
         wrap=QHBoxLayout(self); wrap.setContentsMargins(0,0,0,0); wrap.setSpacing(0)
         wrap.addWidget(self._scroll, 1)
         wrap.addWidget(self._edit, 1)
@@ -1633,7 +1963,7 @@ class PathBar(QWidget):
         self.set_path(self._current_path)
 
     def _copy_current_path(self):
-        # 편집 중이면 입력값 우선, 아니면 현재 경로
+        # ??? ?????????????, ???????? ???
         t = self._edit.text().strip() if self._edit.isVisible() else self._current_path
         if not t:
             t = self._current_path
@@ -1643,12 +1973,12 @@ class PathBar(QWidget):
 
     def set_active(self, active: bool):
         """
-        Path bar를 활성/비활성 시각 상태로 전환한다.
-        (QSS: QScrollArea#crumbScroll[active="true"] 와 그 viewport)
+        Path bar?????/???????? ???????????.
+        (QSS: QScrollArea#crumbScroll[active="true"] ?? ??viewport)
         """
         try:
             self._scroll.setProperty("active", bool(active))
-            # 재적용 (scroll + viewport 모두)
+            # ?????(scroll + viewport ???)
             vp = self._scroll.viewport()
             for w in (self._scroll, vp):
                 w.style().unpolish(w)
@@ -1711,7 +2041,7 @@ class PathBar(QWidget):
             btn.clicked.connect(lambda _,t=target: self.pathSubmitted.emit(t))
             self._hlay.addWidget(btn)
             if i < len(parts)-1:
-                s=QLabel("›", self._host); s.setObjectName("crumbSep"); s.setContentsMargins(0,0,0,0); self._hlay.addWidget(s)
+                s=QLabel(">", self._host); s.setObjectName("crumbSep"); s.setContentsMargins(0,0,0,0); self._hlay.addWidget(s)
         self._hlay.activate()
         m = self._hlay.contentsMargins()
         item_w = 0
@@ -1728,13 +2058,13 @@ class PathBar(QWidget):
         self._host.setFixedSize(max(1, total_w), total_h)
         self._host.updateGeometry()
 
-        # 빌드 직후에도 항상 오른쪽(가장 하위 폴더)이 보이도록 고정
+        # ??? ?????? ??? ???????????? ???)???????? ???
         self._pin_to_right()
         QTimer.singleShot(0, self._pin_to_right)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        # 리사이즈 때도 우측 고정 유지
+        # ?????? ??? ??? ??? ???
         QTimer.singleShot(0, self._pin_to_right)
 
     def _pin_to_right(self):
@@ -1760,9 +2090,9 @@ class PathBar(QWidget):
 # -------------------- SearchResultModel --------------------
 class SearchResultModel(QStandardItemModel):
     """
-    검색 결과 전용 모델.
-    - Size 컬럼은 사람이 읽기 쉬운 단위로 표시
-    - 외부 드래그를 위해 text/uri-list (file://...) 로 QMimeData를 생성
+    ??????? ??? ???.
+    - Size ????? ???????? ??? ????????
+    - ??? ?????? ??? text/uri-list (file://...) ??QMimeData?????
     """
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and index.column() == 1:
@@ -1774,14 +2104,14 @@ class SearchResultModel(QStandardItemModel):
             return ""
         return super().data(index, role)
 
-    # ---- 드래그 지원: 외부 앱으로 file:// URL 전달 ----
+    # ---- ????????? ??? ?????file:// URL ??? ----
     def mimeTypes(self):
-        # 외부 드롭 타겟들이 인식하는 표준 파일 목록 MIME
+        # ??? ??? ????????????? ??? ??? ??? MIME
         return ["text/uri-list"]
 
     def mimeData(self, indexes):
         md = QtCore.QMimeData()
-        # 같은 행이 여러 컬럼으로 중복 들어오는 것을 방지
+        # ??? ??? ??? ?????? ??? ?????? ??? ???
         rows = set()
         for ix in indexes:
             if ix.isValid():
@@ -1793,7 +2123,7 @@ class SearchResultModel(QStandardItemModel):
             it = self.item(r, 0)
             if not it:
                 continue
-            path = it.data(Qt.UserRole)  # ExplorerPane._apply_filter 에서 저장한 실제 경로
+            path = it.data(Qt.UserRole)  # ExplorerPane._apply_filter ??? ????? ??? ???
             if path:
                 urls.append(QUrl.fromLocalFile(path))
 
@@ -1801,34 +2131,34 @@ class SearchResultModel(QStandardItemModel):
         return md
 
     def flags(self, index):
-        # 선택/활성 + 드래그 가능 플래그 부여
+        # ???/??? + ??????????????????
         f = super().flags(index)
         if index.isValid():
             f |= Qt.ItemIsDragEnabled
         return f
 
     def supportedDragActions(self):
-        # 보통 외부 드래그는 '복사' 의미로 전달
+        # ??? ??? ?????? '???' ????????
         return Qt.CopyAction
 
     def startDrag(self, supportedActions):
-        # 외부 앱으로 드래그할 때 항상 파일 URL과 텍스트를 함께 제공
-        from PyQt5.QtGui import QDrag  # 로컬 임포트(추가 전역 임포트 불필요)
+        # ??? ??????????? ????? ??? URL???????? ??? ???
+        from PyQt5.QtGui import QDrag  # ??? ???????? ??? ??????????
         md = QtCore.QMimeData()
 
-        # 현재 선택 경로(브라우즈/검색 모드 모두 대응)
+        # ??? ??? ???(??????/??????? ??? ????
         paths = [p for p in self.pane._selected_paths() if p and os.path.exists(p)]
         if not paths:
             return
 
-        # 호환성: text/uri-list + text/plain
+        # ????? text/uri-list + text/plain
         md.setUrls([QUrl.fromLocalFile(p) for p in paths])
         md.setText("\r\n".join(paths))
 
         drag = QDrag(self)
         drag.setMimeData(md)
 
-        # 기본은 Copy로(일부 앱이 Move 거부하는 문제 방지)
+        # ????? Copy????? ??? Move ?????? ??? ???)
         drag.exec_(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
 
 
@@ -1855,12 +2185,12 @@ class ConflictResolutionDialog(QDialog):
         btn_over = QPushButton("Overwrite All", self)
         btn_skip = QPushButton("Skip All", self)
         btn_copy = QPushButton("Copy All", self)
+        top.addStretch(1)
         top.addWidget(lbl)
         top.addSpacing(8)
         top.addWidget(btn_over)
         top.addWidget(btn_skip)
         top.addWidget(btn_copy)
-        top.addItem(QSpacerItem(10,10, QSizePolicy.Expanding, QSizePolicy.Minimum))
         lay.addLayout(top)
 
         # Table
@@ -1894,7 +2224,7 @@ class ConflictResolutionDialog(QDialog):
         btn_skip.clicked.connect(lambda: self._apply_all("Skip"))
         btn_copy.clicked.connect(lambda: self._apply_all("Copy"))
 
-        # 다크 모드에서 가독성 개선
+        # ??? ?????? ????? ???
         theme = getattr(getattr(parent, "host", None), "theme", "dark")
         if theme == "dark":
             pal = self.palette()
@@ -1942,7 +2272,7 @@ class ExplorerView(QTreeView):
         self._drag_start_modifiers = Qt.NoModifier
         self._drag_start_was_selected = False
         self._drag_ready = False
-        # ▶ 단축키가 항상 이 뷰까지 도달하도록 포커스 정책 강화
+        # ???????? ??? ??????? ???????????????? ???
         self.setFocusPolicy(Qt.StrongFocus)
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
@@ -1961,7 +2291,7 @@ class ExplorerView(QTreeView):
                 self.pane._start_bg_op(op, srcs, self.pane.current_path()); e.acceptProposedAction(); return
         super().dropEvent(e)
 
-    # F5 = 하드 리프레시
+    # F5 = ??? ??????
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_F5:
             try:
@@ -1971,7 +2301,7 @@ class ExplorerView(QTreeView):
             return
         super().keyPressEvent(e)
 
-    # 단일 선택 항목을 재클릭해도 선택 해제되지 않게
+    # ??? ??? ???????????????? ?????? ???
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._drag_start_pos = e.pos()
@@ -1981,14 +2311,14 @@ class ExplorerView(QTreeView):
             self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
             self._drag_ready = False
 
-        # ▶ 어떤 버튼이든 클릭 시 먼저 포커스를 이 뷰로 강제 이동
+        # ????? ?????? ??? ????? ?????? ????? ??? ???
         try:
             if not self.hasFocus():
                 self.setFocus(Qt.MouseFocusReason)
         except Exception:
             pass
 
-        # 단일 선택 항목을 재클릭해도 선택 해제되지 않게 (기존 동작 유지)
+        # ??? ??? ???????????????? ?????? ??? (??? ??? ???)
         if e.button() == Qt.LeftButton and e.modifiers() == Qt.NoModifier:
             clicked = self.indexAt(e.pos())
             sm = self.selectionModel()
@@ -2007,14 +2337,25 @@ class ExplorerView(QTreeView):
 
     def mouseMoveEvent(self, e):
         if (e.buttons() & Qt.LeftButton) and self._drag_start_pos is not None:
-            # 일부 Windows 환경에서 드래그-아웃 대신 내부 다중선택이 시작되는 문제를 회피
+            # ??? Windows ?????? ???????? ??????? ?????????????? ????????
             if (e.pos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
                 if not self._drag_ready:
                     ix = self._drag_start_index
                     sm = self.selectionModel()
+                    # Ctrl+click on an already-selected row toggles it off on press.
+                    # If user actually starts dragging, restore that row so drag payload
+                    # matches Explorer behavior (keep full original selection).
+                    if (ix.isValid() and sm
+                        and bool(self._drag_start_modifiers & Qt.ControlModifier)
+                        and self._drag_start_was_selected
+                        and (not sm.isSelected(ix))):
+                        try:
+                            sm.select(ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+                        except Exception:
+                            pass
                     if ix.isValid() and sm and sm.isSelected(ix):
-                        # Shift는 범위 선택 제스처이므로 강제 드래그를 막는다.
-                        # Ctrl은 클릭 시점에 이미 선택된 항목에서 시작한 경우(복사 드래그 의도)만 허용한다.
+                        # Shift????? ??? ????????????? ?????? ?????
+                        # Ctrl?? ??? ???????? ??????????? ????????(??? ????????)????????.
                         has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
                         has_ctrl = bool(self._drag_start_modifiers & Qt.ControlModifier)
                         allow_with_ctrl = (not has_ctrl) or self._drag_start_was_selected
@@ -2062,7 +2403,7 @@ class ExplorerPane(QWidget):
 
         self._apply_layout(row_toolbar, row_path, row_filter, row_status)
 
-        # 저장된 정렬 설정 복원
+        # ????? ??? ??? ???
         self._load_sort_settings()
 
         self.set_path(start_path or QDir.homePath(), push_history=False)
@@ -2071,21 +2412,40 @@ class ExplorerPane(QWidget):
         self._connect_signals()
         self._register_shortcuts()
 
-        # 초기 정렬 적용 (기본값: Name 오름차순)
+        # ??? ??? ??? (????? Name ??????)
         self._apply_saved_sort()
         self._update_pane_status()
 
     def _init_state(self):
         self._search_mode=False; self._search_model=None; self._search_proxy=None
+        self._search_pending_items={}; self._search_stats_done=set(); self._search_stat_worker=None
+        self._search_stat_queue=[]; self._search_stat_pending=set()
         self._back_stack=[]; self._fwd_stack=[]; self._undo_stack=[]
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
         self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
         self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None; self._pending_normal_root=None
+        self._fast_enum_count = 0
+        self._fast_enum_root = ""
+        self._fast_enum_done = False
+        self._deferred_normal_load_path = None
+        self._file_worker=None
+        self._op_progress_dialog=None
         self._dirload_timer={}
-        self._sort_column = 0  # 기본값: Name
+        self._sort_column = 0  # ????? Name
         self._sort_order = Qt.AscendingOrder
         self._header_resize_guard = False
         self._browse_name_min_width = 140
+        self._visible_stats_interval_ms = 60
+        self._visible_stats_timer = None
+        self._selection_update_interval_ms = 120
+        self._selection_update_timer = None
+        self._selection_cache_sig = None
+        self._selection_cache_data = (0, False, 0)
+        self._selection_cache_ts = 0.0
+        self._disk_free_cache_key = None
+        self._disk_free_cache_text = ""
+        self._disk_free_cache_ts = 0.0
+        self._disk_free_ttl_s = 2.0
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -2097,7 +2457,7 @@ class ExplorerPane(QWidget):
         self.btn_up=QToolButton(self); self.btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp)); self.btn_up.setToolTip("Up"); self.btn_up.setFixedHeight(UI_H)
         self.btn_new=QToolButton(self); self.btn_new.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder)); self.btn_new.setToolTip("New Folder"); self.btn_new.setFixedHeight(UI_H)
 
-        # 새 문서(.txt) 버튼
+        # ?????(.txt) ???
         self.btn_new_file=QToolButton(self)
         self.btn_new_file.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
         self.btn_new_file.setToolTip("New Text File (.txt)")
@@ -2107,7 +2467,7 @@ class ExplorerPane(QWidget):
 
         row_toolbar=QHBoxLayout()
         row_toolbar.setContentsMargins(0,0,0,0)
-        # ▶ 우상단 아이콘 사이 간격 축소
+        # ??????????????? ??? ???
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
         row_toolbar.addWidget(self.btn_star)
         row_toolbar.addWidget(self._bm_btn_container,1)
@@ -2118,21 +2478,21 @@ class ExplorerPane(QWidget):
         row_toolbar.addWidget(self.btn_refresh)
         self._row_toolbar=row_toolbar
 
-        # ▶ 우상단 아이콘 좌우 패딩 축소(해당 버튼에만 적용)
+        # ??????????????? ??? ???(??? ?????? ???)
         _tight_css = "QToolButton{padding-left:4px;padding-right:4px;}"
         for b in (self.btn_cmd, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
             b.setStyleSheet(_tight_css)
-            b.setAutoRaise(True)  # 테두리/여백 느낌 최소화
+            b.setAutoRaise(True)  # ???????? ??? ?????
         return row_toolbar
 
     def _build_path_row(self):
-        self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb — Double-click or F4/Ctrl+L to enter path")
+        self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb ??Double-click or F4/Ctrl+L to enter path")
         row_path=QHBoxLayout(); row_path.setContentsMargins(0,0,0,0); row_path.setSpacing(0); row_path.addWidget(self.path_bar,1)
         return row_path
 
     def _build_filter_row(self):
         self.filter_label=QLabel("Filter:", self)
-        self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, …)"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
+        self.filter_edit=QLineEdit(self); self.filter_edit.setPlaceholderText("Filter (*.pdf, *file*.xls*, ??"); self.filter_edit.setClearButtonEnabled(True); self.filter_edit.setFixedHeight(UI_H)
         self.filter_label.setFixedHeight(UI_H); self.filter_label.setAlignment(Qt.AlignVCenter|Qt.AlignLeft)
         self.btn_search=QToolButton(self); self.btn_search.setText("Search"); self.btn_search.setToolTip("Run recursive search"); self.btn_search.setFixedHeight(UI_H)
         row_filter=QHBoxLayout(); row_filter.setContentsMargins(0,0,0,0); row_filter.setSpacing(ROW_SPACING)
@@ -2144,8 +2504,14 @@ class ExplorerPane(QWidget):
         try: self.source_model.setResolveSymlinks(False)
         except Exception: pass
         self.source_model.setFilter(QDir.AllEntries|QDir.NoDotAndDotDot|QDir.Hidden|QDir.System|QDir.Drives|QDir.AllDirs)
+        self._native_icons=QFileIconProvider()
         self._generic_icons=GenericIconProvider(self.style())
-        if ALWAYS_GENERIC_ICONS: self.source_model.setIconProvider(self._generic_icons)
+        self._icon_provider_mode="native"
+        if ALWAYS_GENERIC_ICONS:
+            self.source_model.setIconProvider(self._generic_icons)
+            self._icon_provider_mode="generic"
+        else:
+            self.source_model.setIconProvider(self._native_icons)
 
         self.stat_proxy=StatOverlayProxy(self); self.stat_proxy.setSourceModel(self.source_model)
         self.proxy=FsSortProxy(self); self.proxy.setSourceModel(self.stat_proxy)
@@ -2251,19 +2617,26 @@ class ExplorerPane(QWidget):
         self.btn_cmd.clicked.connect(self._open_cmd_here)
         self.btn_up.clicked.connect(self.go_up)
         self.btn_new.clicked.connect(self.create_folder)
-        self.btn_new_file.clicked.connect(self.create_text_file)  # 새 문서 생성
-        self.btn_refresh.clicked.connect(self.hard_refresh)  # 하드 리프레시
+        self.btn_new_file.clicked.connect(self.create_text_file)  # ????? ???
+        self.btn_refresh.clicked.connect(self.hard_refresh)  # ??? ??????
         self.view.activated.connect(self._on_double_click)
         self.view.viewport().installEventFilter(self)
         self.view.installEventFilter(self)
         self.path_bar.installEventFilter(self)
-        self.filter_edit.installEventFilter(self)  # ← 추가: 필터창에서 ESC 감지
+        self._bm_btn_container.installEventFilter(self)
+        self.filter_edit.installEventFilter(self)  # ?????: ????????ESC ???
         self._sel_model = None
         self._hook_selection_model()
         self.filter_edit.returnPressed.connect(self._apply_filter)
         self.btn_search.clicked.connect(self._apply_filter)
-        self.filter_edit.textChanged.connect(self._on_filter_text_changed)  # ← 추가: x로 지우면 브라우즈로
-        try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._schedule_visible_stats())
+        self.filter_edit.textChanged.connect(self._on_filter_text_changed)  # ?????: x??????? ????????
+        try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._request_visible_stats())
+        except Exception: pass
+        try: self.proxy.rowsInserted.connect(lambda *_: self._request_visible_stats(0))
+        except Exception: pass
+        try: self.proxy.modelReset.connect(lambda: self._request_visible_stats(0))
+        except Exception: pass
+        try: self.proxy.layoutChanged.connect(lambda *_: self._request_visible_stats(0))
         except Exception: pass
 
     def _register_shortcuts(self):
@@ -2271,7 +2644,7 @@ class ExplorerPane(QWidget):
             sc=QShortcut(QKeySequence(seq), self.view)
             sc.setContext(Qt.WidgetWithChildrenShortcut); sc.activated.connect(slot); return sc
         add_sc("Backspace", self.go_back); add_sc("Alt+Left", self.go_back); add_sc("Alt+Right", self.go_forward)
-        add_sc("Alt+Up", self.go_up)  # ← Alt+Up으로 상위 폴더 이동
+        add_sc("Alt+Up", self.go_up)  # ??Alt+Up??? ??? ??? ???
         add_sc("Ctrl+L", self.path_bar.start_edit); add_sc("F4", self.path_bar.start_edit)
         add_sc("F3", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
         add_sc("Ctrl+F", lambda:(self.filter_edit.setFocus(), self.filter_edit.selectAll()))
@@ -2279,12 +2652,12 @@ class ExplorerPane(QWidget):
         add_sc("Delete", self.delete_selection); add_sc("Shift+Delete", lambda: self.delete_selection(permanent=True)); add_sc("F2", self.rename_selection)
         add_sc(Qt.Key_Return, self._open_current); add_sc(Qt.Key_Enter, self._open_current); add_sc("Ctrl+O", self._open_current)
 
-        # 경로 복사 단축키
+        # ??? ??? ?????
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
 
     def _load_sort_settings(self):
-        """저장된 정렬 설정 불러오기"""
+        """Load persisted sort settings."""
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             self._sort_column = s.value(f"pane_{self.pane_id}/sort_column", 0, type=int)
@@ -2295,7 +2668,7 @@ class ExplorerPane(QWidget):
             self._sort_order = Qt.AscendingOrder
     
     def _save_sort_settings(self):
-        """현재 정렬 설정 저장"""
+        """Persist current sort settings."""
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             s.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
@@ -2305,7 +2678,7 @@ class ExplorerPane(QWidget):
             pass
     
     def _apply_saved_sort(self):
-        """저장된 정렬 설정을 현재 뷰에 적용"""
+        """Apply persisted sort settings to the current view."""
         try:
             v = self.view
             if not v.isSortingEnabled():
@@ -2318,18 +2691,18 @@ class ExplorerPane(QWidget):
 
     def set_active_visual(self, active: bool):
         """
-        Pane 전체에 'active' 속성을 주어 QSS 하이라이트가 적용되도록 한다.
-        - 루트 위젯 objectName을 'paneRoot'로 보장
-        - 스타일 재적용(repolish)로 즉시 반영
-        - breadcrumb의 각 crumb(QPushButton#crumb)까지 확실히 repolish
+        Pane ?????'active' ???????? QSS ????????? ???????????.
+        - ??? ??? objectName??'paneRoot'?????
+        - ??????????repolish)????? ???
+        - breadcrumb????crumb(QPushButton#crumb)??? ?????repolish
         """
         try:
-            # paneRoot 보장 + active 속성 토글
+            # paneRoot ??? + active ??? ???
             if self.objectName() != "paneRoot":
                 self.setObjectName("paneRoot")
             self.setProperty("active", bool(active))
 
-            # 루트와 주요 자식 위젯들 repolish
+            # ????? ??? ??? ?????repolish
             targets = [self,
                        getattr(self, "view", None),
                        getattr(self, "filter_edit", None),
@@ -2344,7 +2717,7 @@ class ExplorerPane(QWidget):
                     except Exception:
                         pass
 
-            # breadcrumb의 모든 crumb 버튼도 명시적으로 repolish
+            # breadcrumb????? crumb ?????????????repolish
             host = getattr(getattr(self, "path_bar", None), "_host", None)
             if host:
                 from PyQt5.QtWidgets import QPushButton
@@ -2361,8 +2734,8 @@ class ExplorerPane(QWidget):
 
     def _hook_selection_model(self):
         """
-        뷰의 모델을 교체하면 selectionModel도 새로 생긴다.
-        항상 최신 selectionModel에 selectionChanged를 다시 연결한다.
+        ??? ??????????? selectionModel????? ?????
+        ??? ??? selectionModel??selectionChanged????? ??????.
         """
         try:
             old = getattr(self, "_sel_model", None)
@@ -2381,61 +2754,84 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # 현재 상태를 즉시 반영
-        QTimer.singleShot(0, self._update_pane_status)
+        # ??? ???????? ???
+        self._request_selection_status_update(immediate=True)
 
     def _copy_path_shortcut(self, folder_only: bool = False):
         """
-        Ctrl+Shift+C : 선택한 항목의 전체 경로 복사
-        Alt+Shift+C  : 파일은 폴더 경로만, 폴더는 그대로 복사
+        Ctrl+Shift+C : ????????????? ??? ???
+        Alt+Shift+C  : ????? ??? ????? ?????????????
         """
         sel = self._selected_paths()
         if len(sel) != 1:
             try:
-                self.host.statusBar().showMessage("하나의 파일/폴더를 선택하세요.", 2000)
+                self.host.statusBar().showMessage("????????/?????????????", 2000)
             except Exception:
                 pass
             return
 
         p = sel[0]
         try:
-            # 폴더-only 모드이면, 파일일 때만 dirname 적용 (폴더는 동일)
+            # ???-only ??????, ???????? dirname ??? (????????)
             if folder_only and os.path.isfile(p):
                 p = os.path.dirname(p)
         except Exception:
-            # 경로 판별 실패 시 그대로 둠
+            # ??? ??? ??? ?????????
             pass
 
         try:
             QApplication.clipboard().setText(p)
             if folder_only:
-                self.host.flash_status("폴더 경로가 클립보드에 복사되었습니다.")
+                self.host.flash_status("??? ????? ???????????????????")
             else:
-                self.host.flash_status("전체 경로가 클립보드에 복사되었습니다.")
+                self.host.flash_status("??? ????? ???????????????????")
         except Exception:
             try:
-                self.host.statusBar().showMessage("클립보드 복사에 실패했습니다.", 2000)
+                self.host.statusBar().showMessage("?????? ??????????????.", 2000)
             except Exception:
                 pass
 
+    def _stop_worker_thread(self, w, wait_ms: int = 100, label: str = "") -> bool:
+        if not w:
+            return True
+        try:
+            if w.isRunning():
+                try:
+                    if hasattr(w, "cancel"):
+                        w.cancel()
+                except Exception:
+                    pass
+                if not w.wait(wait_ms):
+                    try:
+                        w.finished.connect(w.deleteLater, QtCore.Qt.UniqueConnection)
+                    except Exception:
+                        try:
+                            w.finished.connect(w.deleteLater)
+                        except Exception:
+                            pass
+                    if DEBUG and label:
+                        dlog(f"[thread] deferred cleanup: {label}")
+                    return False
+            w.deleteLater()
+            return True
+        except Exception:
+            return False
+
     def _cancel_search_worker(self):
-        # 검색/가시 영역 stat 워커 모두 중단
-        try:
-            w = getattr(self, "_search_worker", None)
-            if w and w.isRunning():
-                w.cancel()
-                w.wait(100)
-        except Exception:
-            pass
+        # ??????????? stat ??? ??? ???
+        self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
         self._search_worker = None
+        self._stop_worker_thread(getattr(self, "_search_stat_worker", None), 80, "search-stat")
+        self._search_stat_worker = None
+        self._search_pending_items = {}
+        self._search_stats_done = set()
+        self._search_stat_queue = []
+        self._search_stat_pending = set()
         try:
-            sw = getattr(self, "_search_stat_worker", None)
-            if sw and sw.isRunning():
-                sw.cancel()
-                sw.wait(50)
+            while QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
         except Exception:
             pass
-        self._search_stat_worker = None
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
@@ -2452,11 +2848,13 @@ class ExplorerPane(QWidget):
             item_name = QStandardItem(name)
             item_name.setData(full, Qt.UserRole)
             item_name.setData(isdir, IS_DIR_ROLE)
+            item_name.setData(str(name).lower(), NAME_FOLD_ROLE)
+            item_name.setData(False, SEARCH_ICON_READY_ROLE)
             item_name.setData(full, Qt.ToolTipRole)
-            # 우선 기본 아이콘(빠름)
+            # ??? ??? ????????)
             item_name.setIcon(self._default_icon(isdir))
 
-            # 크기/날짜는 나중에 가시 영역만 채움
+            # ???/??????????????????????
             item_size = QStandardItem()
             item_size.setData(0, Qt.EditRole)
             item_size.setData(0, SIZE_BYTES_ROLE)
@@ -2468,34 +2866,80 @@ class ExplorerPane(QWidget):
 
             root_item.appendRow([item_name, item_size, item_date, item_folder])
 
-            # 경로 → (size_item, date_item) 매핑 저장
-            if full:
-                d = getattr(self, "_search_item_by_path", None)
-                if isinstance(d, dict):
-                    d[full] = (item_size, item_date)
-
-        # 배치가 들어올 때마다 가시 영역의 아이콘/크기 갱신 예약
-        QTimer.singleShot(0, self._fill_search_visible_icons)
+        # ????? ??????????????????????????? ??? ???
+        self._request_visible_stats(0)
 
     @QtCore.pyqtSlot()
     def _on_search_finished(self):
-        QApplication.restoreOverrideCursor()
+        try:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
         self._search_worker = None
-        # 마무리로 한 번 더 가시 영역 갱신
-        QTimer.singleShot(0, self._fill_search_visible_icons)
+        try:
+            if self._search_mode and self._search_proxy and self.view.model() is self._search_proxy:
+                hdr = self.view.header()
+                col = hdr.sortIndicatorSection()
+                order = hdr.sortIndicatorOrder()
+                if not self.view.isSortingEnabled():
+                    self.view.setSortingEnabled(True)
+                self.view.sortByColumn(col, order)
+        except Exception:
+            pass
+        # ?????? ????????????? ???
+        self._request_visible_stats(0)
+
+    def _start_next_search_stat_worker(self, batch_limit: int = 220):
+        cur = getattr(self, "_search_stat_worker", None)
+        if cur and cur.isRunning():
+            return
+        if not self._search_stat_queue:
+            self._search_stat_worker = None
+            return
+
+        size = max(1, int(batch_limit))
+        batch = self._search_stat_queue[:size]
+        del self._search_stat_queue[:size]
+
+        w = NormalStatWorker(batch, self)
+        w.statReady.connect(self._apply_search_stat, Qt.QueuedConnection)
+        w.finishedCycle.connect(lambda b=batch: self._on_search_stat_cycle_finished(b), Qt.QueuedConnection)
+        self._search_stat_worker = w
+        w.start()
+
+    def _enqueue_search_stat_paths(self, paths: list[str], batch_limit: int = 220):
+        added = False
+        for p in paths:
+            if not p:
+                continue
+            if p in self._search_stat_pending:
+                continue
+            self._search_stat_pending.add(p)
+            self._search_stat_queue.append(p)
+            added = True
+        if added:
+            self._start_next_search_stat_worker(batch_limit=batch_limit)
+
+    def _on_search_stat_cycle_finished(self, batch):
+        for p in batch:
+            self._search_stat_pending.discard(p)
+        self._search_stat_worker = None
+        if self._search_mode:
+            self._start_next_search_stat_worker()
 
     def _on_filter_text_changed(self, text: str):
-        # 공백 제거 후 비어 있으면 검색 결과 표시를 중단하고 브라우즈로 복귀
+        # ??? ??? ????? ???????????? ??????????? ???????????
         if not (text or "").strip():
             self._enter_browse_mode()
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_search_stat(self, path: str, size_val, mtime_val):
-        # 가시 영역 stat 워커가 알려준 값을 검색 모델에 반영
-        d = getattr(self, "_search_item_by_path", None)
+        # ??????? stat ????? ????? ??? ????????????
+        d = getattr(self, "_search_pending_items", None)
         if not isinstance(d, dict):
             return
-        pair = d.get(path)
+        pair = d.pop(path, None)
         if not pair:
             return
         item_size, item_date = pair
@@ -2518,9 +2962,9 @@ class ExplorerPane(QWidget):
 
     def create_text_file(self):
         """
-        현재 폴더에 임의(시간기반)의 새 .txt 파일을 생성합니다.
-        생성 후 목록을 새로고침하고, 방금 만든 파일을 선택한 뒤
-        뷰로 포커스를 되돌려 단축키(Del, F2 등)가 곧바로 동작하도록 합니다.
+        ??? ????????(??????)????.txt ?????????????
+        ??? ????????????????, ??? ??? ????????????
+        ??? ?????? ??????????Del, F2 ???? ??????????????????
         """
         base_dir = self.current_path()
         try:
@@ -2530,25 +2974,25 @@ class ExplorerPane(QWidget):
             QMessageBox.critical(self, "Create failed", str(e))
             return
 
-        # 목록 갱신
+        # ??? ???
         self.hard_refresh()
 
-        # 방금 만든 파일을 선택하고 포커스를 뷰로 돌리는 시도
+        # ??? ??? ??????????? ?????? ??? ????????
         def _try_select():
-            # 단축키가 바로 동작하도록 뷰로 포커스 강제
+            # ?????? ??? ??????????? ????????
             try:
                 if self.view and not self.view.hasFocus():
                     self.view.setFocus(Qt.ShortcutFocusReason)
             except Exception:
                 pass
 
-            # 검색 모드에선 선택 스킵 (탐색 모드에서만 선택)
+            # ?????????? ??? ??? (??? ???????????)
             if self._search_mode:
                 return
 
             try:
                 if self._using_fast:
-                    # Fast 모델에서 경로로 행 찾기
+                    # Fast ?????? ??????????
                     rows = self._fast_model.rowCount()
                     for r in range(rows):
                         rp = self._fast_model.row_path(r)
@@ -2561,7 +3005,7 @@ class ExplorerPane(QWidget):
                             self.view.setCurrentIndex(prx_ix)
                             return
                 else:
-                    # Normal 모델 경로 → 인덱스 매핑
+                    # Normal ??? ??? ??????????
                     src_ix = self.source_model.index(new_path)
                     if src_ix.isValid():
                         st_ix = self.stat_proxy.mapFromSource(src_ix)
@@ -2575,7 +3019,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-        # fast→normal 전환 타이밍을 고려해 여러 번 재시도
+        # fast??ormal ??? ??????????????? ???????
         for delay in (0, 80, 200, 450):
             QTimer.singleShot(delay, _try_select)
 
@@ -2592,31 +3036,181 @@ class ExplorerPane(QWidget):
         except Exception: return QIcon()
 
     def _cancel_fast_stat_worker(self):
-        w=self._fast_stat_worker
-        if w and w.isRunning(): w.cancel(); w.wait(100)
+        self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
         self._fast_stat_worker=None
+
+    def _cancel_enum_worker(self, wait_ms: int = 150):
+        self._stop_worker_thread(self._enum_worker, wait_ms, "dir-enum")
+        self._enum_worker = None
+
+    def _cancel_file_worker(self, wait_ms: int = 300):
+        self._stop_worker_thread(getattr(self, "_file_worker", None), wait_ms, "file-op")
+        self._file_worker = None
+        dlg = getattr(self, "_op_progress_dialog", None)
+        if dlg:
+            try:
+                dlg.close()
+                dlg.deleteLater()
+            except Exception:
+                pass
+            self._op_progress_dialog = None
+
+    def shutdown(self, wait_ms: int = 300):
+        try:
+            self._cancel_search_worker()
+        except Exception:
+            pass
+        try:
+            self._cancel_fast_stat_worker()
+        except Exception:
+            pass
+        try:
+            self._cancel_enum_worker(wait_ms)
+        except Exception:
+            pass
+        try:
+            self._cancel_file_worker(wait_ms)
+        except Exception:
+            pass
+
+    def _ensure_visible_stats_timer(self):
+        if self._visible_stats_timer is not None:
+            return
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.setInterval(self._visible_stats_interval_ms)
+        t.timeout.connect(self._schedule_visible_stats)
+        self._visible_stats_timer = t
+
+    def _request_visible_stats(self, delay_ms: int | None = None):
+        self._ensure_visible_stats_timer()
+        t = self._visible_stats_timer
+        delay = self._visible_stats_interval_ms if delay_ms is None else max(0, int(delay_ms))
+        if t.isActive():
+            remaining = t.remainingTime()
+            if remaining >= 0 and remaining <= delay:
+                return
+            t.stop()
+        t.start(delay)
+
+    def _ensure_selection_update_timer(self):
+        if self._selection_update_timer is not None:
+            return
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.setInterval(self._selection_update_interval_ms)
+        t.timeout.connect(self._flush_selection_status_update)
+        self._selection_update_timer = t
+
+    def _request_selection_status_update(self, immediate: bool = False):
+        self._ensure_selection_update_timer()
+        if immediate:
+            if self._selection_update_timer.isActive():
+                self._selection_update_timer.stop()
+            self._flush_selection_status_update()
+            return
+        self._selection_update_timer.start(self._selection_update_interval_ms)
+
+    def _selection_summary(self):
+        sel = self._selected_paths()
+        sig = tuple(sel)
+        now = time.perf_counter()
+        if sig == self._selection_cache_sig and (now - self._selection_cache_ts) <= 0.2:
+            return self._selection_cache_data
+
+        cnt = len(sel)
+        only_files = (cnt > 0)
+        total = 0
+        if only_files:
+            for p in sel:
+                if not os.path.isfile(p):
+                    only_files = False
+                    total = 0
+                    break
+                try:
+                    total += os.path.getsize(p)
+                except Exception:
+                    pass
+
+        data = (cnt, only_files, total)
+        self._selection_cache_sig = sig
+        self._selection_cache_data = data
+        self._selection_cache_ts = now
+        return data
+
+    def _update_free_space_label(self, force: bool = False):
+        path = self.current_path()
+        if self._is_network_path(path):
+            self.lbl_free.setText("")
+            return
+
+        key = self._drive_label(path)
+        now = time.perf_counter()
+        if (not force and self._disk_free_cache_key == key
+            and (now - self._disk_free_cache_ts) <= self._disk_free_ttl_s):
+            self.lbl_free.setText(self._disk_free_cache_text)
+            return
+
+        try:
+            _total, _used, free = shutil.disk_usage(path)
+            text = f"{key} free {human_size(free)}"
+        except Exception:
+            text = ""
+
+        self._disk_free_cache_key = key
+        self._disk_free_cache_text = text
+        self._disk_free_cache_ts = now
+        self.lbl_free.setText(text)
+
+    def _flush_selection_status_update(self):
+        self._render_selection_status(update_statusbar=True, update_label=True, update_free=True)
+
+    def _render_selection_status(self, update_statusbar: bool, update_label: bool, update_free: bool):
+        cnt, only_files, total = self._selection_summary()
+
+        if update_statusbar:
+            msg = f"Pane {self.pane_id} / selected {cnt} item(s)"
+            if cnt and only_files:
+                msg += f" / {human_size(total)}"
+            try:
+                self.host.statusBar().showMessage(msg, 2000)
+            except Exception:
+                pass
+
+        if update_label:
+            text = ""
+            if cnt:
+                if only_files:
+                    text = f"{cnt} selected / {human_size(total)}"
+                else:
+                    text = f"{cnt} selected"
+            self.lbl_sel.setText(text)
+
+        if update_free:
+            self._update_free_space_label(force=False)
 
     def _schedule_visible_stats(self):
         """
-        화면에 보이는 영역에 대해서만 stat(크기/수정시각) 계산을 예약한다.
-        - 검색 모드: 검색 전용 경량 경로만 처리하고 즉시 반환 (프록시 혼동 방지)
-        - fast 모델: fast 프록시가 실제로 뷰에 연결돼 있을 때만 처리
-        - 일반 모델: self.proxy 가 뷰에 연결돼 있을 때만 처리
+        ??????????????????????stat(???/??????) ???????????.
+        - ???????: ??????? ??? ??????????? ??? ??? (???????? ???)
+        - fast ???: fast ?????? ???????? ???????? ??? ???
+        - ??? ???: self.proxy ?? ??? ???????? ??? ???
         """
-        # 검색 모드에서는 검색 전용 경로만 갱신하고, 다른 프록시로의 mapToSource 호출을 피한다.
+        # ??????????????????? ???????????, ??? ????????mapToSource ??????????
         if self._search_mode:
             self._fill_search_visible_icons()
             return
 
-        # 현재 뷰에 연결된 모델을 확인 (프록시 불일치 시 아무 것도 하지 않음)
+        # ??? ??? ????????????? (??????????????? ??? ??? ???)
         current_model = self.view.model()
+        root_ix = self.view.rootIndex()
         vp = self.view.viewport()
 
-        # ---- Fast(임시) 모델 경로 ----
+        # ---- Fast(???) ??? ??? ----
         if self._using_fast:
             if current_model is not self._fast_proxy:
                 return
-            rc = self._fast_proxy.rowCount()
+            rc = self._fast_proxy.rowCount(root_ix)
             if rc <= 0:
                 return
             top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
@@ -2628,15 +3222,17 @@ class ExplorerPane(QWidget):
 
             to_rows = []
             for r in range(proxy_start, proxy_end + 1):
-                prx_ix = self._fast_proxy.index(r, 0)
-                src_ix = self._fast_proxy.mapToSource(prx_ix)  # -> FastDirModel 인덱스
+                prx_ix = self._fast_proxy.index(r, 0, root_ix)
+                src_ix = self._fast_proxy.mapToSource(prx_ix)  # -> FastDirModel ?????
                 row = src_ix.row()
                 if row is None or row < 0:
                     continue
                 if not self._fast_model.has_stat(row):
                     to_rows.append(row)
+                    if len(to_rows) >= 220:
+                        break
 
-                # OS 아이콘 즉시 채우기
+                # OS ???????? ?????
                 if not self._fast_model.has_icon(row):
                     p = self._fast_model.row_path(row)
                     if p:
@@ -2648,15 +3244,21 @@ class ExplorerPane(QWidget):
 
             if not to_rows:
                 return
-            self._cancel_fast_stat_worker()
+            if self._fast_stat_worker and self._fast_stat_worker.isRunning():
+                return
             root = self._fast_model.rootPath()
             w = FastStatWorker(self._fast_model, root, to_rows, self)
             w.statReady.connect(self._fast_model.apply_stat, Qt.QueuedConnection)
+            def _on_fast_cycle_finished():
+                if self._fast_stat_worker is w:
+                    self._fast_stat_worker = None
+                self._request_visible_stats(0)
+            w.finishedCycle.connect(_on_fast_cycle_finished, QtCore.Qt.QueuedConnection)
             self._fast_stat_worker = w
             w.start()
             return
 
-        # ---- 일반(정상) 모델 경로 ----
+        # ---- ???(???) ??? ??? ----
         if current_model is not self.proxy:
             return
 
@@ -2668,16 +3270,23 @@ class ExplorerPane(QWidget):
         top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
         bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
         start = top_ix.row() if top_ix.isValid() else 0
-        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, model.rowCount() - 1)
+        rc = model.rowCount(root_ix)
+        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, rc - 1)
         start = max(0, start - 40)
-        end = min(model.rowCount() - 1, end + 80)
+        end = min(rc - 1, end + 80)
         if end < start:
             end = start
 
         for r in range(start, end + 1):
-            prx_ix = model.index(r, 0)                 # -> FsSortProxy(self.proxy) 인덱스
-            st_ix  = model.mapToSource(prx_ix)         # -> StatOverlayProxy 인덱스
-            src_ix = stat_proxy.mapToSource(st_ix)     # -> QFileSystemModel 인덱스
+            prx_ix = model.index(r, 0, root_ix)        # -> FsSortProxy(self.proxy) ?????
+            if not prx_ix.isValid():
+                continue
+            st_ix  = model.mapToSource(prx_ix)         # -> StatOverlayProxy ?????
+            if not st_ix.isValid():
+                continue
+            src_ix = stat_proxy.mapToSource(st_ix)     # -> QFileSystemModel ?????
+            if not src_ix.isValid():
+                continue
             try:
                 p = src_model.filePath(src_ix)
             except Exception:
@@ -2689,12 +3298,12 @@ class ExplorerPane(QWidget):
             stat_proxy.request_paths(paths)
 
     def _on_header_clicked(self, col:int):
-        """헤더 클릭 시 정렬 변경 및 저장"""
+        """Handle header click: toggle sort column/order and persist settings."""
         v=self.view
         if not v.isSortingEnabled(): 
             v.setSortingEnabled(True)
         
-        # 같은 컬럼 클릭 시 방향 토글, 다른 컬럼은 오름차순
+        # ??? ??? ??? ????? ???, ??? ????? ??????
         if col == self._sort_column:
             new_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
         else:
@@ -2706,11 +3315,11 @@ class ExplorerPane(QWidget):
         v.header().setSortIndicator(col, new_order)
         v.sortByColumn(col, new_order)
         
-        # 설정 저장
+        # ??? ????
         self._save_sort_settings()
 
     def _mark_self_active(self):
-        """이 Pane을 활성 Pane으로 표시."""
+        """??Pane????? Pane??? ???."""
         try:
             if hasattr(self.host, "mark_active_pane"):
                 self.host.mark_active_pane(self)
@@ -2718,7 +3327,7 @@ class ExplorerPane(QWidget):
             pass
 
     def eventFilter(self, obj, ev):
-        # 뷰포트(파일 리스트) 영역: 기존 동작 유지
+        # ???????? ????? ???: ??? ??? ???
         if obj is self.view.viewport():
             if ev.type()==QEvent.MouseButtonPress:
                 if ev.button()==Qt.XButton1: self.go_back(); return True
@@ -2734,17 +3343,22 @@ class ExplorerPane(QWidget):
                         if tip!=self._tooltip_last_text:
                             QToolTip.showText(QCursor.pos(), tip, self.view); self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
             if ev.type() in (QEvent.Resize, QEvent.Show):
-                QTimer.singleShot(0, self._schedule_visible_stats)
+                self._request_visible_stats(0)
                 self._schedule_browse_name_autofit()
             return False
 
-        # 필터 입력창: Esc로 필터 해제 + 브라우즈 모드 복귀
+        if obj is getattr(self, "_bm_btn_container", None):
+            if ev.type() in (QEvent.Resize, QEvent.Show):
+                QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
+            return False
+
+        # ??? ????? Esc????? ??? + ?????? ??? ???
         if obj is self.filter_edit:
             if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Escape:
                 try:
                     self.filter_edit.clear()
                 finally:
-                    # 검색 모드였다면 브라우즈 모드로 복귀
+                    # ???????????? ?????? ????????
                     self._enter_browse_mode()
                 ev.accept()
                 return True
@@ -2760,34 +3374,34 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-        # 1) cmd.exe 경로 결정 (ComSpec 우선)
+        # 1) cmd.exe ??? ??? (ComSpec ???)
         comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
 
-        # 2) 우선: pywin32가 있으면 ShellExecute로 안전 실행
+        # 2) ???: pywin32?? ?????ShellExecute????? ???
         if HAS_PYWIN32:
             try:
-                # /K 로 창 유지 + 해당 폴더로 이동
-                # title 지정은 선택적(디버깅 편의를 위해)
+                # /K ??????? + ??? ????????
+                # title ????? ??????????????????)
                 params = f'/K title Multi-Pane File Explorer & cd /d "{path}"'
                 win32api.ShellExecute(
                     int(self.window().winId()) if self.window() else 0,
                     "open",
                     comspec,
                     params,
-                    path,  # 작업 디렉터리
+                    path,  # ??? ??????
                     win32con.SW_SHOWNORMAL
                 )
                 return
             except Exception:
-                pass  # 아래 단계로 폴백
+                pass  # ??? ????????
 
-        # 3) 표준 subprocess 경로 (새 콘솔/프로세스 그룹으로 확실히 분리)
+        # 3) ??? subprocess ??? (?????/?????? ?????? ????????)
         try:
             flags = 0
             flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-            # 창 표시 정보(일부 환경에서 창이 즉시 사라지는 걸 방지)
+            # ????? ???(??? ?????? ??? ??? ????????????)
             si = None
             try:
                 si = subprocess.STARTUPINFO()
@@ -2796,7 +3410,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 si = None
 
-            # /K 로 유지 + /d 로 드라이브 전환 포함
+            # /K ????? + /d ???????? ??? ???
             subprocess.Popen(
                 [comspec, "/K", f'cd /d "{path}"'],
                 cwd=path,
@@ -2805,11 +3419,11 @@ class ExplorerPane(QWidget):
             )
             return
         except Exception:
-            pass  # 마지막 폴백
+            pass  # ????????
 
-        # 4) 최종 폴백: cmd 내장 명령 'start' 사용 (shell=True 필요)
+        # 4) ??? ???: cmd ??? ??? 'start' ??? (shell=True ???)
         try:
-            # 빈 제목("") 필수, /D로 작업폴더 지정 후 cmd 실행
+            # ?????("") ???, /D???????? ??????cmd ???
             cmdline = f'start "" /D "{path}" "{comspec}" /K cd /d "{path}"'
             subprocess.Popen(cmdline, shell=True)
             return
@@ -2829,9 +3443,28 @@ class ExplorerPane(QWidget):
             if w: w.deleteLater()
         for it in self.host.get_enabled_bookmarks():
             name=it.get("name") or _derive_name_from_path(it.get("path","")); p=it.get("path","")
-            btn=QToolButton(self._bm_btn_container); btn.setText(name); btn.setToolTip(p); btn.setFixedHeight(UI_H)
+            btn=QToolButton(self._bm_btn_container)
+            btn.setObjectName("quickBookmarkBtn")
+            btn.setText(str(name))
+            btn.setProperty("fullText", str(name))
+            btn.setToolTip(p)
+            btn.setFixedHeight(UI_H)
+            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _=False, path=p: self.set_path(path, push_history=True))
             self._bm_btn_layout.addWidget(btn)
+        self._bm_btn_layout.addStretch(1)
+        QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
+
+    def _refresh_quick_bookmark_button_texts(self):
+        try:
+            for btn in self._bm_btn_container.findChildren(QToolButton, "quickBookmarkBtn"):
+                full = str(btn.property("fullText") or btn.text() or "")
+                w = max(24, int(btn.width()) - 12)
+                elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, w)
+                if btn.text() != elided:
+                    btn.setText(elided)
+        except Exception:
+            pass
 
     def _selected_paths(self):
         paths=[]; sel=self.view.selectionModel().selectedRows(0)
@@ -2840,70 +3473,100 @@ class ExplorerPane(QWidget):
             if p: paths.append(p)
         seen=set(); out=[]
         for p in paths:
-            np=os.path.normpath(p)
+            np=os.path.normcase(os.path.normpath(p))
             if np not in seen: seen.add(np); out.append(np)
         return out
 
     def _index_to_full_path(self, index):
-        if not index.isValid(): return None
-        if self._using_fast or self._search_mode:
-            return index.sibling(index.row(),0).data(Qt.UserRole)
-        else:
-            st_ix=self.proxy.mapToSource(index); src_ix=self.stat_proxy.mapToSource(st_ix)
-            return self.source_model.filePath(src_ix)
+        if not index.isValid():
+            return None
+
+        model = None
+        try:
+            model = index.model()
+        except Exception:
+            model = None
+
+        try:
+            # Fast/Search models store absolute path in UserRole.
+            if model in (self._fast_proxy, self._fast_model, self._search_proxy, self._search_model):
+                return index.sibling(index.row(), 0).data(Qt.UserRole)
+
+            # Normal browse chain: proxy -> stat_proxy -> source_model.
+            if model is self.proxy:
+                st_ix = self.proxy.mapToSource(index)
+                if not st_ix.isValid():
+                    return None
+                src_ix = self.stat_proxy.mapToSource(st_ix)
+                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
+
+            if model is self.stat_proxy:
+                src_ix = self.stat_proxy.mapToSource(index)
+                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
+
+            if model is self.source_model:
+                return self.source_model.filePath(index)
+
+            # Unknown model: avoid proxy mapping with mismatched index model.
+            return index.sibling(index.row(), 0).data(Qt.UserRole)
+        except Exception:
+            return None
 
     def _use_fast_model(self, path: str):
         """
-        FastDirModel을 사용해 먼저 빠르게 목록을 보여주고,
-        디렉터리 열거가 끝난 뒤 한 번만 정렬/리페인트/아이콘 채우기를 수행하여
-        대용량(수천 개+) 폴더 진입 속도를 높인다.
-        ※ 아이콘 채우기는 열거 중에는 일시 비활성화하고, 끝난 뒤 복구한다.
+        FastDirModel?????????? ????????????????,
+        ?????? ????? ??? ??????? ???/??????/??????????? ??????
+        ?????(??? ??) ??? ??? ??????????
+        ????????????? ??? ???????? ?????????, ??? ????????.
         """
-        # 진행 중인 워커/캐시 정리
+        # ??? ??? ???/??? ???
         self._cancel_fast_stat_worker()
-        if self._enum_worker and self._enum_worker.isRunning():
-            self._enum_worker.cancel()
-            self._enum_worker.wait(100)
+        self._cancel_enum_worker(wait_ms=100)
         try:
             self.stat_proxy.clear_cache()
         except Exception:
             pass
 
-        # Fast 모델로 전환
+        # Fast ????????
         self._using_fast = True
         self._fast_model.reset_dir(path)
         self.view.setModel(self._fast_proxy)
+        self.view.setRootIndex(QtCore.QModelIndex())
         self._configure_header_fast()
+        self._fast_enum_count = 0
+        self._fast_enum_root = path
+        self._fast_enum_done = False
 
-        # ── 아이콘 채우기 임시 비활성화(열거 중만) ─────────────────────
-        #   Fast 모드에서 가시 영역 통계 계산 시 OS 아이콘을 요청하면
-        #   큰 지연이 발생할 수 있어, 열거가 끝날 때까지 무시합니다.
+        # ???? ????????????? ??????(??? ???) ??????????????????????????????????????????
+        #   Fast ?????? ??????? ??? ??? ??OS ?????? ??????
+        #   ??????? ??????????, ????? ??? ????? ????????
         orig_apply_icon = getattr(self._fast_model, "apply_icon", None)
 
         def _noop_apply_icon(_row, _icon):
-            # 열거 중에는 실제 아이콘을 적용하지 않음
+            # ??? ???????? ?????? ?????? ???
             return None
 
         try:
             self._fast_model.apply_icon = _noop_apply_icon
         except Exception:
-            orig_apply_icon = None  # 복구 불가해도 동작에는 지장 없음
+            orig_apply_icon = None  # ??? ?????? ?????? ???????
 
-        # 열거 중에는 재정렬이 반복되지 않도록 정렬/업데이트를 잠시 끔
+        # ??? ??????????? ?????? ????????/??????????? ??
         was_sorting = self.view.isSortingEnabled()
         if was_sorting:
             self.view.setSortingEnabled(False)
         self.view.setUpdatesEnabled(False)
 
         self._fast_batch_counter = 0
-        self._enum_worker = DirEnumWorker(path)
+        self._enum_worker = DirEnumWorker(path, self)
 
-        # 배치 도착: 모델에 추가 + 과도한 갱신은 스로틀링
+        # ??? ???: ???????? + ?????????? ???????
         def _on_batch(rows):
             self._fast_model.append_rows(rows)
+            self._fast_enum_count += len(rows or [])
             self._fast_batch_counter += 1
             if (self._fast_batch_counter % 6) == 0:
-                QTimer.singleShot(0, self._schedule_visible_stats)
+                self._request_visible_stats(0)
 
         self._enum_worker.batchReady.connect(_on_batch, QtCore.Qt.QueuedConnection)
         self._enum_worker.error.connect(
@@ -2918,76 +3581,100 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-        # 열거 종료: 정렬/업데이트 복구 + 아이콘 채우기 복구 후 즉시 가시영역 아이콘/통계를 채움
+        # ??? ???: ???/?????? ??? + ????????????? ????? ????????????????????
         def _on_finished():
             try:
-                # 화면 업데이트 재개
+                self._fast_enum_done = True
+                # ??? ?????? ???
                 self.view.setUpdatesEnabled(True)
 
                 self._apply_saved_sort()
                 self.view.setSortingEnabled(True)
 
-                # 아이콘 apply 함수 원복 → 이제 가시영역 아이콘을 실제로 채움
+                # ?????apply ??? ??? ????? ????????????? ????????
                 _restore_apply_icon()
 
-                # 가시 영역 통계/아이콘을 즉시 2회 스케줄(첫 패스 후 아이콘 캐시 안정화용)
-                QTimer.singleShot(0, self._schedule_visible_stats)
-                QTimer.singleShot(80, self._schedule_visible_stats)
+                # ??????? ???/?????? ??? 2???????????? ?????????? ??????)
+                self._request_visible_stats(0)
+                self._request_visible_stats(80)
+                try:
+                    cur = self.current_path()
+                    deferred = getattr(self, "_deferred_normal_load_path", None)
+                    if (deferred
+                        and not self._search_mode
+                        and os.path.normcase(deferred) == os.path.normcase(path)
+                        and os.path.normcase(cur) == os.path.normcase(path)):
+                        self._deferred_normal_load_path = None
+                        QTimer.singleShot(0, lambda p=path, c=self._fast_enum_count: self._start_normal_model_loading(p, known_count=c))
+                except Exception:
+                    pass
             finally:
-                # 사용자가 정렬을 꺼두고 썼다면 원 상태 유지
+                # ?????? ???????????????????? ???
                 if not was_sorting:
                     self.view.setSortingEnabled(False)
 
         self._enum_worker.finished.connect(_on_finished)
 
-        # 초기 화면 빈칸 방지를 위해 첫 패스 예약
-        QTimer.singleShot(0, self._schedule_visible_stats)
+        # ??? ??? ??? ???????? ????? ???
+        self._request_visible_stats(0)
 
-        # 백그라운드 열거 시작
+        # ??????????? ???
         self._enum_worker.start()
 
 
-    def _start_normal_model_loading(self, path:str):
+    def _start_normal_model_loading(self, path:str, known_count: int | None = None):
         """
-        큰 폴더 진입 시 UI 스톨을 줄이기 위해:
-          - 항목 수가 매우 많으면(Q&D 카운트) QFileSystemModel 로딩을 생략하고 fast 모델만 유지
-          - 중간 규모 이상이면 아이콘을 제너릭으로 강제하여 셸 아이콘 조회 비용 최소화
+        ????? ??? ??UI ?????????????:
+          - ??? ??? ??? ?????Q&D ????? QFileSystemModel ??????????? fast ????????
+          - ??? ??? ?????? ?????? ?????????????? ?????????? ??? ?????
         """
         self._pending_normal_root = path
         t = QElapsedTimer(); t.start()
         self._dirload_timer[path.lower()] = t
 
-        # ── 폴더 크기 빠른 추정: threshold를 넘으면 즉시 중단
-        count = 0
-        is_huge = False
-        HUGE_THRESHOLD = 3000   # 이 이상이면 normal 모델 전환 생략
-        GENERIC_THRESHOLD = 1200  # 이 이상이면 제너릭 아이콘 강제
-        try:
-            with os.scandir(path) as it:
-                for _ in it:
-                    count += 1
-                    if count >= HUGE_THRESHOLD:
-                        is_huge = True
-                        break
-        except Exception:
-            # 읽기 실패해도 normal 로딩을 시도할 수 있게 둔다
-            pass
+        # ???? ??? ??? ??? ???: threshold?????????? ???
+        HUGE_THRESHOLD = 3000   # ???????? normal ??? ??? ???
+        GENERIC_THRESHOLD = 1200  # ???????? ?????????????
+        if known_count is not None:
+            try:
+                count = max(0, int(known_count))
+            except Exception:
+                count = 0
+            is_huge = count >= HUGE_THRESHOLD
+        else:
+            count = 0
+            is_huge = False
+            try:
+                with os.scandir(path) as it:
+                    for _ in it:
+                        count += 1
+                        if count >= HUGE_THRESHOLD:
+                            is_huge = True
+                            break
+            except Exception:
+                # ??? ?????? normal ??????????????? ???
+                pass
 
         if is_huge:
-            # 매우 큰 폴더: fast 모델만 유지 (normal 전환 생략)
+            # ??? ?????: fast ???????? (normal ??? ???)
             dlog(f"[perf] Skip QFileSystemModel for huge folder (>= {HUGE_THRESHOLD} items): {path}")
             self._pending_normal_root = None
-            QTimer.singleShot(0, self._schedule_visible_stats)
+            self._request_visible_stats(0)
             return
 
-        # 중간 규모 이상: 제너릭 아이콘 강제(셸 아이콘 조회 비용 절감)
+        # ??? ??? ???: ?????????????(?????????? ??? ???)
         try:
-            if ALWAYS_GENERIC_ICONS or count >= GENERIC_THRESHOLD:
+            use_generic = ALWAYS_GENERIC_ICONS or count >= GENERIC_THRESHOLD
+            if use_generic and self._icon_provider_mode != "generic":
                 self.source_model.setIconProvider(self._generic_icons)
+                self._icon_provider_mode = "generic"
+            elif (not use_generic) and self._icon_provider_mode != "native":
+                self.source_model.setIconProvider(self._native_icons)
+                self._icon_provider_mode = "native"
         except Exception:
             pass
 
-        # 일반 모델 비동기 로딩 시작
+        # ??? ??? ???????? ???
         _ = self.source_model.setRootPath(path)
 
     def _unc_share_root(self, path:str)->str:
@@ -3072,15 +3759,15 @@ class ExplorerPane(QWidget):
                     QMessageBox.information(
                         self,
                         "Network Sign-in",
-                        "네트워크 인증 창을 열었습니다.\n인증 후 같은 경로를 다시 열어주세요.",
+                        "?????? ??? ??? ????????\n??? ????? ???????? ????????",
                     )
                     return
             if not os.path.exists(path):
                 QMessageBox.warning(self, "Path not found", path)
                 return
 
-            # 검색 결과 뷰에서 다른 폴더로 이동할 때는 먼저 검색 모드를 정리한다.
-            # (_search_mode가 남아 있으면 normal 모델 전환이 막혀 외부 드래그가 실패할 수 있음)
+            # ??????? ???????? ????????????? ??? ???????????????.
+            # (_search_mode?? ??? ?????normal ??? ???????? ??? ?????? ??????????)
             if self._search_mode:
                 self._enter_browse_mode()
 
@@ -3089,32 +3776,35 @@ class ExplorerPane(QWidget):
                 self._back_stack.append(cur)
                 self._fwd_stack.clear()
 
-            # 경로 표시/즐겨찾기 상태 반영
+            # ??? ???/?????? ??? ???
             self.path_bar.set_path(path)
             self._update_star_button()
 
-            # ── 파일시스템 워처 바인딩(자동 새로고침) ──
+            # ???? ??????????? ???????? ??????) ????
             try:
                 self._bind_fs_watcher(path)
             except Exception:
                 pass
 
-            # 빠른 모델로 즉시 표시 → 백그라운드로 QFileSystemModel 로딩
+            # ??? ???????? ??? ??????????? QFileSystemModel ???
+            self._deferred_normal_load_path = path
             self._use_fast_model(path)
-            QTimer.singleShot(0, lambda: self._start_normal_model_loading(path))
+            if self._fast_enum_done and os.path.normcase(self._fast_enum_root) == os.path.normcase(path):
+                self._deferred_normal_load_path = None
+                QTimer.singleShot(0, lambda p=path, c=self._fast_enum_count: self._start_normal_model_loading(p, known_count=c))
 
-            # 상태바/선택정보 업데이트 예약
+            # ??????????? ?????? ???
             QTimer.singleShot(50, self._update_pane_status)
             self._update_statusbar_selection()
 
     def _bind_fs_watcher(self, folder_path: str):
         """
-        현재 Pane이 보고 있는 폴더에 QFileSystemWatcher를 바인딩한다.
-        - 디렉터리 변경 이벤트를 디바운스(합치기)해서 과도한 새로고침을 방지
-        - 일반 모드(QFileSystemModel)에서는 모델이 스스로 갱신되므로 최소 작업만,
-          빠른 모드(FastDirModel/검색 모드)에서는 가벼운 재로딩을 수행
+        ??? Pane????? ??? ?????QFileSystemWatcher??????????
+        - ?????? ?????????? ??????(???????? ????????????????
+        - ??? ???(QFileSystemModel)?????????????????????????? ?????
+          ??? ???(FastDirModel/???????)?????????? ?????? ???
         """
-        # 워처/디바운스 타이머 지연 생성
+        # ???/?????? ????? ???????
         if not hasattr(self, "_fswatch"):
             self._fswatch = QtCore.QFileSystemWatcher(self)
             self._fswatch.directoryChanged.connect(self._on_fs_changed)
@@ -3123,10 +3813,10 @@ class ExplorerPane(QWidget):
         if not hasattr(self, "_fswatch_debounce"):
             self._fswatch_debounce = QTimer(self)
             self._fswatch_debounce.setSingleShot(True)
-            self._fswatch_debounce.setInterval(600)  # ms: 변경 폭주 대비
+            self._fswatch_debounce.setInterval(600)  # ms: ??????? ????
             self._fswatch_debounce.timeout.connect(self._apply_fs_change)
 
-        # 기존 감시 경로 제거 후 새 경로 등록
+        # ??? ??? ??? ??? ??????? ???
         try:
             dirs = list(self._fswatch.directories())
             if dirs:
@@ -3135,17 +3825,17 @@ class ExplorerPane(QWidget):
             pass
 
         try:
-            # 존재하는 디렉터리만 감시
+            # ?????? ???????????
             if os.path.isdir(folder_path):
                 self._fswatch.addPath(folder_path)
         except Exception:
-            # 감시 실패는 기능상 치명적이지 않음(무시)
+            # ??? ?????????????????? ???(???)
             pass
 
     def _on_fs_changed(self, _path: str):
         """
-        워처 이벤트 수신 시 디바운스 타이머만 갱신한다.
-        (실제 갱신은 _apply_fs_change 에서 일괄 처리)
+        ??? ???????? ???????? ?????????????.
+        (??? ????? _apply_fs_change ??? ??? ???)
         """
         try:
             if self._fswatch_debounce.isActive():
@@ -3156,30 +3846,30 @@ class ExplorerPane(QWidget):
 
     def _apply_fs_change(self):
         """
-        디바운스 후 실제 반영 로직.
-        - 검색 모드: 필터가 있으면 재검색, 없으면 브라우즈 모드로 복귀
-        - 빠른 모드: 현재 경로를 빠르게 재열거
-        - 일반 모드(QFileSystemModel): 모델이 자동 반영 → 가시 영역 통계만 갱신
+        ?????? ????? ??? ???.
+        - ???????: ????? ?????????? ??????????? ????????
+        - ??? ???: ??? ???????????????
+        - ??? ???(QFileSystemModel): ???????? ??? ????????? ????????
         """
         try:
-            # 검색 모드일 때
+            # ???????????
             if getattr(self, "_search_mode", False):
                 pattern = self.filter_edit.text().strip()
                 if pattern:
-                    # 현재 필터 그대로 재검색
+                    # ??? ??? ??????????
                     self._apply_filter()
                 else:
-                    # 필터가 비어 있으면 브라우즈 모드로 복귀
+                    # ????? ??? ??????????? ????????
                     self._enter_browse_mode()
                 return
 
-            # 빠른 모드일 때는 빠르게 재열거
+            # ??? ???????? ??????????
             if getattr(self, "_using_fast", False):
                 self._use_fast_model(self.current_path())
                 return
 
-            # 일반 모드(QFileSystemModel)라면 자동으로 반영되므로 가시영역만 갱신
-            QTimer.singleShot(0, self._schedule_visible_stats)
+            # ??? ???(QFileSystemModel)??? ?????? ???????????????? ???
+            self._request_visible_stats(0)
             self._update_pane_status()
         except Exception:
             pass
@@ -3193,7 +3883,7 @@ class ExplorerPane(QWidget):
             dlog(f"directoryLoaded: '{loaded_path}' in {ms} ms")
             self._dirload_timer.pop(key, None)
 
-        # 큰 폴더로 판단해 normal 전환을 건너뛰었으면 아무 것도 하지 않음
+        # ????????????normal ?????????????? ??? ??? ??? ???
         if self._pending_normal_root is None:
             return
 
@@ -3208,15 +3898,15 @@ class ExplorerPane(QWidget):
                 self._using_fast = False
                 self._pending_normal_root = None
 
-                # ★ 선택모델 재연결
+                # ???????? ?????
                 self._hook_selection_model()
 
                 self._configure_header_browse()
                 if not self.view.isSortingEnabled():
                     self.view.setSortingEnabled(True)
-                # 저장된 정렬 적용
+                # ????? ??? ???
                 self._apply_saved_sort()
-                QTimer.singleShot(0, self._schedule_visible_stats)
+                self._request_visible_stats(0)
             except Exception:
                 pass
 
@@ -3229,16 +3919,14 @@ class ExplorerPane(QWidget):
         dst=self._fwd_stack.pop(); self._back_stack.append(self.current_path()); self.set_path(dst, push_history=False)
     def go_up(self):
         parent=Path(self.current_path()).parent; self.set_path(str(parent), push_history=True)
-    def refresh(self):  # 버튼/단축키 → 하드 리프레시 동일
+    def refresh(self):  # ???/?????????? ?????? ???
         self.hard_refresh()
     def hard_refresh(self):
         if self._search_mode:
             self._apply_filter(); return
         try: self._cancel_fast_stat_worker()
         except Exception: pass
-        try:
-            if self._enum_worker and self._enum_worker.isRunning():
-                self._enum_worker.cancel(); self._enum_worker.wait(100)
+        try: self._cancel_enum_worker(wait_ms=100)
         except Exception: pass
         try: self.stat_proxy.clear_cache()
         except Exception: pass
@@ -3378,38 +4066,121 @@ class ExplorerPane(QWidget):
         if op=="cut": self.host.clear_clipboard()
 
     def _start_bg_op(self, op, srcs, dst_dir):
-        # 1) Build conflicts
-        conflicts=[]
+        cur_worker = getattr(self, "_file_worker", None)
+        if cur_worker and cur_worker.isRunning():
+            self.host.flash_status("Another file operation is already running")
+            return
+
+        valid_srcs = []
+        skipped_same = []
+        blocked_nested = []
+        auto_map = {}
+
         for src in srcs:
-            base=os.path.basename(src); dst=os.path.join(dst_dir, base)
+            if not src or not os.path.exists(src):
+                continue
+
+            base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
+            dst = os.path.join(dst_dir, base)
+
+            if _paths_same(src, dst):
+                if op == "copy":
+                    # Same-folder copy should keep both by default.
+                    auto_map[src] = "copy"
+                    valid_srcs.append(src)
+                else:
+                    # Move to the exact same path is a no-op.
+                    skipped_same.append(src)
+                continue
+
+            if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+                blocked_nested.append(src)
+                continue
+
+            valid_srcs.append(src)
+
+        if blocked_nested:
+            sample = "\n".join(blocked_nested[:5])
+            more = "\n..." if len(blocked_nested) > 5 else ""
+            QMessageBox.warning(
+                self,
+                f"{op.title()} blocked",
+                "Cannot copy/move a folder into its own subfolder:\n\n"
+                f"{sample}{more}",
+            )
+
+        if not valid_srcs:
+            if skipped_same:
+                self.host.flash_status("Nothing to move (same source and destination)")
+            return
+
+        # 1) Build conflicts (excluding auto-resolved same-path copies)
+        conflicts=[]
+        for src in valid_srcs:
+            if src in auto_map:
+                continue
+            base=os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
+            dst=os.path.join(dst_dir, base)
             if os.path.exists(dst): conflicts.append((src,dst))
 
-        conflict_map=None
+        conflict_map=dict(auto_map)
         if conflicts:
             dlg=ConflictResolutionDialog(self, conflicts, dst_dir)
             if dlg.exec_()!=QDialog.Accepted: return
             # src -> "overwrite"|"skip"|"copy"
-            conflict_map=dlg.result_map()
+            conflict_map.update(dlg.result_map())
 
         # 2) Run worker
-        worker=FileOpWorker(op, srcs, dst_dir, conflict_map=conflict_map)
-        dlgp=QProgressDialog(f"{op.title()} in progress…","Cancel",0,100,self)
-        dlgp.setWindowTitle(f"{op.title()} files"); dlgp.setWindowModality(Qt.ApplicationModal)
+        old_dlg = getattr(self, "_op_progress_dialog", None)
+        if old_dlg:
+            try:
+                old_dlg.close()
+                old_dlg.deleteLater()
+            except Exception:
+                pass
+            self._op_progress_dialog = None
+
+        worker=FileOpWorker(op, valid_srcs, dst_dir, conflict_map=conflict_map, parent=self)
+        dlgp=QProgressDialog(f"{op.title()} in progress...", "Cancel", 0, 100, self)
+        dlgp.setWindowTitle(f"{op.title()} files"); dlgp.setWindowModality(Qt.WindowModal)
         dlgp.setAutoClose(True); dlgp.setAutoReset(True)
+        dlgp.setMinimumDuration(0)
 
         worker.progress.connect(dlgp.setValue)
         worker.status.connect(lambda s: self.host.statusBar().showMessage(s,2000))
-        worker.error.connect(lambda msg:(dlgp.close(), QMessageBox.critical(self,f"{op.title()} failed",msg)))
+
+        def _on_error(msg):
+            if msg == "Operation cancelled.":
+                self.host.flash_status(f"{op.title()} cancelled")
+                return
+            QMessageBox.critical(self,f"{op.title()} failed",msg)
 
         def _finish_ok():
             try: dlgp.setValue(100); dlgp.close()
             except Exception: pass
             if not self._using_fast and not self._search_mode: self.stat_proxy.clear_cache()
-            QTimer.singleShot(0, self._schedule_visible_stats); self._update_pane_status()
+            self._request_visible_stats(0); self._update_pane_status()
             self.host.flash_status(f"{op.title()} complete")
 
+        def _cleanup_worker():
+            if getattr(self, "_file_worker", None) is worker:
+                self._file_worker = None
+            try:
+                if getattr(self, "_op_progress_dialog", None) is dlgp:
+                    self._op_progress_dialog = None
+                dlgp.close()
+                dlgp.deleteLater()
+            except Exception:
+                pass
+            worker.deleteLater()
+
+        worker.error.connect(_on_error)
+        worker.finished.connect(_cleanup_worker)
         worker.finished_ok.connect(_finish_ok); dlgp.canceled.connect(worker.cancel)
-        worker.start(); dlgp.exec_()
+        self._file_worker = worker
+        self._op_progress_dialog = dlgp
+        worker.start()
+        dlgp.open()
 
     # ---- Delete / Rename / Undo ----
     def delete_selection(self, permanent:bool=False):
@@ -3472,29 +4243,30 @@ class ExplorerPane(QWidget):
 
     # ---- Search ----
     def _enter_browse_mode(self):
-        # 검색 관련 상태/워커 정리
+        # ???????????/??? ???
         try:
             if hasattr(self, "_cancel_search_worker"):
                 self._cancel_search_worker()
         except Exception:
             pass
-        self._search_item_by_path = {}
+        self._search_pending_items = {}
         self._search_stats_done = set()
         self._search_model = None
         self._search_proxy = None
 
         if not self._search_mode:
-            QTimer.singleShot(0, self._schedule_visible_stats)
+            self._request_visible_stats(0)
             return
 
         self._search_mode = False
 
         if self._using_fast:
             self.view.setModel(self._fast_proxy)
+            self.view.setRootIndex(QtCore.QModelIndex())
         else:
             self.view.setModel(self.proxy)
 
-        # ★ 선택모델 재연결
+        # ???????? ?????
         self._hook_selection_model()
 
         path = self.current_path()
@@ -3508,10 +4280,10 @@ class ExplorerPane(QWidget):
         self._configure_header_browse()
         if not self.view.isSortingEnabled():
             self.view.setSortingEnabled(True)
-        # 저장된 정렬 적용
+        # ????? ??? ???
         self._apply_saved_sort()
 
-        QTimer.singleShot(0, self._schedule_visible_stats)
+        self._request_visible_stats(0)
 
     def _enter_search_mode(self, model:QStandardItemModel):
         self._cancel_fast_stat_worker()
@@ -3519,11 +4291,12 @@ class ExplorerPane(QWidget):
         self._search_mode=True
         self._search_model=model
         self._search_proxy=FsSortProxy(self)
+        self._search_proxy.setDynamicSortFilter(False)
         self._search_proxy.setSourceModel(self._search_model)
         self.view.setModel(self._search_proxy)
         self.view.setRootIndex(QtCore.QModelIndex())
 
-        # ★ 선택모델 재연결
+        # ???????? ?????
         self._hook_selection_model()
 
         header = self.view.header()
@@ -3535,30 +4308,35 @@ class ExplorerPane(QWidget):
     def _apply_filter(self):
         pattern = self.filter_edit.text().strip()
         if not pattern:
-            # 빈 패턴 → 탐색 모드 복귀
+            # ????? ????? ??? ???
             self._enter_browse_mode()
             return
 
-        # 이전 검색 중단
+        # ??? ???????
         self._cancel_search_worker()
 
         base = self.current_path()
 
-        # 검색 결과 모델 준비 (가벼운 데이터만 먼저 채우고, stat은 나중에 화면 가시 영역만)
+        # ??????? ??? ????(????? ?????? ??? ????? stat?? ???????? ?????????
         model = SearchResultModel(self)
         model.setHorizontalHeaderLabels(["Name", "Size", "Date Modified", "Folder"])
         self._enter_search_mode(model)
 
-        # 경로→아이템 매핑/상태 초기화 (가시 영역 stat 채우기용)
-        self._search_item_by_path = {}
+        # ??????? ?????(??????? stat ??????)
+        self._search_pending_items = {}
         self._search_stats_done = set()
         self._search_stat_worker = None
+        self._search_stat_queue = []
+        self._search_stat_pending = set()
 
-        # 워커 시작 (비동기 스트리밍)
-        w = SearchWorker(base, pattern, self)
+        # ??? ??? (???????????)
+        w = SearchWorker(base, pattern, self, max_results=SEARCH_RESULT_LIMIT)
         self._search_worker = w
         w.batchReady.connect(self._on_search_batch, Qt.QueuedConnection)
         w.error.connect(lambda msg: self.host.statusBar().showMessage(f"Search error: {msg}", 4000))
+        w.truncated.connect(lambda n: self.host.statusBar().showMessage(
+            f"Search capped at {n} results. Refine filter to narrow results.", 6000
+        ))
         w.finished.connect(self._on_search_finished, Qt.QueuedConnection)
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -3569,21 +4347,27 @@ class ExplorerPane(QWidget):
         if not self._search_mode or not self._search_proxy or not self._search_model:
             return
 
+        root_ix = self.view.rootIndex()
         vp = self.view.viewport()
         top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
         bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
         start = top_ix.row() if top_ix.isValid() else 0
-        end = bot_ix.row() if bot_ix.isValid() else min(start + 200, self._search_proxy.rowCount() - 1)
+        rc = self._search_proxy.rowCount(root_ix)
+        end = bot_ix.row() if bot_ix.isValid() else min(start + 200, rc - 1)
         start = max(0, start - 40)
-        end = min(self._search_proxy.rowCount() - 1, end + 100)
+        end = min(rc - 1, end + 100)
         if end < start:
             end = start
 
         paths_need_stat = []
 
         for r in range(start, end + 1):
-            prx_ix = self._search_proxy.index(r, 0)
+            prx_ix = self._search_proxy.index(r, 0, root_ix)
+            if not prx_ix.isValid():
+                continue
             src_ix = self._search_proxy.mapToSource(prx_ix)
+            if not src_ix.isValid():
+                continue
             item_name = self._search_model.item(src_ix.row(), 0)
             item_size = self._search_model.item(src_ix.row(), 1)
             item_date = self._search_model.item(src_ix.row(), 2)
@@ -3593,32 +4377,23 @@ class ExplorerPane(QWidget):
             p = item_name.data(Qt.UserRole)
             isdir = bool(item_name.data(IS_DIR_ROLE))
 
-            # 아이콘: 실제 OS 아이콘으로 교체
-            if p:
+            # ????? ??? OS ???????????
+            if p and not bool(item_name.data(SEARCH_ICON_READY_ROLE)):
                 idx = self.source_model.index(p)
                 if idx.isValid():
                     icon = self.source_model.fileIcon(idx)
                     if icon and not icon.isNull():
                         item_name.setIcon(icon)
+                item_name.setData(True, SEARCH_ICON_READY_ROLE)
 
-            # 가시 영역 stat: 폴더 제외, 아직 처리하지 않은 경로만
+            # Visible-area stat: queue only once per path.
             if p and not isdir and p not in getattr(self, "_search_stats_done", set()):
-                # size/date 가 비어 있는 경우에만 요청 (0-byte 파일의 재요청 방지 위해 set으로 관리)
+                self._search_pending_items[p] = (item_size, item_date)
                 paths_need_stat.append(p)
                 self._search_stats_done.add(p)
 
         if paths_need_stat:
-            # 이전 워커가 돌고 있으면 취소
-            try:
-                if self._search_stat_worker and self._search_stat_worker.isRunning():
-                    self._search_stat_worker.cancel()
-                    self._search_stat_worker.wait(50)
-            except Exception:
-                pass
-            w = NormalStatWorker(paths_need_stat, self)
-            w.statReady.connect(self._apply_search_stat, Qt.QueuedConnection)
-            self._search_stat_worker = w
-            w.start()
+            self._enqueue_search_stat_paths(paths_need_stat, batch_limit=220)
 
     def _build_fallback_new_actions(self, menu: QMenu):
         return {
@@ -3653,15 +4428,44 @@ class ExplorerPane(QWidget):
         owner_hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
         paths = self._selected_paths()
 
-        # 먼저 윈도우 탐색기 네이티브 메뉴 시도
+        # ??? ???????????????? ??? ???
         if self._try_native_context_menu(pos, owner_hwnd, paths):
             return
 
-        # 선택 항목이 있는 경우, 배경 전용(New) fallback 메뉴는 띄우지 않음
+        # ??? ???????? ???, ??? ???(New) fallback ?????????? ???
         if paths:
+            global_pt = QCursor.pos()
+            menu = QMenu(self)
+
+            act_open = menu.addAction("Open")
+            act_rename = menu.addAction("Rename")
+            if len(paths) != 1:
+                act_rename.setEnabled(False)
+            act_delete = menu.addAction("Delete")
+            menu.addSeparator()
+            act_copy = menu.addAction("Copy")
+            act_cut = menu.addAction("Cut")
+            act_paste = menu.addAction("Paste")
+
+            payload = self.host.get_clipboard() or self._external_clipboard_payload()
+            act_paste.setEnabled(bool(payload and payload.get("paths")))
+
+            action = menu.exec_(global_pt)
+            if action == act_open:
+                self._open_current()
+            elif action == act_rename:
+                self.rename_selection()
+            elif action == act_delete:
+                self.delete_selection()
+            elif action == act_copy:
+                self.copy_selection()
+            elif action == act_cut:
+                self.cut_selection()
+            elif action == act_paste:
+                self.paste_into_current()
             return
 
-        # ── Fallback: 'New' 항목만 상위 레벨에 바로 표시 ──
+        # ???? Fallback: 'New' ???????? ???????? ??? ????
         dst_dir = self.current_path()
         global_pt = QCursor.pos()
         menu = QMenu(self)
@@ -3680,24 +4484,10 @@ class ExplorerPane(QWidget):
             QMessageBox.critical(self, "Create failed", str(e))
 
 
-    def _on_selection_changed(self,*_): self._update_statusbar_selection(); self._update_pane_status()
+    def _on_selection_changed(self,*_):
+        self._request_selection_status_update()
     def _update_statusbar_selection(self):
-        # 상태바는 가볍게: 디렉터리 재귀 계산 없이, 전부 파일일 때만 합계
-        sel = self._selected_paths()
-        cnt = len(sel)
-        msg = f"Pane {self.pane_id} — selected {cnt} item(s)"
-        if cnt and all(os.path.isfile(p) for p in sel):
-            total = 0
-            for p in sel:
-                try:
-                    total += os.path.getsize(p)
-                except Exception:
-                    pass
-            msg += f" / {human_size(total)}"
-        try:
-            self.host.statusBar().showMessage(msg, 2000)
-        except Exception:
-            pass
+        self._render_selection_status(update_statusbar=True, update_label=False, update_free=False)
 
     def _drive_label(self, path:str)->str:
         if path.startswith("\\\\"):
@@ -3725,35 +4515,11 @@ class ExplorerPane(QWidget):
             return False
 
     def _update_pane_status(self):
-        sel = self._selected_paths()
-        cnt = len(sel)
+        self._render_selection_status(update_statusbar=False, update_label=True, update_free=True)
 
-        # 좌측 상태 텍스트: 선택 개수, 전부 파일일 때는 총 용량
-        text = ""
-        if cnt:
-            only_files = all(os.path.isfile(p) for p in sel)
-            if only_files:
-                total = 0
-                for p in sel:
-                    try:
-                        total += os.path.getsize(p)
-                    except Exception:
-                        pass
-                text = f"{cnt} selected — {human_size(total)}"
-            else:
-                text = f"{cnt} selected"
-        self.lbl_sel.setText(text)
-
-        # 우측 드라이브 여유 공간
-        path = self.current_path()
-        if self._is_network_path(path):
-            self.lbl_free.setText("")
-        else:
-            try:
-                total, used, free = shutil.disk_usage(path)
-                self.lbl_free.setText(f"{self._drive_label(path)} free {human_size(free)}")
-            except Exception:
-                self.lbl_free.setText("")
+    def closeEvent(self, e):
+        self.shutdown(wait_ms=1000)
+        super().closeEvent(e)
 
 
 # -------------------- Main Window --------------------
@@ -3763,22 +4529,22 @@ class MultiExplorer(QMainWindow):
         super().__init__()
         self.theme=initial_theme if initial_theme in ("dark","light") else "dark"
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
-        self.setWindowTitle(f"Multi-Pane File Explorer — {pane_count} panes"); self.resize(1500,900)
+        self.setWindowTitle(f"Multi-Pane File Explorer ??{pane_count} panes"); self.resize(1500,900)
 
         # Top bar
         top=QWidget(self); top_lay=QHBoxLayout(top); top_lay.setContentsMargins(6,2,6,2); top_lay.setSpacing(ROW_SPACING)
-        self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 ↔ 6 ↔ 8)"); self.btn_layout.setFixedHeight(UI_H)
+        self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 ??6 ??8)"); self.btn_layout.setFixedHeight(UI_H)
         self.btn_theme=QToolButton(top); self.btn_theme.setToolTip("Toggle Light/Dark"); self.btn_theme.setFixedHeight(UI_H)
         self.btn_bm_edit=QToolButton(top); self.btn_bm_edit.setToolTip("Edit Bookmarks"); self.btn_bm_edit.setFixedHeight(UI_H)
 
-        # ▶ Session 버튼 추가 (Edit Bookmarks 오른쪽)
+        # ??Session ??? ??? (Edit Bookmarks ?????
         self.btn_session=QToolButton(top)
         self.btn_session.setToolTip("Session (save/load all pane paths)")
         self.btn_session.setFixedHeight(UI_H)
 
         self.btn_about=QToolButton(top); self.btn_about.setToolTip("About"); self.btn_about.setFixedHeight(UI_H)
         top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0)
-        top_lay.addWidget(self.btn_session,0)  # ← 추가된 버튼
+        top_lay.addWidget(self.btn_session,0)  # ??????????
         top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
 
         self.central=QWidget(self); self.setCentralWidget(self.central)
@@ -3791,7 +4557,7 @@ class MultiExplorer(QMainWindow):
         self._update_layout_icon(); self._update_theme_icon()
         self.btn_layout.clicked.connect(self._cycle_layout); self.btn_theme.clicked.connect(self._toggle_theme)
         self.btn_bm_edit.clicked.connect(self._open_bookmark_editor)
-        self.btn_session.clicked.connect(self._open_session_manager)  # ← 세션 매니저 열기
+        self.btn_session.clicked.connect(self._open_session_manager)  # ????? ????? ???
         self.btn_about.clicked.connect(self._show_about)
 
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
@@ -3801,28 +4567,30 @@ class MultiExplorer(QMainWindow):
 
         self.statusBar().showMessage("Ready", 1500)
 
-        self._wd_timer=QTimer(self); self._wd_timer.setInterval(50); self._wd_last=time.perf_counter()
-        def _wd_tick():
-            now=time.perf_counter(); gap=(now-self._wd_last)*1000
-            if gap>200: dlog(f"[STALL] UI event loop blocked ~{gap:.0f} ms")
-            self._wd_last=now
-        self._wd_timer.timeout.connect(_wd_tick); self._wd_timer.start()
+        self._wd_timer = None
+        if DEBUG:
+            self._wd_timer=QTimer(self); self._wd_timer.setInterval(50); self._wd_last=time.perf_counter()
+            def _wd_tick():
+                now=time.perf_counter(); gap=(now-self._wd_last)*1000
+                if gap>200: dlog(f"[STALL] UI event loop blocked ~{gap:.0f} ms")
+                self._wd_last=now
+            self._wd_timer.timeout.connect(_wd_tick); self._wd_timer.start()
 
         settings=QSettings(ORG_NAME, APP_NAME); geo=settings.value("window/geometry")
-        if isinstance(geo, QtCore.QByteArray): self.restoreGeometry(geo)
+        if isinstance(geo, QtCore.QByteArray): self._safe_restore_geometry(geo)
 
     def mark_active_pane(self, pane):
         """
-        활성 Pane을 설정하고, 각 Pane의 PathBar와 Pane 전체 시각 상태를 반영한다.
+        ??? Pane????????, ??Pane??PathBar?? Pane ??? ??? ???????????.
         """
         try:
             self._active_pane = pane
             for p in getattr(self, "panes", []):
                 try:
                     is_active = (p is pane)
-                    # Path bar 하이라이트
+                    # Path bar ????????
                     p.path_bar.set_active(is_active)
-                    # Pane 전체 하이라이트
+                    # Pane ??? ????????
                     if hasattr(p, "set_active_visual"):
                         p.set_active_visual(is_active)
                 except Exception:
@@ -3832,11 +4600,11 @@ class MultiExplorer(QMainWindow):
             pass
 
     def _install_focus_tracker(self):
-        """앱 전역 포커스 변화에 따라 활성 Pane을 갱신한다."""
+        """????? ?????????? ??? ??? Pane????????."""
         app = QApplication.instance()
         if not app:
             return
-        # 중복 연결 방지
+        # ??? ??? ???
         try:
             self._focus_tracker_connected
         except AttributeError:
@@ -3847,14 +4615,14 @@ class MultiExplorer(QMainWindow):
         self._focus_tracker_connected = True
 
     def _on_focus_changed(self, old, now):
-        """포커스가 바뀔 때, 포커스를 품고 있는 Pane을 활성화한다."""
+        """?????? ?????? ?????? ??? ??? Pane??????????"""
         try:
             if not now:
                 return
             if not isinstance(now, QWidget):
                 return
             for p in getattr(self, "panes", []):
-                # now가 Pane의 자손 위젯이면 해당 Pane을 활성화
+                # now?? Pane????? ?????? ??? Pane???????
                 if p.isAncestorOf(now):
                     self.mark_active_pane(p)
                     return
@@ -3871,9 +4639,9 @@ class MultiExplorer(QMainWindow):
         if hasattr(self, "btn_theme") and self.btn_theme:
             self.btn_theme.setIcon(icon_theme_toggle(self.theme))
         if hasattr(self, "btn_bm_edit") and self.btn_bm_edit:
-            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))  # 북마크 편집(별+연필)
+            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))  # ????????(?????)
         if hasattr(self, "btn_session") and self.btn_session:
-            self.btn_session.setIcon(icon_session(self.theme))        # ★ 세션 아이콘 지정
+            self.btn_session.setIcon(icon_session(self.theme))        # ????? ?????????
         if hasattr(self, "btn_about") and self.btn_about:
             self.btn_about.setIcon(icon_info(self.theme))
 
@@ -3883,7 +4651,7 @@ class MultiExplorer(QMainWindow):
             try:
                 p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
                 p.btn_cmd.setIcon(icon_cmd(self.theme))
-                # PathBar의 복사 아이콘도 갱신
+                # PathBar????? ?????? ???
                 if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
                     p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
             except Exception:
@@ -3900,14 +4668,14 @@ class MultiExplorer(QMainWindow):
 
     def build_panes(self, n:int, start_paths):
         """
-        - 현재(직전) 창 개수에 대한 경로들을 last_paths_{count} 로 저장
-        - 4→6, 6→8 등 창 개수를 늘릴 때, 새로 생기는 창(5~n)은
-          마지막으로 사용했던 same-count(6 또는 8) 레이아웃의 경로를 사용
-        - 레이아웃은 새 GridLayout으로 재구성하고, 최대화 상태를 유지/복원
+        - ???(???) ????????????????? last_paths_{count} ??????
+        - 4??, 6?? ???????????? ?? ??? ???????5~n)??
+          ?????????????? same-count(6 ??? 8) ????????????????
+        - ???????? ??GridLayout??? ???????? ?????????????/???
         """
         was_max = self.isMaximized()
 
-        # 1) 직전 레이아웃의 경로 저장 (예: 4개 사용 중이었다면 last_paths_4 로 저장)
+        # 1) ??? ??????????? ????(?? 4????? ????????last_paths_4 ??????
         try:
             prev_count = len(getattr(self, "panes", []))
         except Exception:
@@ -3921,9 +4689,9 @@ class MultiExplorer(QMainWindow):
             except Exception:
                 pass
 
-        # 2) 대상 레이아웃에서 사용할 경로 구성
-        #    - start_paths(호출자가 넘긴 현재 표시 경로들)로 우선 채움
-        #    - 부족한 나머지는 last_paths_{n}에서 보충 (주로 5~n 채우기)
+        # 2) ????????????? ???????? ???
+        #    - start_paths(?????? ??? ??? ??? ?????????? ???
+        #    - ????? ???????last_paths_{n}??? ??? (??? 5~n ?????
         final_paths = list(start_paths or [])[:n]
         if len(final_paths) < n:
             s = QSettings(ORG_NAME, APP_NAME)
@@ -3937,7 +4705,14 @@ class MultiExplorer(QMainWindow):
                     cand = QDir.homePath()
                 final_paths.append(str(cand))
 
-        # 3) 기존 그리드/페인 완전 제거
+        # 3) ??? ???????? ??? ???
+        old_panes = list(getattr(self, "panes", []))
+        for p in old_panes:
+            try:
+                p.shutdown(wait_ms=600)
+            except Exception:
+                pass
+
         vmain = self.centralWidget().layout() if self.centralWidget() else None
         if hasattr(self, "grid") and isinstance(self.grid, QGridLayout):
             while self.grid.count():
@@ -3945,6 +4720,7 @@ class MultiExplorer(QMainWindow):
                 w = it.widget()
                 if w:
                     w.setParent(None)
+                    w.deleteLater()
             if vmain:
                 try:
                     vmain.removeItem(self.grid)
@@ -3955,7 +4731,7 @@ class MultiExplorer(QMainWindow):
             except Exception:
                 pass
 
-        # 4) 새 그리드 구성
+        # 4) ??????????
         cols = {4: 2, 6: 3, 8: 4}.get(n, 3)
         gap = GRID_GAPS.get(cols, 3)
         margin_lr = GRID_MARG_LR.get(cols, 6)
@@ -3966,7 +4742,7 @@ class MultiExplorer(QMainWindow):
         if vmain:
             vmain.addLayout(self.grid, 1)
 
-        # 스트레치 설정
+        # ?????? ???
         for c in range(cols):
             self.grid.setColumnStretch(c, 1)
             self.grid.setColumnMinimumWidth(c, 0)
@@ -3975,7 +4751,7 @@ class MultiExplorer(QMainWindow):
             self.grid.setRowStretch(r, 1)
             self.grid.setRowMinimumHeight(r, 0)
 
-        # 5) 새 페인 생성/배치 (final_paths를 그대로 사용)
+        # 5) ????? ???/??? (final_paths??????????)
         self.panes = []
         self.setUpdatesEnabled(False)
         for i in range(n):
@@ -3987,11 +4763,11 @@ class MultiExplorer(QMainWindow):
             self.grid.addWidget(pane, rr, cc)
         self.setUpdatesEnabled(True)
 
-        # 6) 타이틀/아이콘/레이아웃 마무리
-        self.setWindowTitle(f"Multi-Pane File Explorer — {n} panes")
+        # 6) ?????/??????????? ?????
+        self.setWindowTitle(f"Multi-Pane File Explorer ??{n} panes")
         self._update_theme_dependent_icons()
 
-        # 최대화 상태였다면: 해제→재최대화로 레이아웃을 확실히 채움
+        # ?????????????: ???????????? ????????????????
         if was_max:
             QTimer.singleShot(0, self._unmax_then_remax)
         else:
@@ -4000,48 +4776,48 @@ class MultiExplorer(QMainWindow):
 
     def _unmax_then_remax(self):
         try:
-            # 최대화 상태가 아니면 일반 킥만
+            # ?????????? ???????? ???
             if not self.isMaximized():
                 self._kick_layout()
                 return
 
-            # 1) 최대화 해제 (창 크기 변경 경고 피하기 위해 showNormal 사용)
+            # 1) ???????? (????? ??????? ???????? showNormal ???)
             self.showNormal()
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
-            # 2) 레이아웃 재계산
+            # 2) ?????? ?????
             self._kick_layout()
 
-            # 3) 다시 최대화
+            # 3) ??? ?????
             self.showMaximized()
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
-            # 4) 마지막으로 한 번 더 레이아웃 킥
+            # 4) ???????????????????? ??
             self._kick_layout()
         except Exception:
             pass
 
     def _kick_layout(self):
         """
-        레이아웃을 재계산하되, '최대화가 아닌 상태'에서는 현재 창 크기/위치를
-        절대 변경하지 않는다. (전환 시 창이 커지는 문제 방지)
+        ???????????????? '?????? ??? ???'???????? ?????/?????
+        ??? ??????? ????? (??? ????? ???????? ???)
         """
         try:
             cw = self.centralWidget()
             lay = cw.layout() if cw else None
 
-            keep_geom = not self.isMaximized()   # 최대화가 아니라면 현재 지오메트리 고정
+            keep_geom = not self.isMaximized()   # ?????? ?????? ??? ???????? ???
             if keep_geom:
                 g = self.geometry()
-                # 현재 크기로 일시 고정(레이아웃 중 창이 커지는 것 방지)
+                # ??? ???????? ???(?????? ????? ??????????)
                 old_min = self.minimumSize()
                 old_max = self.maximumSize()
                 self.setMinimumSize(g.size())
                 self.setMaximumSize(g.size())
 
-            # ── 레이아웃 강제 패스 (창 크기 변경 없이) ─────────────────
+            # ???? ?????? ??? ??? (????? ???????) ??????????????????????????????????
             if lay:
                 lay.invalidate()
                 lay.activate()
@@ -4050,7 +4826,7 @@ class MultiExplorer(QMainWindow):
                 self.grid.invalidate()
                 self.grid.update()
 
-            # 각 Pane 내부 위젯 갱신 (확장 정책만 보정: 창 크기에는 영향 없음)
+            # ??Pane ??? ??? ??? (??? ????????: ???????? ??? ???)
             for p in getattr(self, "panes", []):
                 try:
                     p.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4059,13 +4835,13 @@ class MultiExplorer(QMainWindow):
                         p.view.updateGeometries()
                         p.view.doItemsLayout()
                         p.view.viewport().update()
-                    # 경로바는 항상 우측(가장 하위 폴더) 고정
+                    # ?????? ??? ???(??????? ???) ???
                     if hasattr(p, "path_bar") and hasattr(p.path_bar, "_pin_to_right"):
                         p.path_bar._pin_to_right()
                 except Exception:
                     pass
 
-            # 레이아웃 요청 처리(사용자 입력 제외)
+            # ?????? ??? ???(???????? ???)
             QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.LayoutRequest)
             QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
@@ -4078,18 +4854,18 @@ class MultiExplorer(QMainWindow):
         except Exception:
             pass
         finally:
-            # ── 잠금 해제 & 지오메트리 복원 ─────────────────────────────
+            # ???? ??? ??? & ???????? ??? ??????????????????????????????????????????????????????????
             try:
                 if keep_geom:
-                    # 원래 min/max 복원
+                    # ??? min/max ???
                     try:
                         self.setMinimumSize(old_min)
                         self.setMaximumSize(old_max)
                     except Exception:
-                        # 실패 시 일반 복원값으로
+                        # ??? ????? ????????
                         self.setMinimumSize(QtCore.QSize(0, 0))
                         self.setMaximumSize(QtCore.QSize(16777215, 16777215))
-                    # 레이아웃 중 변경됐으면 원 지오메트리로 되돌림
+                    # ?????? ?????????? ?????????????????
                     if self.geometry() != g:
                         self.setGeometry(g)
             except Exception:
@@ -4098,14 +4874,14 @@ class MultiExplorer(QMainWindow):
 
     def _safe_restore_geometry(self, ba: QtCore.QByteArray):
         """
-        저장된 지오메트리를 복원하되, 현재 모니터의 사용 가능 영역을 넘지 않도록 클램프한다.
+        ????? ????????????????, ??? ?????? ??? ???????????? ?????????????
         """
         try:
             ok = self.restoreGeometry(ba)
             if not ok:
                 return
 
-            # 현재 화면의 사용 가능 영역
+            # ??? ???????? ???????
             win = self.windowHandle()
             screen = (win.screen().availableGeometry() if win and win.screen()
                       else QApplication.primaryScreen().availableGeometry())
@@ -4117,7 +4893,7 @@ class MultiExplorer(QMainWindow):
             new_x = min(max(sg.left(), g.x()), sg.right() - new_w)
             new_y = min(max(sg.top(),  g.y()), sg.bottom() - new_h)
 
-            # 창 크기/위치가 화면을 벗어나면 보정
+            # ?????/????? ??????????? ???
             if (new_w != g.width()) or (new_h != g.height()) or (new_x != g.x()) or (new_y != g.y()):
                 self.setGeometry(new_x, new_y, new_w, new_h)
         except Exception:
@@ -4187,7 +4963,7 @@ class MultiExplorer(QMainWindow):
             "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.0.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
-            "<div style='color:#333; margin-top:6px; font-size:10pt;'>© 2026</div>"
+            "<div style='color:#333; margin-top:6px; font-size:10pt;'>? 2026</div>"
         )
         lay.addWidget(lbl)
         btns=QDialogButtonBox(QDialogButtonBox.Ok, dlg); lay.addWidget(btns); btns.accepted.connect(dlg.accept)
@@ -4196,10 +4972,23 @@ class MultiExplorer(QMainWindow):
         dlg.resize(380,180); dlg.exec_()
 
     def closeEvent(self,e):
+        paths = []
+        try:
+            paths = self._current_paths()
+        except Exception:
+            paths = []
+
+        for p in list(getattr(self, "panes", [])):
+            try:
+                p.shutdown(wait_ms=1000)
+            except Exception:
+                pass
+
         settings=QSettings(ORG_NAME, APP_NAME)
         settings.setValue("window/geometry", self.saveGeometry())
-        settings.setValue("layout/pane_count", len(self.panes))
-        for i,p in enumerate(self.panes): settings.setValue(f"layout/pane_{i}_path", p.current_path())
+        settings.setValue("layout/pane_count", len(paths) if paths else len(self.panes))
+        for i,p in enumerate(paths if paths else [x.current_path() for x in self.panes]):
+            settings.setValue(f"layout/pane_{i}_path", p)
         settings.sync(); super().closeEvent(e)
 
     # ---- Sessions (save/load all pane paths) ---------------------------------
@@ -4227,12 +5016,12 @@ class MultiExplorer(QMainWindow):
     def _save_session(self, name: str):
         name = (name or "").strip()
         if not name:
-            QMessageBox.information(self, "Save Session", "세션 이름을 입력해 주세요.")
+            QMessageBox.information(self, "Save Session", "??? ???????????????")
             return
         paths = self._current_paths()
         panes = len(self.panes)
         items = self._get_sessions()
-        # 이름 중복은 대소문자 무시하고 교체
+        # ??? ????? ????????????? ???
         lowered = name.lower()
         replaced = False
         for i, it in enumerate(items):
@@ -4258,13 +5047,13 @@ class MultiExplorer(QMainWindow):
             if it.get("name","") == name:
                 target = it; break
         if not target:
-            QMessageBox.warning(self, "Load Session", "세션을 찾을 수 없습니다."); return
+            QMessageBox.warning(self, "Load Session", "???????? ????????."); return
         paths = list(target.get("paths", []))
         panes = int(target.get("panes", len(paths)))
         if panes <= 0 or not paths:
-            QMessageBox.warning(self, "Load Session", "세션 데이터가 비어 있습니다."); return
+            QMessageBox.warning(self, "Load Session", "??? ?????? ??? ??????."); return
 
-        # 현재 레이아웃과 다르면 재구성
+        # ??? ??????????????????
         if panes != len(self.panes):
             self.build_panes(panes, paths)
         else:
@@ -4280,7 +5069,7 @@ class MultiExplorer(QMainWindow):
     def _open_session_manager(self):
         dlg = SessionManagerDialog(self, self._get_sessions())
         if dlg.exec_() == QDialog.Accepted:
-            pass  # 필요 시 후처리
+            pass  # ??? ???????
 
 class SessionManagerDialog(QDialog):
     def __init__(self, parent: MultiExplorer, sessions: list):
@@ -4346,7 +5135,7 @@ class SessionManagerDialog(QDialog):
     def _on_load(self):
         name = self._selected_name()
         if not name:
-            QMessageBox.information(self, "Load Session", "세션을 선택해 주세요.")
+            QMessageBox.information(self, "Load Session", "???????????????")
             return
         try:
             self.parent()._load_session(name)
@@ -4356,9 +5145,9 @@ class SessionManagerDialog(QDialog):
     def _on_delete(self):
         name = self._selected_name()
         if not name:
-            QMessageBox.information(self, "Delete Session", "세션을 선택해 주세요.")
+            QMessageBox.information(self, "Delete Session", "???????????????")
             return
-        btn = QMessageBox.question(self, "Delete Session", f"삭제하시겠습니까?\n{name}",
+        btn = QMessageBox.question(self, "Delete Session", f"?????????????\n{name}",
                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if btn != QMessageBox.Yes:
             return
@@ -4374,11 +5163,11 @@ class SessionManagerDialog(QDialog):
         if not ok or not name.strip():
             return
         name = name.strip()
-        # 이미 존재하면 덮어쓸지 확인
+        # ??? ?????? ?????? ???
         exists = any(s.get("name","").lower() == name.lower() for s in self.parent()._get_sessions())
         if exists:
             btn = QMessageBox.question(self, "Save Session",
-                                       f"동일한 이름의 세션이 있습니다.\n덮어쓰시겠습니까?\n{name}",
+                                       f"?????????????????????.\n?????????????\n{name}",
                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if btn != QMessageBox.Yes:
                 return
@@ -4428,7 +5217,7 @@ class BookmarkEditDialog(QDialog):
 
         path_wrap = QWidget(self.table); h = QHBoxLayout(path_wrap); h.setContentsMargins(0,0,0,0); h.setSpacing(ROW_SPACING)
         path_edit = QLineEdit(path_wrap); path_edit.setText(str(data.get("path", ""))); path_edit.setPlaceholderText("Folder path"); path_edit.setClearButtonEnabled(True); path_edit.setFixedHeight(UI_H)
-        btn = QToolButton(path_wrap); btn.setText("…"); btn.setFixedHeight(UI_H)
+        btn = QToolButton(path_wrap); btn.setText("..."); btn.setFixedHeight(UI_H)
         def browse():
             start = path_edit.text().strip() or QDir.homePath()
             d = QFileDialog.getExistingDirectory(self, "Select Folder", start)
@@ -4477,10 +5266,13 @@ def parse_args():
     ap=argparse.ArgumentParser(description="Multi-Pane File Explorer (PyQt5)")
     ap.add_argument("paths", nargs="*", help="Optional start paths per pane")
     ap.add_argument("--panes", type=int, choices=[4,6,8], default=6, help="Number of panes: 4, 6 or 8")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logs (or set MULTIPANE_DEBUG=1)")
     return ap.parse_args()
 
 def main():
+    global DEBUG
     args=parse_args()
+    DEBUG = bool(args.debug or _env_flag("MULTIPANE_DEBUG"))
     _enable_win_per_monitor_v2()
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -4500,3 +5292,4 @@ def main():
 
 if __name__=="__main__":
     main()
+

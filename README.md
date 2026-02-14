@@ -35,12 +35,18 @@ pip install PyQt5 send2trash pywin32
 
 ## Run
 ```bash
-python main.py [--panes 4|6|8] [start_path1 start_path2 ...]
+python multipane_explorer.py [--panes 4|6|8] [--debug] [start_path1 start_path2 ...]
 ```
 Examples:
 ```bash
-python main.py --panes 6
-python main.py --panes 4 "C:\Windows" "D:\WS" "C:\Users\USER" "C:\Temp"
+python multipane_explorer.py --panes 6
+python multipane_explorer.py --panes 6 --debug
+python multipane_explorer.py --panes 4 "C:\Windows" "D:\WS" "C:\Users\USER" "C:\Temp"
+```
+
+PowerShell (env var):
+```powershell
+$env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 ```
 
 Settings are stored via `QSettings`.  
