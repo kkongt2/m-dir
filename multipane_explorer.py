@@ -4078,8 +4078,11 @@ class ExplorerPane(QWidget):
             if p: paths.append(p)
         seen=set(); out=[]
         for p in paths:
-            np=os.path.normcase(os.path.normpath(p))
-            if np not in seen: seen.add(np); out.append(np)
+            key = _path_key(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
         return out
 
     def _index_to_full_path(self, index):
@@ -4648,8 +4651,13 @@ class ExplorerPane(QWidget):
         skipped_same = []
         blocked_nested = []
         auto_map = {}
+        seen_src_keys = set()
 
         for src in srcs:
+            src_key = _path_key(src)
+            if src_key in seen_src_keys:
+                continue
+            seen_src_keys.add(src_key)
             if not src or not os.path.exists(src):
                 continue
 
