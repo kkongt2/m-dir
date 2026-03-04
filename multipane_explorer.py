@@ -1632,6 +1632,32 @@ class FastDirModel(QAbstractTableModel):
     def columnCount(self, parent=QtCore.QModelIndex()): return 4
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         return self.HEADERS[section] if role==Qt.DisplayRole and orientation==Qt.Horizontal else None
+    def flags(self, index):
+        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if index.isValid():
+            base |= Qt.ItemIsDragEnabled
+        return base
+    def mimeTypes(self):
+        return ["text/uri-list"]
+    def mimeData(self, indexes):
+        md = QtCore.QMimeData()
+        if not indexes:
+            return md
+        rows = sorted({ix.row() for ix in indexes if ix.isValid()})
+        urls = []
+        paths = []
+        for row in rows:
+            p = self.row_path(row)
+            if not p:
+                continue
+            paths.append(p)
+            urls.append(QUrl.fromLocalFile(p))
+        if urls:
+            md.setUrls(urls)
+            md.setText("\r\n".join(paths))
+        return md
+    def supportedDragActions(self):
+        return Qt.CopyAction | Qt.MoveAction
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid(): return None
         r=self._rows[index.row()]; c=index.column()
@@ -2826,6 +2852,34 @@ class ExplorerView(QTreeView):
         self._drag_ready = False
 
         self.setFocusPolicy(Qt.StrongFocus)
+
+    def ensure_drag_ready(self):
+        self._clear_drag_state()
+        try:
+            self.setDragEnabled(True)
+            self.setAcceptDrops(True)
+            self.setDropIndicatorShown(True)
+            self.setDefaultDropAction(Qt.MoveAction)
+            if self.dragDropMode() != QAbstractItemView.DragDrop:
+                self.setDragDropMode(QAbstractItemView.DragDrop)
+            if self.selectionBehavior() != QAbstractItemView.SelectRows:
+                self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        except Exception:
+            pass
+
+    def _row_selected_for_drag(self, sm, index):
+        if not (sm and index.isValid()):
+            return False
+        try:
+            if sm.isRowSelected(index.row(), index.parent()):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(sm.isSelected(index))
+        except Exception:
+            return False
+
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             try:
@@ -2875,6 +2929,7 @@ class ExplorerView(QTreeView):
         if e.key() == Qt.Key_F5:
             try:
                 self.pane.hard_refresh()
+                self.ensure_drag_ready()
             finally:
                 e.accept()
             return
@@ -2887,7 +2942,7 @@ class ExplorerView(QTreeView):
             self._drag_start_index = self.indexAt(e.pos())
             self._drag_start_modifiers = e.modifiers()
             sm = self.selectionModel()
-            self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
+            self._drag_start_was_selected = self._row_selected_for_drag(sm, self._drag_start_index)
             self._drag_ready = False
 
 
@@ -2901,11 +2956,11 @@ class ExplorerView(QTreeView):
         if e.button() == Qt.LeftButton and e.modifiers() == Qt.NoModifier:
             clicked = self.indexAt(e.pos())
             sm = self.selectionModel()
-            prev_rows = sm.selectedRows(0)
+            prev_rows = sm.selectedRows(0) if sm else []
             same_single = (clicked.isValid() and len(prev_rows)==1 and
                            prev_rows[0].row()==clicked.row() and prev_rows[0].parent()==clicked.parent())
             super().mousePressEvent(e)
-            if same_single and len(sm.selectedRows(0)) == 0:
+            if same_single and sm and len(sm.selectedRows(0)) == 0:
                 sm.select(clicked, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
                 sm.setCurrentIndex(clicked, QtCore.QItemSelectionModel.NoUpdate)
                 e.accept()
@@ -2927,12 +2982,12 @@ class ExplorerView(QTreeView):
                     if (ix.isValid() and sm
                         and bool(self._drag_start_modifiers & Qt.ControlModifier)
                         and self._drag_start_was_selected
-                        and (not sm.isSelected(ix))):
+                        and (not self._row_selected_for_drag(sm, ix))):
                         try:
                             sm.select(ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
                         except Exception:
                             pass
-                    if ix.isValid() and sm and sm.isSelected(ix):
+                    if ix.isValid() and sm and self._row_selected_for_drag(sm, ix):
 
 
                         has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
@@ -3104,6 +3159,7 @@ class ExplorerPane(QWidget):
     def _setup_view(self):
         self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._on_context_menu)
@@ -4496,7 +4552,12 @@ class ExplorerPane(QWidget):
         self.hard_refresh()
     def hard_refresh(self):
         if self._search_mode:
-            self._apply_filter(); return
+            self._apply_filter()
+            try:
+                self.view.ensure_drag_ready()
+            except Exception:
+                pass
+            return
         try: self._cancel_fast_stat_worker()
         except Exception: pass
         try: self._cancel_enum_worker(wait_ms=100)
@@ -4504,6 +4565,10 @@ class ExplorerPane(QWidget):
         try: self.stat_proxy.clear_cache()
         except Exception: pass
         self.set_path(self.current_path(), push_history=False)
+        try:
+            self.view.ensure_drag_ready()
+        except Exception:
+            pass
         self.host.flash_status("Hard refresh")
 
 
@@ -5219,6 +5284,11 @@ class MultiExplorer(QMainWindow):
                         p.set_active_visual(is_active)
                 except Exception:
                     pass
+            try:
+                if pane and hasattr(pane, "view") and hasattr(pane.view, "ensure_drag_ready"):
+                    pane.view.ensure_drag_ready()
+            except Exception:
+                pass
             dlog(f"[active] pane={getattr(pane, 'pane_id', '?')}")
         except Exception:
             pass
