@@ -1479,6 +1479,16 @@ def _derive_name_from_path(p: str) -> str:
         base = os.path.basename(p.rstrip("\\/")); return base or p
     except Exception: return p
 
+def file_extension_label(name_or_path: str, is_dir: bool = False) -> str:
+    if is_dir:
+        return ""
+    try:
+        base = os.path.basename(str(name_or_path or ""))
+        ext = os.path.splitext(base)[1]
+        return ext[1:].lower() if ext.startswith(".") and len(ext) > 1 else ""
+    except Exception:
+        return ""
+
 def migrate_legacy_favorites_into_named(items: list) -> list:
     try:
         s = QSettings(ORG_NAME, APP_NAME)
@@ -1590,7 +1600,7 @@ class FsSortProxy(QSortFilterProxyModel):
 
 
 class FastDirModel(QAbstractTableModel):
-    HEADERS = ["Name", "Size", "Type", "Date Modified"]
+    HEADERS = ["Name", "Size", "Ext", "Date Modified"]
     def __init__(self, parent=None):
         super().__init__(parent); self._root=""; self._rows=[]
 
@@ -1632,9 +1642,39 @@ class FastDirModel(QAbstractTableModel):
     def columnCount(self, parent=QtCore.QModelIndex()): return 4
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         return self.HEADERS[section] if role==Qt.DisplayRole and orientation==Qt.Horizontal else None
+    def flags(self, index):
+        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if index.isValid():
+            base |= Qt.ItemIsDragEnabled
+        return base
+    def mimeTypes(self):
+        return ["text/uri-list"]
+    def mimeData(self, indexes):
+        md = QtCore.QMimeData()
+        if not indexes:
+            return md
+        rows = sorted({ix.row() for ix in indexes if ix.isValid()})
+        urls = []
+        paths = []
+        for row in rows:
+            p = self.row_path(row)
+            if not p:
+                continue
+            paths.append(p)
+            urls.append(QUrl.fromLocalFile(p))
+        if urls:
+            md.setUrls(urls)
+            md.setText("\r\n".join(paths))
+        return md
+    def supportedDragActions(self):
+        return Qt.CopyAction | Qt.MoveAction
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid(): return None
         r=self._rows[index.row()]; c=index.column()
+
+        if role == Qt.TextAlignmentRole:
+            if c in (1, 2, 3):
+                return int(Qt.AlignRight | Qt.AlignVCenter)
 
 
         if role == Qt.DecorationRole and c == 0:
@@ -1659,7 +1699,7 @@ class FastDirModel(QAbstractTableModel):
                 if r["size"] is None: return ""
                 return human_size(int(r["size"]))
             if c==2:
-                return r["type"]
+                return r.get("ext", "")
             if c==3:
                 if r["mtime"] is None: return ""
                 dt=QDateTime.fromSecsSinceEpoch(int(r["mtime"])); return dt.toString("yyyy-MM-dd HH:mm:ss")
@@ -1670,10 +1710,11 @@ class FastDirModel(QAbstractTableModel):
 
                 if r.get("is_dir", False): return 0
                 return 0 if r["size"] is None else int(r["size"])
+            if c==2:
+                return r.get("ext", "")
             if c==3:
                 return QDateTime.fromSecsSinceEpoch(int(r["mtime"])) if r["mtime"] else QDateTime()
-            else:
-                return r["type"]
+            return ""
 
         elif role==Qt.ToolTipRole:
             return r["path"]
@@ -1725,16 +1766,15 @@ class DirEnumWorker(QtCore.QThread):
                     name=entry.name; p=os.path.join(self.root,name)
                     try: is_dir=entry.is_dir(follow_symlinks=False)
                     except Exception: is_dir=os.path.isdir(p)
-                    ext=os.path.splitext(name)[1]
-                    typ="Folder" if is_dir else (ext.lstrip(".").upper()+" file" if ext else "File")
+                    ext = file_extension_label(name, is_dir)
                     batch.append({
                         "name": name,
                         "name_l": name.lower(),
                         "path": p,
                         "is_dir": is_dir,
+                        "ext": ext,
                         "size": None,
                         "mtime": None,
-                        "type": typ,
                     })
                     if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
                 if batch: self.batchReady.emit(batch)
@@ -1894,13 +1934,21 @@ class StatOverlayProxy(QIdentityProxyModel):
             w.wait(100)
         self._worker = None
 
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole and section == 2:
+            return "Ext"
+        return super().headerData(section, orientation, role)
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
 
         col = index.column()
-        if col not in (1, 3):
+        if col not in (1, 2, 3):
             return super().data(index, role)
+
+        if role == Qt.TextAlignmentRole:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
 
         src = self.sourceModel()
         sidx = self.mapToSource(index)
@@ -1944,6 +1992,12 @@ class StatOverlayProxy(QIdentityProxyModel):
                 return 0
             if role == Qt.DisplayRole:
                 return ""
+            return super().data(index, role)
+
+        if col == 2:
+            ext = file_extension_label(p, is_dir)
+            if role in (Qt.DisplayRole, Qt.EditRole):
+                return ext
             return super().data(index, role)
 
         if col == 3:
@@ -2433,6 +2487,10 @@ class PathBar(QWidget):
 
 class SearchResultModel(QStandardItemModel):
     def data(self, index, role=Qt.DisplayRole):
+        if role == Qt.TextAlignmentRole:
+            c = index.column()
+            if c in (1, 2, 3):
+                return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.DisplayRole and index.column() == 1:
             b = super().data(index, SIZE_BYTES_ROLE)
             if b is None:
@@ -2826,6 +2884,34 @@ class ExplorerView(QTreeView):
         self._drag_ready = False
 
         self.setFocusPolicy(Qt.StrongFocus)
+
+    def ensure_drag_ready(self):
+        self._clear_drag_state()
+        try:
+            self.setDragEnabled(True)
+            self.setAcceptDrops(True)
+            self.setDropIndicatorShown(True)
+            self.setDefaultDropAction(Qt.MoveAction)
+            if self.dragDropMode() != QAbstractItemView.DragDrop:
+                self.setDragDropMode(QAbstractItemView.DragDrop)
+            if self.selectionBehavior() != QAbstractItemView.SelectRows:
+                self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        except Exception:
+            pass
+
+    def _row_selected_for_drag(self, sm, index):
+        if not (sm and index.isValid()):
+            return False
+        try:
+            if sm.isRowSelected(index.row(), index.parent()):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(sm.isSelected(index))
+        except Exception:
+            return False
+
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             try:
@@ -2875,6 +2961,7 @@ class ExplorerView(QTreeView):
         if e.key() == Qt.Key_F5:
             try:
                 self.pane.hard_refresh()
+                self.ensure_drag_ready()
             finally:
                 e.accept()
             return
@@ -2887,7 +2974,7 @@ class ExplorerView(QTreeView):
             self._drag_start_index = self.indexAt(e.pos())
             self._drag_start_modifiers = e.modifiers()
             sm = self.selectionModel()
-            self._drag_start_was_selected = bool(self._drag_start_index.isValid() and sm and sm.isSelected(self._drag_start_index))
+            self._drag_start_was_selected = self._row_selected_for_drag(sm, self._drag_start_index)
             self._drag_ready = False
 
 
@@ -2901,11 +2988,11 @@ class ExplorerView(QTreeView):
         if e.button() == Qt.LeftButton and e.modifiers() == Qt.NoModifier:
             clicked = self.indexAt(e.pos())
             sm = self.selectionModel()
-            prev_rows = sm.selectedRows(0)
+            prev_rows = sm.selectedRows(0) if sm else []
             same_single = (clicked.isValid() and len(prev_rows)==1 and
                            prev_rows[0].row()==clicked.row() and prev_rows[0].parent()==clicked.parent())
             super().mousePressEvent(e)
-            if same_single and len(sm.selectedRows(0)) == 0:
+            if same_single and sm and len(sm.selectedRows(0)) == 0:
                 sm.select(clicked, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
                 sm.setCurrentIndex(clicked, QtCore.QItemSelectionModel.NoUpdate)
                 e.accept()
@@ -2927,12 +3014,12 @@ class ExplorerView(QTreeView):
                     if (ix.isValid() and sm
                         and bool(self._drag_start_modifiers & Qt.ControlModifier)
                         and self._drag_start_was_selected
-                        and (not sm.isSelected(ix))):
+                        and (not self._row_selected_for_drag(sm, ix))):
                         try:
                             sm.select(ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
                         except Exception:
                             pass
-                    if ix.isValid() and sm and sm.isSelected(ix):
+                    if ix.isValid() and sm and self._row_selected_for_drag(sm, ix):
 
 
                         has_shift = bool(self._drag_start_modifiers & Qt.ShiftModifier)
@@ -3104,6 +3191,7 @@ class ExplorerPane(QWidget):
     def _setup_view(self):
         self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._on_context_menu)
@@ -3118,9 +3206,10 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
+        self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
     def _configure_header_fast(self):
@@ -3128,9 +3217,10 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
+        self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
     def _configure_header_search(self):
@@ -3139,9 +3229,11 @@ class ExplorerPane(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.resizeSection(1, 90)
-        header.resizeSection(2, 150)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
 
     def _schedule_browse_name_autofit(self):
         if self._search_mode:
@@ -3158,12 +3250,14 @@ class ExplorerPane(QWidget):
         if header is None:
             return
 
-        if not v.isColumnHidden(2):
-            return
         vp_w = v.viewport().width()
         if vp_w <= 0:
             return
-        target = vp_w - header.sectionSize(1) - header.sectionSize(3)
+        fixed_w = 0
+        for col in (1, 2, 3):
+            if not v.isColumnHidden(col):
+                fixed_w += header.sectionSize(col)
+        target = vp_w - fixed_w
         target = max(self._browse_name_min_width, target)
         if abs(header.sectionSize(0) - target) <= 1:
             return
@@ -3179,7 +3273,7 @@ class ExplorerPane(QWidget):
         if self._header_resize_guard or self._search_mode:
             return
 
-        if logical_index in (1, 3):
+        if logical_index in (1, 2, 3):
             self._schedule_browse_name_autofit()
 
     def _build_status_row(self):
@@ -3476,12 +3570,16 @@ class ExplorerPane(QWidget):
             item_size.setData(0, Qt.EditRole)
             item_size.setData(0, SIZE_BYTES_ROLE)
 
+            ext = file_extension_label(name, isdir)
+            item_ext = QStandardItem(ext)
+            item_ext.setData(ext, Qt.EditRole)
+
             item_date = QStandardItem("")
             item_date.setData(QDateTime(), Qt.EditRole)
 
             item_folder = QStandardItem(rel_folder)
 
-            root_item.appendRow([item_name, item_size, item_date, item_folder])
+            root_item.appendRow([item_name, item_size, item_ext, item_date, item_folder])
 
 
         self._request_visible_stats(0)
@@ -4499,7 +4597,12 @@ class ExplorerPane(QWidget):
         self.hard_refresh()
     def hard_refresh(self):
         if self._search_mode:
-            self._apply_filter(); return
+            self._apply_filter()
+            try:
+                self.view.ensure_drag_ready()
+            except Exception:
+                pass
+            return
         try: self._cancel_fast_stat_worker()
         except Exception: pass
         try: self._cancel_enum_worker(wait_ms=100)
@@ -4507,6 +4610,10 @@ class ExplorerPane(QWidget):
         try: self.stat_proxy.clear_cache()
         except Exception: pass
         self.set_path(self.current_path(), push_history=False)
+        try:
+            self.view.ensure_drag_ready()
+        except Exception:
+            pass
         self.host.flash_status("Hard refresh")
 
 
@@ -4946,7 +5053,7 @@ class ExplorerPane(QWidget):
 
 
         model = SearchResultModel(self)
-        model.setHorizontalHeaderLabels(["Name", "Size", "Date Modified", "Folder"])
+        model.setHorizontalHeaderLabels(["Name", "Size", "Ext", "Date Modified", "Folder"])
         self._enter_search_mode(model)
 
 
@@ -4999,7 +5106,7 @@ class ExplorerPane(QWidget):
                 continue
             item_name = self._search_model.item(src_ix.row(), 0)
             item_size = self._search_model.item(src_ix.row(), 1)
-            item_date = self._search_model.item(src_ix.row(), 2)
+            item_date = self._search_model.item(src_ix.row(), 3)
             if not item_name:
                 continue
 
@@ -5227,6 +5334,11 @@ class MultiExplorer(QMainWindow):
                         p.set_active_visual(is_active)
                 except Exception:
                     pass
+            try:
+                if pane and hasattr(pane, "view") and hasattr(pane.view, "ensure_drag_ready"):
+                    pane.view.ensure_drag_ready()
+            except Exception:
+                pass
             dlog(f"[active] pane={getattr(pane, 'pane_id', '?')}")
         except Exception:
             pass
@@ -5618,7 +5730,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.0.0</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.1.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
