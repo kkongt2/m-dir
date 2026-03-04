@@ -1479,6 +1479,16 @@ def _derive_name_from_path(p: str) -> str:
         base = os.path.basename(p.rstrip("\\/")); return base or p
     except Exception: return p
 
+def file_extension_label(name_or_path: str, is_dir: bool = False) -> str:
+    if is_dir:
+        return ""
+    try:
+        base = os.path.basename(str(name_or_path or ""))
+        ext = os.path.splitext(base)[1]
+        return ext[1:].lower() if ext.startswith(".") and len(ext) > 1 else ""
+    except Exception:
+        return ""
+
 def migrate_legacy_favorites_into_named(items: list) -> list:
     try:
         s = QSettings(ORG_NAME, APP_NAME)
@@ -1590,7 +1600,7 @@ class FsSortProxy(QSortFilterProxyModel):
 
 
 class FastDirModel(QAbstractTableModel):
-    HEADERS = ["Name", "Size", "Type", "Date Modified"]
+    HEADERS = ["Name", "Size", "Ext", "Date Modified"]
     def __init__(self, parent=None):
         super().__init__(parent); self._root=""; self._rows=[]
 
@@ -1662,6 +1672,10 @@ class FastDirModel(QAbstractTableModel):
         if not index.isValid(): return None
         r=self._rows[index.row()]; c=index.column()
 
+        if role == Qt.TextAlignmentRole:
+            if c in (1, 2, 3):
+                return int(Qt.AlignRight | Qt.AlignVCenter)
+
 
         if role == Qt.DecorationRole and c == 0:
             ic = self._icon_cache.get(index.row())
@@ -1685,7 +1699,7 @@ class FastDirModel(QAbstractTableModel):
                 if r["size"] is None: return ""
                 return human_size(int(r["size"]))
             if c==2:
-                return r["type"]
+                return r.get("ext", "")
             if c==3:
                 if r["mtime"] is None: return ""
                 dt=QDateTime.fromSecsSinceEpoch(int(r["mtime"])); return dt.toString("yyyy-MM-dd HH:mm:ss")
@@ -1696,10 +1710,11 @@ class FastDirModel(QAbstractTableModel):
 
                 if r.get("is_dir", False): return 0
                 return 0 if r["size"] is None else int(r["size"])
+            if c==2:
+                return r.get("ext", "")
             if c==3:
                 return QDateTime.fromSecsSinceEpoch(int(r["mtime"])) if r["mtime"] else QDateTime()
-            else:
-                return r["type"]
+            return ""
 
         elif role==Qt.ToolTipRole:
             return r["path"]
@@ -1751,16 +1766,15 @@ class DirEnumWorker(QtCore.QThread):
                     name=entry.name; p=os.path.join(self.root,name)
                     try: is_dir=entry.is_dir(follow_symlinks=False)
                     except Exception: is_dir=os.path.isdir(p)
-                    ext=os.path.splitext(name)[1]
-                    typ="Folder" if is_dir else (ext.lstrip(".").upper()+" file" if ext else "File")
+                    ext = file_extension_label(name, is_dir)
                     batch.append({
                         "name": name,
                         "name_l": name.lower(),
                         "path": p,
                         "is_dir": is_dir,
+                        "ext": ext,
                         "size": None,
                         "mtime": None,
-                        "type": typ,
                     })
                     if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
                 if batch: self.batchReady.emit(batch)
@@ -1920,13 +1934,21 @@ class StatOverlayProxy(QIdentityProxyModel):
             w.wait(100)
         self._worker = None
 
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole and section == 2:
+            return "Ext"
+        return super().headerData(section, orientation, role)
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
 
         col = index.column()
-        if col not in (1, 3):
+        if col not in (1, 2, 3):
             return super().data(index, role)
+
+        if role == Qt.TextAlignmentRole:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
 
         src = self.sourceModel()
         sidx = self.mapToSource(index)
@@ -1970,6 +1992,12 @@ class StatOverlayProxy(QIdentityProxyModel):
                 return 0
             if role == Qt.DisplayRole:
                 return ""
+            return super().data(index, role)
+
+        if col == 2:
+            ext = file_extension_label(p, is_dir)
+            if role in (Qt.DisplayRole, Qt.EditRole):
+                return ext
             return super().data(index, role)
 
         if col == 3:
@@ -2459,6 +2487,10 @@ class PathBar(QWidget):
 
 class SearchResultModel(QStandardItemModel):
     def data(self, index, role=Qt.DisplayRole):
+        if role == Qt.TextAlignmentRole:
+            c = index.column()
+            if c in (1, 2, 3):
+                return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.DisplayRole and index.column() == 1:
             b = super().data(index, SIZE_BYTES_ROLE)
             if b is None:
@@ -3174,9 +3206,10 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
+        self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
     def _configure_header_fast(self):
@@ -3184,9 +3217,10 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 90)
-        header.resizeSection(3, 150)
-        self.view.setColumnHidden(2, True)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
+        self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
     def _configure_header_search(self):
@@ -3195,9 +3229,11 @@ class ExplorerPane(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.resizeSection(1, 90)
-        header.resizeSection(2, 150)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.resizeSection(1, 68)
+        header.resizeSection(2, 44)
+        header.resizeSection(3, 132)
 
     def _schedule_browse_name_autofit(self):
         if self._search_mode:
@@ -3214,12 +3250,14 @@ class ExplorerPane(QWidget):
         if header is None:
             return
 
-        if not v.isColumnHidden(2):
-            return
         vp_w = v.viewport().width()
         if vp_w <= 0:
             return
-        target = vp_w - header.sectionSize(1) - header.sectionSize(3)
+        fixed_w = 0
+        for col in (1, 2, 3):
+            if not v.isColumnHidden(col):
+                fixed_w += header.sectionSize(col)
+        target = vp_w - fixed_w
         target = max(self._browse_name_min_width, target)
         if abs(header.sectionSize(0) - target) <= 1:
             return
@@ -3235,7 +3273,7 @@ class ExplorerPane(QWidget):
         if self._header_resize_guard or self._search_mode:
             return
 
-        if logical_index in (1, 3):
+        if logical_index in (1, 2, 3):
             self._schedule_browse_name_autofit()
 
     def _build_status_row(self):
@@ -3532,12 +3570,16 @@ class ExplorerPane(QWidget):
             item_size.setData(0, Qt.EditRole)
             item_size.setData(0, SIZE_BYTES_ROLE)
 
+            ext = file_extension_label(name, isdir)
+            item_ext = QStandardItem(ext)
+            item_ext.setData(ext, Qt.EditRole)
+
             item_date = QStandardItem("")
             item_date.setData(QDateTime(), Qt.EditRole)
 
             item_folder = QStandardItem(rel_folder)
 
-            root_item.appendRow([item_name, item_size, item_date, item_folder])
+            root_item.appendRow([item_name, item_size, item_ext, item_date, item_folder])
 
 
         self._request_visible_stats(0)
@@ -5003,7 +5045,7 @@ class ExplorerPane(QWidget):
 
 
         model = SearchResultModel(self)
-        model.setHorizontalHeaderLabels(["Name", "Size", "Date Modified", "Folder"])
+        model.setHorizontalHeaderLabels(["Name", "Size", "Ext", "Date Modified", "Folder"])
         self._enter_search_mode(model)
 
 
@@ -5056,7 +5098,7 @@ class ExplorerPane(QWidget):
                 continue
             item_name = self._search_model.item(src_ix.row(), 0)
             item_size = self._search_model.item(src_ix.row(), 1)
-            item_date = self._search_model.item(src_ix.row(), 2)
+            item_date = self._search_model.item(src_ix.row(), 3)
             if not item_name:
                 continue
 
