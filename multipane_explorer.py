@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QMenu, QStyle, QHeaderView, QScrollArea, QFrame, QLabel, QShortcut,
     QToolButton, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QCheckBox, QFileDialog, QProgressDialog, QToolTip, QSizePolicy, QFileIconProvider,
-    QComboBox, QSpacerItem, QCompleter, QSpinBox
+    QComboBox, QSpacerItem, QCompleter, QSpinBox, QStyledItemDelegate
 )
 
 
@@ -70,6 +70,10 @@ FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
 PATH_HISTORY_LIMIT = 30
 VALID_THEMES = ("dark", "light")
+SIZE_COL_WIDTH = 60
+DATE_COL_WIDTH = 122
+LIST_DATETIME_FMT = "yyyy-MM-dd HH:mm"
+HOVER_TOOLTIP_DURATION_MULTIPLIER = 9
 
 # Keep this list in sync with the README keyboard-shortcuts section.
 KEYBOARD_SHORTCUTS = [
@@ -1552,6 +1556,12 @@ class FsSortProxy(QSortFilterProxyModel):
 
         self._sort_order = order
         super().sort(column, order)
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.TextAlignmentRole:
+            if section == 1:
+                return int(Qt.AlignRight | Qt.AlignVCenter)
+            return int(Qt.AlignLeft | Qt.AlignVCenter)
+        return super().headerData(section, orientation, role)
     def lessThan(self, left, right):
         col = left.column(); src = self.sourceModel()
 
@@ -1702,7 +1712,7 @@ class FastDirModel(QAbstractTableModel):
                 return r.get("ext", "")
             if c==3:
                 if r["mtime"] is None: return ""
-                dt=QDateTime.fromSecsSinceEpoch(int(r["mtime"])); return dt.toString("yyyy-MM-dd HH:mm:ss")
+                dt=QDateTime.fromSecsSinceEpoch(int(r["mtime"])); return dt.toString(LIST_DATETIME_FMT)
 
         elif role==Qt.EditRole:
             if c==0: return r["name"]
@@ -2004,7 +2014,7 @@ class StatOverlayProxy(QIdentityProxyModel):
             if rec and rec[1] is not None:
                 dt = QDateTime.fromSecsSinceEpoch(int(rec[1]))
                 if role == Qt.DisplayRole:
-                    return dt.toString("yyyy-MM-dd HH:mm:ss")
+                    return dt.toString(LIST_DATETIME_FMT)
                 if role == Qt.EditRole:
                     return dt
 
@@ -2559,6 +2569,13 @@ class SearchResultModel(QStandardItemModel):
 
 
 
+class SearchFolderDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.displayAlignment = Qt.AlignRight | Qt.AlignVCenter
+        option.textElideMode = Qt.ElideLeft
+
+
 class BulkRenameDialog(QDialog):
     _INVALID_WIN_CHARS = set('<>:"/\\|?*')
 
@@ -3092,6 +3109,14 @@ class ExplorerPane(QWidget):
         self._search_running = False
         self._back_stack=[]; self._fwd_stack=[]; self._undo_stack=[]
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
+        self._tooltip_display_ms = 36000
+        try:
+            st = QApplication.instance().style()
+            base_ms = int(st.styleHint(QStyle.SH_ToolTip_FallAsleepDelay)) if st else 0
+            if base_ms > 0:
+                self._tooltip_display_ms = max(1000, int(base_ms * HOVER_TOOLTIP_DURATION_MULTIPLIER))
+        except Exception:
+            pass
         self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
         self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None; self._pending_normal_root=None
         self._fast_enum_count = 0
@@ -3206,9 +3231,9 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 68)
+        header.resizeSection(1, SIZE_COL_WIDTH)
         header.resizeSection(2, 44)
-        header.resizeSection(3, 132)
+        header.resizeSection(3, DATE_COL_WIDTH)
         self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
@@ -3217,9 +3242,9 @@ class ExplorerPane(QWidget):
         header.setStretchLastSection(False)
         for i in range(4):
             header.setSectionResizeMode(i, QHeaderView.Interactive)
-        header.resizeSection(1, 68)
+        header.resizeSection(1, SIZE_COL_WIDTH)
         header.resizeSection(2, 44)
-        header.resizeSection(3, 132)
+        header.resizeSection(3, DATE_COL_WIDTH)
         self.view.setColumnHidden(2, False)
         self._schedule_browse_name_autofit()
 
@@ -3231,9 +3256,10 @@ class ExplorerPane(QWidget):
         header.setSectionResizeMode(2, QHeaderView.Interactive)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
-        header.resizeSection(1, 68)
+        header.resizeSection(1, SIZE_COL_WIDTH)
         header.resizeSection(2, 44)
-        header.resizeSection(3, 132)
+        header.resizeSection(3, DATE_COL_WIDTH)
+        self.view.setColumnHidden(2, True)
 
     def _schedule_browse_name_autofit(self):
         if self._search_mode:
@@ -3669,11 +3695,11 @@ class ExplorerPane(QWidget):
         if mtime_val is not None:
             try:
                 dt = QDateTime.fromSecsSinceEpoch(int(mtime_val))
-                item_date.setData(dt.toString("yyyy-MM-dd HH:mm:ss"), Qt.DisplayRole)
                 item_date.setData(dt, Qt.EditRole)
+                item_date.setData(dt.toString(LIST_DATETIME_FMT), Qt.DisplayRole)
             except Exception:
-                item_date.setData("", Qt.DisplayRole)
                 item_date.setData(QDateTime(), Qt.EditRole)
+                item_date.setData("", Qt.DisplayRole)
 
 
     def create_text_file(self):
@@ -4032,19 +4058,32 @@ class ExplorerPane(QWidget):
     def eventFilter(self, obj, ev):
 
         if obj is self.view.viewport():
+            if ev.type() == QEvent.ToolTip:
+                # Suppress default model tooltip so our custom duration is not overridden.
+                return True
             if ev.type()==QEvent.MouseButtonPress:
                 if ev.button()==Qt.XButton1: self.go_back(); return True
                 if ev.button()==Qt.XButton2: self.go_forward(); return True
             if ev.type()==QEvent.MouseMove:
                 ix=self.view.indexAt(ev.pos())
                 if ix!=self._last_hover_index: self._last_hover_index=ix
-                if ix.isValid():
+                if not self._search_mode:
+                    QToolTip.hideText()
+                    self._tooltip_last_text = ""
+                elif ix.isValid():
                     now_ms=time.perf_counter()*1000.0
                     if (now_ms-self._tooltip_last_ms)>=self._tooltip_interval_ms:
                         name=ix.sibling(ix.row(),0).data(Qt.DisplayRole); full=self._index_to_full_path(ix)
                         tip=full if full else name
                         if tip!=self._tooltip_last_text:
-                            QToolTip.showText(QCursor.pos(), tip, self.view); self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
+                            QToolTip.showText(QCursor.pos(), tip, self.view.viewport(), QtCore.QRect(), self._tooltip_display_ms)
+                            self._tooltip_last_text=tip; self._tooltip_last_ms=now_ms
+                else:
+                    QToolTip.hideText()
+                    self._tooltip_last_text = ""
+            if ev.type() == QEvent.Leave:
+                QToolTip.hideText()
+                self._tooltip_last_text = ""
             if ev.type() in (QEvent.Resize, QEvent.Show):
                 self._request_visible_stats(0)
                 self._schedule_browse_name_autofit()
@@ -4980,6 +5019,8 @@ class ExplorerPane(QWidget):
         self._search_model = None
         self._search_proxy = None
         self._set_search_button_state(False)
+        QToolTip.hideText()
+        self._tooltip_last_text = ""
 
         if not self._search_mode:
             self._request_visible_stats(0)
@@ -5022,6 +5063,9 @@ class ExplorerPane(QWidget):
         self._search_proxy.setSourceModel(self._search_model)
         self.view.setModel(self._search_proxy)
         self.view.setRootIndex(QtCore.QModelIndex())
+        if not hasattr(self, "_search_folder_delegate"):
+            self._search_folder_delegate = SearchFolderDelegate(self.view)
+        self.view.setItemDelegateForColumn(4, self._search_folder_delegate)
 
 
         self._hook_selection_model()
