@@ -180,23 +180,18 @@ def remove_any(path: str):
     if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
     else: os.remove(path)
 
-def move_with_collision(src: str, dst_dir: str) -> str:
-    name = os.path.basename(src); dst = os.path.join(dst_dir, name)
-    if os.path.exists(dst): dst = unique_dest_path(dst_dir, name)
-    return shutil.move(src, dst)
-
-def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
-    if not paths: return True
-    # Prefer trash providers; fall back to permanent delete.
+def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
+    if not path or not os.path.exists(path):
+        return True
     if HAS_SEND2TRASH:
         try:
-            for p in paths: send2trash(p)
+            send2trash(path)
             return True
         except Exception as e:
             if DEBUG: print("[delete] send2trash failed:", e)
     if HAS_PYWIN32:
         try:
-            pFrom = ("\0".join(_normalize_fs_path(p) for p in paths) + "\0\0")
+            pFrom = (_normalize_fs_path(path) + "\0\0")
             flags = (shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION |
                      shellcon.FOF_NOERRORUI | shellcon.FOF_SILENT)
             res, aborted = shell.SHFileOperation((int(hwnd), shellcon.FO_DELETE, pFrom, None, flags, False, None, None))
@@ -204,11 +199,24 @@ def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
         except Exception as e:
             if DEBUG: print("[delete] SHFileOperation failed:", e)
     try:
-        for p in paths: remove_any(p)
+        remove_any(path)
         return True
     except Exception as e:
         if DEBUG: print("[delete] fallback remove failed:", e)
         return False
+
+def move_with_collision(src: str, dst_dir: str) -> str:
+    name = os.path.basename(src); dst = os.path.join(dst_dir, name)
+    if os.path.exists(dst): dst = unique_dest_path(dst_dir, name)
+    return shutil.move(src, dst)
+
+def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
+    if not paths: return True
+    ok = True
+    for p in paths:
+        if not recycle_path_to_trash(p, hwnd):
+            ok = False
+    return ok
 
 def icon_bookmark_edit(theme: str):
     def paint(p: QPainter, w, h):
@@ -528,6 +536,92 @@ class FileOpWorker(QtCore.QThread):
             if self._cancel:
                 self.error.emit("Operation cancelled."); return
             self._done = max(self._done, self._total)
+            self._emit_progress(force=True)
+            self.finished_ok.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class DeleteWorker(QtCore.QThread):
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    finished_ok = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, paths: list, permanent: bool = False, hwnd: int = 0, parent=None):
+        super().__init__(parent)
+        self.paths = [p for p in paths if p]
+        self.permanent = permanent
+        self.hwnd = int(hwnd or 0)
+        self._cancel = False
+        self._total = max(1, len(self.paths))
+        self._done = 0
+        self._last_progress_pct = -1
+        self._last_progress_emit_ts = 0.0
+        self.deleted_count = 0
+        self.errors = []
+
+    def cancel(self):
+        self._cancel = True
+
+    def _emit_progress(self, force: bool = False):
+        total = max(1, int(self._total or 1))
+        pct = min(100, int(self._done * 100 / total))
+        now = time.perf_counter()
+        should_emit = (
+            force
+            or pct >= 100
+            or self._last_progress_pct < 0
+            or (
+                pct > self._last_progress_pct
+                and (
+                    (pct - self._last_progress_pct) >= 1
+                    or (now - self._last_progress_emit_ts) >= 0.05
+                )
+            )
+        )
+        if not should_emit:
+            return
+        self._last_progress_pct = pct
+        self._last_progress_emit_ts = now
+        self.progress.emit(pct)
+
+    def run(self):
+        try:
+            verb = "Deleting" if self.permanent else "Sending to Recycle Bin"
+            total = len(self.paths)
+            if total == 0:
+                self._done = self._total
+                self._emit_progress(force=True)
+                self.finished_ok.emit()
+                return
+
+            for idx, path in enumerate(self.paths, start=1):
+                if self._cancel:
+                    self.error.emit("Operation cancelled.")
+                    return
+
+                name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
+                self.status.emit(f"{verb} {idx}/{total}: {name}")
+
+                try:
+                    if not os.path.exists(path):
+                        self.deleted_count += 1
+                    elif self.permanent:
+                        remove_any(path)
+                        self.deleted_count += 1
+                    else:
+                        if recycle_path_to_trash(path, self.hwnd):
+                            self.deleted_count += 1
+                        else:
+                            self.errors.append(f"{path}: Could not move item to Recycle Bin.")
+                except Exception as e:
+                    self.errors.append(f"{path}: {e}")
+
+                self._done = idx
+                self._emit_progress()
+
+            self._done = self._total
             self._emit_progress(force=True)
             self.finished_ok.emit()
         except Exception as e:
@@ -4901,6 +4995,121 @@ class ExplorerPane(QWidget):
         worker.start()
         dlgp.open()
 
+    def _start_delete_op(self, paths, permanent: bool = False):
+        cur_worker = getattr(self, "_file_worker", None)
+        if cur_worker and cur_worker.isRunning():
+            self.host.flash_status("Another file operation is already running")
+            return
+
+        valid_paths = [p for p in paths if p]
+        if not valid_paths:
+            return
+
+        old_dlg = getattr(self, "_op_progress_dialog", None)
+        if old_dlg:
+            try:
+                old_dlg.close()
+                old_dlg.deleteLater()
+            except Exception:
+                pass
+            self._op_progress_dialog = None
+
+        verb = "Deleting" if permanent else "Moving to Recycle Bin"
+        hwnd = int(self.window().winId()) if (not permanent and HAS_PYWIN32) else 0
+        busy_mode = (
+            len(valid_paths) == 1
+            and os.path.isdir(valid_paths[0])
+            and not os.path.islink(valid_paths[0])
+        )
+
+        worker = DeleteWorker(valid_paths, permanent=permanent, hwnd=hwnd, parent=self)
+        dlgp = QProgressDialog(f"{verb}...", "Cancel", 0, 0 if busy_mode else 100, self)
+        dlgp.setWindowTitle("Delete files" if permanent else "Recycle Bin")
+        dlgp.setWindowModality(Qt.WindowModal)
+        dlgp.setAutoClose(True)
+        dlgp.setAutoReset(True)
+        dlgp.setMinimumDuration(0)
+
+        if not busy_mode:
+            worker.progress.connect(dlgp.setValue)
+        worker.status.connect(dlgp.setLabelText)
+        worker.status.connect(lambda s: self.host.statusBar().showMessage(s, 2000))
+
+        def _refresh_after_cancel():
+            self.refresh()
+            self.host.flash_status("Delete cancelled")
+
+        def _on_error(msg):
+            if msg == "Operation cancelled.":
+                QtCore.QTimer.singleShot(0, _refresh_after_cancel)
+                return
+            QtCore.QTimer.singleShot(0, self.refresh)
+            QMessageBox.critical(self, "Delete failed", msg)
+
+        def _finish_ok():
+            try:
+                if busy_mode:
+                    dlgp.setRange(0, 100)
+                dlgp.setValue(100)
+                dlgp.close()
+            except Exception:
+                pass
+
+            if not self._using_fast and not self._search_mode:
+                self.stat_proxy.clear_cache()
+            self.refresh()
+            self._request_visible_stats(0)
+            self._update_pane_status()
+
+            if worker.errors:
+                details = "\n".join(worker.errors)[:2000]
+                failed = len(worker.errors)
+                success_msg = (
+                    f"Deleted {worker.deleted_count} item(s)"
+                    if permanent else
+                    f"Sent {worker.deleted_count} item(s) to Recycle Bin"
+                )
+                if worker.deleted_count > 0:
+                    QMessageBox.warning(
+                        self,
+                        "Delete completed with errors",
+                        f"{success_msg}, but {failed} failed.\n\n{details}",
+                    )
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "Delete failed",
+                        details or "Could not delete the selected items.",
+                    )
+                self.host.flash_status(f"Delete finished with {failed} error(s)")
+                return
+
+            if permanent:
+                self.host.flash_status(f"Deleted {worker.deleted_count} item(s)")
+            else:
+                self.host.flash_status(f"Sent {worker.deleted_count} item(s) to Recycle Bin")
+
+        def _cleanup_worker():
+            if getattr(self, "_file_worker", None) is worker:
+                self._file_worker = None
+            try:
+                if getattr(self, "_op_progress_dialog", None) is dlgp:
+                    self._op_progress_dialog = None
+                dlgp.close()
+                dlgp.deleteLater()
+            except Exception:
+                pass
+            worker.deleteLater()
+
+        worker.error.connect(_on_error)
+        worker.finished.connect(_cleanup_worker)
+        worker.finished_ok.connect(_finish_ok)
+        dlgp.canceled.connect(worker.cancel)
+        self._file_worker = worker
+        self._op_progress_dialog = dlgp
+        worker.start()
+        dlgp.open()
+
 
     def delete_selection(self, permanent:bool=False):
         paths=self._selected_paths()
@@ -4910,18 +5119,7 @@ class ExplorerPane(QWidget):
         msg=f"{len(paths)} item(s) will be {action}.\n\nAre you sure?"
         btn=QMessageBox.question(self,title,msg,QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
         if btn!=QMessageBox.Yes: return
-        if permanent:
-            errors=[]
-            for p in paths:
-                try: remove_any(p)
-                except Exception as e: errors.append(f"{p}: {e}")
-            if errors: QMessageBox.critical(self,"Delete failed","\n".join(errors)[:2000])
-            else: self.host.flash_status(f"Deleted {len(paths)} item(s)")
-            self.refresh(); return
-        hwnd=int(self.window().winId()) if HAS_PYWIN32 else 0
-        ok=recycle_to_trash(paths, hwnd)
-        if ok: self.host.flash_status(f"Sent {len(paths)} item(s) to Recycle Bin"); self.refresh()
-        else: QMessageBox.critical(self,"Delete failed","Could not move items to Recycle Bin.")
+        self._start_delete_op(paths, permanent=permanent)
 
     def rename_selection(self):
         paths=self._selected_paths()
