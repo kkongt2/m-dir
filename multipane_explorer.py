@@ -105,6 +105,226 @@ except Exception:
     HAS_PYWIN32 = False
 
 
+def _dedupe_local_paths(paths):
+    out = []
+    seen = set()
+    for raw in paths or ():
+        if not raw:
+            continue
+        try:
+            path = os.path.normpath(os.fspath(raw))
+        except Exception:
+            continue
+        key = os.path.normcase(path) if sys.platform == "win32" else path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _decode_preferred_drop_effect(raw):
+    try:
+        data = bytes(raw) if raw is not None else b""
+    except Exception:
+        return None
+    if len(data) < 4:
+        return None
+    return int.from_bytes(data[:4], byteorder="little", signed=False)
+
+
+def _drop_effect_to_operation(effect):
+    if effect is None:
+        return None
+    if effect & 2:
+        return "move"
+    if effect & 1:
+        return "copy"
+    return None
+
+
+def _read_windows_file_clipboard_payload():
+    if sys.platform != "win32" or not HAS_PYWIN32:
+        return None
+    try:
+        drop_effect_fmt = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
+        win32clipboard.OpenClipboard()
+        try:
+            paths = []
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                data = win32clipboard.GetClipboardData(win32con.CF_HDROP)
+                if isinstance(data, (tuple, list)):
+                    paths = [os.fspath(p) for p in data if p]
+                elif data:
+                    paths = [os.fspath(data)]
+            effect = None
+            if win32clipboard.IsClipboardFormatAvailable(drop_effect_fmt):
+                effect = _decode_preferred_drop_effect(
+                    win32clipboard.GetClipboardData(drop_effect_fmt)
+                )
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+    paths = _dedupe_local_paths(paths)
+    if not paths:
+        return None
+    return {"op": _drop_effect_to_operation(effect) or "copy", "paths": paths}
+
+
+def _normalize_file_clipboard_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+    paths = _dedupe_local_paths(payload.get("paths") or [])
+    if not paths:
+        return None
+    op = str(payload.get("op") or "copy").strip().lower()
+    if op not in {"copy", "cut", "move"}:
+        op = "copy"
+    return {"op": op, "paths": paths}
+
+
+def _clipboard_operation_to_drop_effect(op):
+    return 2 if str(op).strip().lower() in {"cut", "move"} else 1
+
+
+def _write_windows_file_clipboard_payload(payload):
+    payload = _normalize_file_clipboard_payload(payload)
+    if sys.platform != "win32" or not HAS_PYWIN32 or not payload:
+        return False
+
+    class _Point(ctypes.Structure):
+        _fields_ = [
+            ("x", ctypes.c_long),
+            ("y", ctypes.c_long),
+        ]
+
+    class _DropFiles(ctypes.Structure):
+        _fields_ = [
+            ("pFiles", ctypes.c_uint32),
+            ("pt", _Point),
+            ("fNC", ctypes.c_int),
+            ("fWide", ctypes.c_int),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    global_alloc = kernel32.GlobalAlloc
+    global_alloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    global_alloc.restype = ctypes.c_void_p
+    global_lock = kernel32.GlobalLock
+    global_lock.argtypes = [ctypes.c_void_p]
+    global_lock.restype = ctypes.c_void_p
+    global_unlock = kernel32.GlobalUnlock
+    global_unlock.argtypes = [ctypes.c_void_p]
+    global_unlock.restype = ctypes.c_int
+    global_free = kernel32.GlobalFree
+    global_free.argtypes = [ctypes.c_void_p]
+    global_free.restype = ctypes.c_void_p
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = [ctypes.c_void_p]
+    open_clipboard.restype = ctypes.c_int
+    empty_clipboard = user32.EmptyClipboard
+    empty_clipboard.argtypes = []
+    empty_clipboard.restype = ctypes.c_int
+    set_clipboard_data = user32.SetClipboardData
+    set_clipboard_data.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    set_clipboard_data.restype = ctypes.c_void_p
+    close_clipboard = user32.CloseClipboard
+    close_clipboard.argtypes = []
+    close_clipboard.restype = ctypes.c_int
+    register_clipboard_format = user32.RegisterClipboardFormatW
+    register_clipboard_format.argtypes = [ctypes.c_wchar_p]
+    register_clipboard_format.restype = ctypes.c_uint
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+
+    def _alloc_global_bytes(raw):
+        handle = global_alloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(raw))
+        if not handle:
+            raise OSError("GlobalAlloc failed")
+        ptr = global_lock(handle)
+        if not ptr:
+            global_free(handle)
+            raise OSError("GlobalLock failed")
+        try:
+            ctypes.memmove(ptr, raw, len(raw))
+        finally:
+            global_unlock(handle)
+        return handle
+
+    file_list = ("\0".join(payload["paths"]) + "\0\0").encode("utf-16le")
+    dropfiles = _DropFiles()
+    dropfiles.pFiles = ctypes.sizeof(_DropFiles)
+    dropfiles.fNC = 0
+    dropfiles.fWide = 1
+    hdrop = None
+    heffect = None
+
+    try:
+        hdrop = _alloc_global_bytes(bytes(dropfiles) + file_list)
+        heffect = _alloc_global_bytes(
+            _clipboard_operation_to_drop_effect(payload["op"]).to_bytes(4, "little")
+        )
+        effect_fmt = register_clipboard_format("Preferred DropEffect")
+
+        opened = False
+        for _ in range(8):
+            if open_clipboard(None):
+                opened = True
+                break
+            time.sleep(0.03)
+        if not opened:
+            return False
+        try:
+            if not empty_clipboard():
+                return False
+            if not set_clipboard_data(win32con.CF_HDROP, hdrop):
+                return False
+            hdrop = None
+            if not set_clipboard_data(effect_fmt, heffect):
+                return False
+            heffect = None
+            return True
+        finally:
+            close_clipboard()
+    except Exception:
+        return False
+    finally:
+        if hdrop:
+            global_free(hdrop)
+        if heffect:
+            global_free(heffect)
+
+
+def _clear_windows_clipboard():
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = [ctypes.c_void_p]
+    open_clipboard.restype = ctypes.c_int
+    empty_clipboard = user32.EmptyClipboard
+    empty_clipboard.argtypes = []
+    empty_clipboard.restype = ctypes.c_int
+    close_clipboard = user32.CloseClipboard
+    close_clipboard.argtypes = []
+    close_clipboard.restype = ctypes.c_int
+    opened = False
+    for _ in range(8):
+        if open_clipboard(None):
+            opened = True
+            break
+        time.sleep(0.03)
+    if not opened:
+        return False
+    try:
+        return bool(empty_clipboard())
+    finally:
+        close_clipboard()
+
+
 try:
     from send2trash import send2trash
     HAS_SEND2TRASH = True
@@ -635,244 +855,171 @@ def _common_css():
     QAbstractScrollArea::viewport {{ margin: 0; padding: 0; }}
     QLineEdit[clearButtonEnabled="true"] {{ padding-right: 22px; }}
     QToolTip {{ border: 1px solid rgba(0,0,0,0.25); }}
-
     QTreeView {{ padding: {TREE_PAD}px; }}
     QTreeView::item {{ padding: {ITEM_VPAD}px 6px; }}
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
     QToolButton#quickBookmarkBtn {{ text-align: left; }}
-
     QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
 
-def apply_dark_style(app: QApplication):
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(28, 30, 34))
-    pal.setColor(QPalette.Base, QColor(22, 24, 28))
-    pal.setColor(QPalette.AlternateBase, QColor(30, 32, 36))
-    pal.setColor(QPalette.Text, QColor(230, 233, 238))
-    pal.setColor(QPalette.ButtonText, QColor(230, 233, 238))
-    pal.setColor(QPalette.WindowText, QColor(230, 233, 238))
-    pal.setColor(QPalette.ToolTipBase, QColor(255,255,255))
-    pal.setColor(QPalette.ToolTipText, QColor(30,30,30))
-    pal.setColor(QPalette.Highlight, QColor(64, 128, 255))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    pal.setColor(QPalette.Button, QColor(38, 40, 46))
-    app.setPalette(pal)
-    app.setStyleSheet(_common_css() + """
-        QMainWindow { background: #1C1E22; }
-        QLineEdit, QPushButton, QToolButton {
-            background: #26282E; border: 1px solid #33363D; border-radius: 8px;
-            color: #E6E9EE; min-height: 0px;
-        }
-        QToolButton[busy="true"] {
-            background: #2B3E62;
-            border: 1px solid #5E9BFF;
-            color: #EAF1FF;
-            font-weight: 600;
-        }
-        QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus {
-            border: 2px solid #8FC1FF;
-        }
-        QTreeView:focus { border: 2px solid #8FC1FF; }
-        QTreeView {
-            background: #16181C; alternate-background-color: #1E2026;
-            border: 1px solid #2B2E34; border-radius: 10px;
-        }
-        QTreeView::item { color: #E6E9EE; }
-        QTreeView::item:selected { background: #4068FF; color: white; }
-        QTreeView::item:hover { background: rgba(160,190,255,0.22); }
+def _star_polygon(cx, cy, r, inner_ratio=0.45):
+    return QPolygonF([
+        QtCore.QPointF(cx + math.cos(-math.pi/2 + i * math.pi/5) * (r if i % 2 == 0 else r * inner_ratio),
+                       cy + math.sin(-math.pi/2 + i * math.pi/5) * (r if i % 2 == 0 else r * inner_ratio))
+        for i in range(10)
+    ])
 
-        QHeaderView::section {
-            background: #20232A; color: #D6DAE2; border: 0; border-right: 1px solid #2E3138;
-        }
-        QMenu { background-color: #20232A; color: #E6E9EE; border: 1px solid #2B2E34; border-radius: 8px; }
+def _setup_readonly_table(table: QTableWidget, labels, resize_modes, row_count=None):
+    table.setColumnCount(len(labels)); table.setHorizontalHeaderLabels(list(labels))
+    if row_count is not None: table.setRowCount(row_count)
+    header = table.horizontalHeader()
+    for col, mode in enumerate(resize_modes):
+        header.setSectionResizeMode(col, mode)
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    return table
+
+def _set_table_row_items(table: QTableWidget, row: int, *values):
+    for col, value in enumerate(values):
+        table.setItem(row, col, QTableWidgetItem("" if value is None else str(value)))
+
+def _add_dialog_button_box(layout, parent, buttons, accept_slot, reject_slot=None):
+    btns = QDialogButtonBox(buttons, parent)
+    if accept_slot: btns.accepted.connect(accept_slot)
+    if reject_slot: btns.rejected.connect(reject_slot)
+    layout.addWidget(btns)
+    return btns
+
+def _empty_bookmark_item():
+    return {"enabled": False, "name": "", "path": ""}
+
+def _apply_palette_colors(widget, colors):
+    pal = widget.palette()
+    for role, rgb in colors.items(): pal.setColor(role, QColor(*rgb))
+    widget.setPalette(pal)
+
+_THEME_PALETTE_SHARED = {
+    QPalette.ToolTipBase: (255, 255, 255),
+    QPalette.Highlight: (64, 128, 255),
+    QPalette.HighlightedText: (255, 255, 255),
+}
+_THEME_CSS_SHARED = {
+    "busy_border": "#5E9BFF",
+    "tree_selected_fg": "#FFFFFF",
+    "active_root_border": "#5E9BFF",
+    "message_box_css": "",
+}
+_THEME_CSS_TEMPLATE = """
+        QMainWindow { background: %(window_bg)s; }
+        QLineEdit, QPushButton, QToolButton { background: %(control_bg)s; border: 1px solid %(control_border)s; border-radius: 8px; color: %(control_fg)s; min-height: 0px; }
+        QToolButton[busy="true"] { background: %(busy_bg)s; border: 1px solid %(busy_border)s; color: %(busy_fg)s; font-weight: 600; }
+        QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus { border: 2px solid %(focus_border)s; }
+        QTreeView:focus { border: 2px solid %(focus_border)s; }
+        QTreeView { background: %(tree_bg)s; alternate-background-color: %(tree_alt_bg)s; border: 1px solid %(tree_border)s; border-radius: 10px; }
+        QTreeView::item { color: %(tree_fg)s; }
+        QTreeView::item:selected { background: %(tree_selected_bg)s; color: %(tree_selected_fg)s; }
+        QTreeView::item:hover { %(tree_hover_rule)s; }
+        QHeaderView::section { background: %(header_bg)s; color: %(header_fg)s; border: 0; border-right: 1px solid %(header_border)s; }
+        QMenu { background-color: %(menu_bg)s; color: %(menu_fg)s; border: 1px solid %(menu_border)s; border-radius: 8px; }
         QMenu::item { padding: 6px 12px; }
-        QMenu::item:selected { background: #2D3550; }
-
-        /* Default crumb button */
-        QPushButton#crumb {
-            background: rgba(255,255,255,0.05);
-            border: 1px solid #2B2E34;
-            padding: 0 6px; border-radius: 6px; text-align: left; color: #E6E9EE;
-        }
-        QPushButton#crumb:hover { background: rgba(255,255,255,0.09); }
-        QLabel#crumbSep { color: #7F8796; }
-
-        /* Remove border/background from breadcrumb scroll area */
-        QScrollArea#crumbScroll { border: 0px solid transparent; }
-        QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
+        QMenu::item:selected { background: %(menu_selected_bg)s; }
+        QPushButton#crumb { background: %(crumb_bg)s; border: 1px solid %(crumb_border)s; padding: 0 6px; border-radius: 6px; text-align: left; color: %(crumb_fg)s; }
+        QPushButton#crumb:hover { background: %(crumb_hover_bg)s; }
+        QLabel#crumbSep { color: %(crumb_sep)s; }
+        QScrollArea#crumbScroll, QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
-
-        /* Active pane: highlight only crumb buttons */
-        QWidget#paneRoot[active="true"] QPushButton#crumb {
-            background: rgba(94,155,255,0.16);
-            border-color: rgba(94,155,255,0.40);
-        }
-        QWidget#paneRoot[active="true"] QPushButton#crumb:hover {
-            background: rgba(94,155,255,0.22);
-        }
-
-        /* Pane-level active highlight */
-        QWidget#paneRoot {
-            border: 1px solid transparent;
-            border-radius: 10px;
-        }
-        QWidget#paneRoot[active="true"] {
-            border: 1px solid #5E9BFF;
-            background: rgba(94, 155, 255, 0.06);
-        }
-        QWidget#paneRoot[active="true"] QTreeView { border-color: rgba(94,155,255,0.45); }
-        QWidget#paneRoot[active="true"] QLineEdit { border: 1px solid rgba(94,155,255,0.35); }
-        QWidget#paneRoot[active="true"] QLineEdit:focus { border: 1px solid #5E9BFF; }
-        QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton {
-            border-color: rgba(94,155,255,0.25);
-        }
-
-        QWidget#paneRoot[drop_target="true"] {
-            border: 2px solid #34C88A;
-            background: rgba(52, 200, 138, 0.14);
-        }
-        QWidget#paneRoot[drop_target="true"] QTreeView { border-color: rgba(52,200,138,0.70); }
-        QWidget#paneRoot[drop_target="true"] QLineEdit { border-color: rgba(52,200,138,0.58); }
-
-        /* Message boxes: white background, black text */
+        QWidget#paneRoot { border: 1px solid transparent; border-radius: 10px; }
+        QWidget#paneRoot[active="true"] { border: 1px solid %(active_root_border)s; background: %(active_root_bg)s; }
+        QWidget#paneRoot[active="true"] QPushButton#crumb { background: %(active_crumb_bg)s; border-color: %(active_crumb_border)s; }
+        QWidget#paneRoot[active="true"] QPushButton#crumb:hover { background: %(active_crumb_hover_bg)s; }
+        QWidget#paneRoot[active="true"] QTreeView { border-color: %(active_tree_border)s; }
+        QWidget#paneRoot[active="true"] QLineEdit { border: 1px solid %(active_lineedit_border)s; }
+        QWidget#paneRoot[active="true"] QLineEdit:focus { border: 1px solid %(active_root_border)s; }
+        QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton { border-color: %(active_btn_border)s; }
+        QWidget#paneRoot[drop_target="true"] { border: 2px solid %(drop_border)s; background: %(drop_bg)s; }
+        QWidget#paneRoot[drop_target="true"] QTreeView { border-color: %(drop_tree_border)s; }
+        QWidget#paneRoot[drop_target="true"] QLineEdit { border-color: %(drop_lineedit_border)s; }
+        %(message_box_css)s
+    """
+_THEME_STYLE_SPECS = {
+    "dark": {
+        "palette": _THEME_PALETTE_SHARED | {
+            QPalette.Window: (28, 30, 34), QPalette.Base: (22, 24, 28), QPalette.AlternateBase: (30, 32, 36),
+            QPalette.Text: (230, 233, 238), QPalette.ButtonText: (230, 233, 238), QPalette.WindowText: (230, 233, 238),
+            QPalette.ToolTipText: (30, 30, 30), QPalette.Button: (38, 40, 46),
+        },
+        "css": _THEME_CSS_SHARED | {
+            "window_bg": "#1C1E22", "control_bg": "#26282E", "control_border": "#33363D", "control_fg": "#E6E9EE",
+            "busy_bg": "#2B3E62", "busy_fg": "#EAF1FF", "focus_border": "#8FC1FF",
+            "tree_bg": "#16181C", "tree_alt_bg": "#1E2026", "tree_border": "#2B2E34", "tree_fg": "#E6E9EE",
+            "tree_selected_bg": "#4068FF", "tree_hover_rule": "background: rgba(160,190,255,0.22)",
+            "header_bg": "#20232A", "header_fg": "#D6DAE2", "header_border": "#2E3138",
+            "menu_bg": "#20232A", "menu_fg": "#E6E9EE", "menu_border": "#2B2E34", "menu_selected_bg": "#2D3550",
+            "crumb_bg": "rgba(255,255,255,0.05)", "crumb_border": "#2B2E34", "crumb_fg": "#E6E9EE",
+            "crumb_hover_bg": "rgba(255,255,255,0.09)", "crumb_sep": "#7F8796",
+            "active_root_bg": "rgba(94, 155, 255, 0.06)", "active_crumb_bg": "rgba(94,155,255,0.16)",
+            "active_crumb_border": "rgba(94,155,255,0.40)", "active_crumb_hover_bg": "rgba(94,155,255,0.22)",
+            "active_tree_border": "rgba(94,155,255,0.45)", "active_lineedit_border": "rgba(94,155,255,0.35)",
+            "active_btn_border": "rgba(94,155,255,0.25)", "drop_border": "#34C88A", "drop_bg": "rgba(52, 200, 138, 0.14)",
+            "drop_tree_border": "rgba(52,200,138,0.70)", "drop_lineedit_border": "rgba(52,200,138,0.58)",
+            "message_box_css": """
         QMessageBox { background: #FFFFFF; color: #000000; }
         QMessageBox QLabel { color: #000000; }
-        QMessageBox QPushButton {
-            color: #000000;
-            background: #F2F4F8;
-            border: 1px solid #D0D5DD;
-            border-radius: 6px;
-            padding: 4px 10px;
-        }
+        QMessageBox QPushButton { color: #000000; background: #F2F4F8; border: 1px solid #D0D5DD; border-radius: 6px; padding: 4px 10px; }
         QMessageBox QPushButton:hover { background: #EAEFFF; }
-    """)
+    """,
+        },
+    },
+    "light": {
+        "palette": _THEME_PALETTE_SHARED | {
+            QPalette.Window: (248, 249, 251), QPalette.Base: (255, 255, 255), QPalette.AlternateBase: (246, 248, 250),
+            QPalette.Text: (28, 28, 30), QPalette.ButtonText: (28, 28, 30), QPalette.WindowText: (28, 28, 30),
+            QPalette.ToolTipText: (28, 28, 30), QPalette.Button: (242, 244, 248),
+        },
+        "css": _THEME_CSS_SHARED | {
+            "window_bg": "#F8F9FB", "control_bg": "#FFFFFF", "control_border": "#DDE1E6", "control_fg": "#1C1C1E",
+            "busy_bg": "#EAF2FF", "busy_fg": "#1A3B8A", "focus_border": "#2A63FF",
+            "tree_bg": "#FFFFFF", "tree_alt_bg": "#F6F8FA", "tree_border": "#DDE1E6", "tree_fg": "#1A1A1A",
+            "tree_selected_bg": "#2A63FF", "tree_hover_rule": "background: rgba(64,104,255,0.14); color: #1A1A1A",
+            "header_bg": "#F1F3F7", "header_fg": "#333", "header_border": "#E5E8EE",
+            "menu_bg": "#FFFFFF", "menu_fg": "#1C1C1E", "menu_border": "#CED3DB", "menu_selected_bg": "#EAEFFF",
+            "crumb_bg": "rgba(0,0,0,0.04)", "crumb_border": "#E5E8EE", "crumb_fg": "#1C1C1E",
+            "crumb_hover_bg": "rgba(0,0,0,0.07)", "crumb_sep": "#7A7F89",
+            "active_root_bg": "rgba(64, 128, 255, 0.06)", "active_crumb_bg": "rgba(64,128,255,0.12)",
+            "active_crumb_border": "rgba(64,128,255,0.40)", "active_crumb_hover_bg": "rgba(64,128,255,0.18)",
+            "active_tree_border": "rgba(64,128,255,0.40)", "active_lineedit_border": "rgba(64,128,255,0.35)",
+            "active_btn_border": "rgba(64,128,255,0.25)", "drop_border": "#22A96A", "drop_bg": "rgba(34, 169, 106, 0.10)",
+            "drop_tree_border": "rgba(34,169,106,0.62)", "drop_lineedit_border": "rgba(34,169,106,0.50)",
+        },
+    },
+}
 
-def apply_light_style(app: QApplication):
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(248, 249, 251))
-    pal.setColor(QPalette.Base, QColor(255, 255, 255))
-    pal.setColor(QPalette.AlternateBase, QColor(246, 248, 250))
-    pal.setColor(QPalette.Text, QColor(28, 28, 30))
-    pal.setColor(QPalette.ButtonText, QColor(28, 28, 30))
-    pal.setColor(QPalette.WindowText, QColor(28, 28, 30))
-    pal.setColor(QPalette.ToolTipBase, QColor(255,255,255))
-    pal.setColor(QPalette.ToolTipText, QColor(28,28,30))
-    pal.setColor(QPalette.Highlight, QColor(64, 128, 255))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    pal.setColor(QPalette.Button, QColor(242, 244, 248))
-    app.setPalette(pal)
-    app.setStyleSheet(_common_css() + """
-        QMainWindow { background: #F8F9FB; }
-        QLineEdit, QPushButton, QToolButton {
-            background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 8px;
-            color: #1C1C1E; min-height: 0px;
-        }
-        QToolButton[busy="true"] {
-            background: #EAF2FF;
-            border: 1px solid #5E9BFF;
-            color: #1A3B8A;
-            font-weight: 600;
-        }
-        QLineEdit:focus, QPushButton:focus, QToolButton:focus, QComboBox:focus {
-            border: 2px solid #2A63FF;
-        }
-        QTreeView:focus { border: 2px solid #2A63FF; }
-        QTreeView {
-            background: #FFFFFF; alternate-background-color: #F6F8FA;
-            border: 1px solid #DDE1E6; border-radius: 10px;
-        }
-        QTreeView::item { color: #1A1A1A; }
-        QTreeView::item:selected { background: #2A63FF; color: #FFFFFF; }
-        QTreeView::item:hover { background: rgba(64,104,255,0.14); color: #1A1A1A; }
+def _apply_theme(app: QApplication, theme: str):
+    spec = _THEME_STYLE_SPECS["light" if theme == "light" else "dark"]
+    _apply_palette_colors(app, spec["palette"])
+    app.setStyleSheet(_common_css() + (_THEME_CSS_TEMPLATE % spec["css"]))
 
-        QHeaderView::section {
-            background: #F1F3F7; color: #333; border: 0; border-right: 1px solid #E5E8EE;
-        }
-        QMenu { background-color: #FFFFFF; color: #1C1C1E; border: 1px solid #CED3DB; border-radius: 8px; }
-        QMenu::item { padding: 6px 12px; }
-        QMenu::item:selected { background: #EAEFFF; }
-
-        /* Default crumb button */
-        QPushButton#crumb {
-            background: rgba(0,0,0,0.04);
-            border: 1px solid #E5E8EE;
-            padding: 0 6px; border-radius: 6px; text-align: left; color: #1C1C1E;
-        }
-        QPushButton#crumb:hover { background: rgba(0,0,0,0.07); }
-        QLabel#crumbSep { color: #7A7F89; }
-
-        /* Remove border/background from breadcrumb scroll area */
-        QScrollArea#crumbScroll { border: 0px solid transparent; }
-        QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
-        QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
-
-        /* Active pane: highlight only crumb buttons */
-        QWidget#paneRoot[active="true"] QPushButton#crumb {
-            background: rgba(64,128,255,0.12);
-            border-color: rgba(64,128,255,0.40);
-        }
-        QWidget#paneRoot[active="true"] QPushButton#crumb:hover {
-            background: rgba(64,128,255,0.18);
-        }
-
-        /* Pane-level active highlight */
-        QWidget#paneRoot {
-            border: 1px solid transparent;
-            border-radius: 10px;
-        }
-        QWidget#paneRoot[active="true"] {
-            border: 1px solid #5E9BFF;
-            background: rgba(64, 128, 255, 0.06);
-        }
-        QWidget#paneRoot[active="true"] QTreeView { border-color: rgba(64,128,255,0.40); }
-        QWidget#paneRoot[active="true"] QLineEdit { border: 1px solid rgba(64,128,255,0.35); }
-        QWidget#paneRoot[active="true"] QLineEdit:focus { border: 1px solid #5E9BFF; }
-        QWidget#paneRoot[active="true"] QToolButton, QWidget#paneRoot[active="true"] QPushButton {
-            border-color: rgba(64,128,255,0.25);
-        }
-        QWidget#paneRoot[drop_target="true"] {
-            border: 2px solid #22A96A;
-            background: rgba(34, 169, 106, 0.10);
-        }
-        QWidget#paneRoot[drop_target="true"] QTreeView { border-color: rgba(34,169,106,0.62); }
-        QWidget#paneRoot[drop_target="true"] QLineEdit { border-color: rgba(34,169,106,0.50); }
-    """)
-
-def apply_theme_by_name(app: QApplication, theme: str):
-    if theme == "light":
-        apply_light_style(app)
-    else:
-        apply_dark_style(app)
+def apply_dark_style(app: QApplication): _apply_theme(app, "dark")
+def apply_light_style(app: QApplication): _apply_theme(app, "light")
+def apply_theme_by_name(app: QApplication, theme: str): _apply_theme(app, theme)
 
 
 
 def icon_copy_squares(theme: str):
     def paint(p: QPainter, w, h):
-
         stroke = QColor(210, 214, 225) if theme == "dark" else QColor(85, 95, 115)
         fill   = QColor(255, 255, 255)
-
         p.setRenderHint(QPainter.Antialiasing, True)
         pen = QPen(stroke, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         p.setPen(pen)
         p.setBrush(QBrush(fill))
-
-
         front_rect = QtCore.QRect(6, 3, 11, 11)
         back_rect  = QtCore.QRect(3, 6, 11, 11)
         radius = 3
-
-
         p.drawRoundedRect(front_rect, radius, radius)
-
-
         p.drawRoundedRect(back_rect, radius, radius)
-
     return _make_icon(20, 20, paint)
-
-
 def _make_icon(w, h, painter_fn):
     pm = QPixmap(w, h); pm.fill(Qt.transparent)
     p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing, True)
@@ -913,43 +1060,24 @@ def icon_theme_toggle(theme: str):
 def icon_session(theme: str):
     def paint(p: QPainter, w, h):
         p.setRenderHint(QPainter.Antialiasing, True)
-
-
         line = QColor(190, 195, 210) if theme == "dark" else QColor(90, 100, 120)
         fill = QColor(60, 66, 80) if theme == "dark" else QColor(245, 247, 250)
         tab  = QColor(100, 150, 255) if theme == "dark" else QColor(80, 120, 230)
         star_fill  = QColor(255, 210, 60)
         star_edge  = QColor(160, 120, 0)
-
-
         p.setPen(QPen(line, 1.3))
         p.setBrush(QBrush(fill))
         p.drawRoundedRect(QtCore.QRectF(3.0, 6.5, 12.5, 9.0), 2.5, 2.5)
         p.drawRoundedRect(QtCore.QRectF(5.0, 5.0, 12.5, 9.0), 2.5, 2.5)
         p.setBrush(QBrush(tab))
         p.drawRoundedRect(QtCore.QRectF(7.0, 3.5, 12.5, 9.0), 2.5, 2.5)
-
-
-        cx, cy, r = w - 6.0, h - 6.0, 3.2
-        pts = []
-        for i in range(10):
-            ang = -math.pi/2 + i * (math.pi/5.0)
-            rad = r if (i % 2 == 0) else r * 0.44
-            pts.append(QtCore.QPointF(cx + math.cos(ang)*rad, cy + math.sin(ang)*rad))
         p.setPen(QPen(star_edge, 1.0))
         p.setBrush(QBrush(star_fill))
-        p.drawPolygon(QPolygonF(pts))
-
+        p.drawPolygon(_star_polygon(w - 6.0, h - 6.0, 3.2, inner_ratio=0.44))
     return _make_icon(22, 22, paint)
-
-
 def icon_star(checked: bool, theme: str):
     def paint(p: QPainter, w, h):
-        cx, cy, r = w/2, h/2, min(w,h)/2.6; pts = []
-        for i in range(10):
-            angle = -math.pi/2 + i * math.pi/5; rad = r if i % 2 == 0 else r*0.45
-            pts.append(QtCore.QPointF(cx + math.cos(angle)*rad, cy + math.sin(angle)*rad))
-        poly = QPolygonF(pts)
+        poly = _star_polygon(w/2, h/2, min(w,h)/2.6)
         if checked:
             p.setBrush(QBrush(QColor(255, 200, 0))); p.setPen(QPen(QColor(160,120,0), 1.2))
         else:
@@ -2721,24 +2849,14 @@ class BulkRenameDialog(QDialog):
 
         self.lbl_summary = QLabel("", self)
         lay.addWidget(self.lbl_summary)
-
-        self.tbl = QTableWidget(self)
-        self.tbl.setColumnCount(4)
-        self.tbl.setHorizontalHeaderLabels(["Current Name", "New Name", "Folder", "Status"])
-        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl = _setup_readonly_table(
+            QTableWidget(self),
+            ["Current Name", "New Name", "Folder", "Status"],
+            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch, QHeaderView.ResizeToContents],
+        )
         lay.addWidget(self.tbl, 1)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        btns = _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         self.btn_ok = btns.button(QDialogButtonBox.Ok)
-        lay.addWidget(btns)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-
         for w in (self.ed_prefix, self.ed_suffix, self.ed_find, self.ed_replace, self.ed_sep):
             w.textChanged.connect(self._rebuild_preview)
         for w in (self.chk_case, self.chk_number):
@@ -2869,10 +2987,7 @@ class BulkRenameDialog(QDialog):
                 changed += 1
             if r.get("error"):
                 errors += 1
-            self.tbl.setItem(i, 0, QTableWidgetItem(old_name))
-            self.tbl.setItem(i, 1, QTableWidgetItem(new_name))
-            self.tbl.setItem(i, 2, QTableWidgetItem(folder))
-            self.tbl.setItem(i, 3, QTableWidgetItem(status))
+            _set_table_row_items(self.tbl, i, old_name, new_name, folder, status)
         self.tbl.resizeColumnsToContents()
         self.btn_ok.setEnabled(changed > 0 and errors == 0)
         self.lbl_summary.setText(
@@ -2880,17 +2995,11 @@ class BulkRenameDialog(QDialog):
         )
 
     def result_operations(self) -> list[tuple[str, str]]:
-        out = []
-        for r in self._plan:
-            if r.get("error"):
-                continue
-            if r.get("status") != "ready":
-                continue
-            src = r.get("src", "")
-            dst = r.get("dst", "")
-            if src and dst:
-                out.append((src, dst))
-        return out
+        return [
+            (r.get("src", ""), r.get("dst", ""))
+            for r in self._plan
+            if not r.get("error") and r.get("status") == "ready" and r.get("src") and r.get("dst")
+        ]
 
 
 class ConflictResolutionDialog(QDialog):
@@ -2918,47 +3027,31 @@ class ConflictResolutionDialog(QDialog):
         lay.addLayout(top)
 
 
-        self.tbl = QTableWidget(self)
-        self.tbl.setColumnCount(3)
-        self.tbl.setHorizontalHeaderLabels(["Name", "Destination", "Action"])
-        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tbl.setRowCount(len(conflicts))
+        self.tbl = _setup_readonly_table(
+            QTableWidget(self),
+            ["Name", "Destination", "Action"],
+            [QHeaderView.ResizeToContents, QHeaderView.Stretch, QHeaderView.ResizeToContents],
+            row_count=len(conflicts),
+        )
         self._combos = []
-
         for r, (src, dst) in enumerate(conflicts):
             name = os.path.basename(src)
-            self.tbl.setItem(r, 0, QTableWidgetItem(name))
-            self.tbl.setItem(r, 1, QTableWidgetItem(dst))
+            _set_table_row_items(self.tbl, r, name, dst)
             combo = QComboBox(self.tbl)
             combo.addItems(["Overwrite", "Skip", "Copy"])
             self.tbl.setCellWidget(r, 2, combo)
             self._combos.append(combo)
-
         lay.addWidget(self.tbl, 1)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
-        lay.addWidget(btns)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-
-
+        _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         btn_over.clicked.connect(lambda: self._apply_all("Overwrite"))
         btn_skip.clicked.connect(lambda: self._apply_all("Skip"))
         btn_copy.clicked.connect(lambda: self._apply_all("Copy"))
-
-
         theme = getattr(getattr(parent, "host", None), "theme", "dark")
         if theme == "dark":
-            pal = self.palette()
-            pal.setColor(QPalette.Window, QColor(255, 255, 255))
-            pal.setColor(QPalette.Base, QColor(255, 255, 255))
-            pal.setColor(QPalette.AlternateBase, QColor(245, 245, 245))
-            pal.setColor(QPalette.Text, QColor(0, 0, 0))
-            pal.setColor(QPalette.ButtonText, QColor(0, 0, 0))
-            pal.setColor(QPalette.WindowText, QColor(0, 0, 0))
-            self.setPalette(pal)
+            _apply_palette_colors(self, {
+                QPalette.Window: (255, 255, 255), QPalette.Base: (255, 255, 255), QPalette.AlternateBase: (245, 245, 245),
+                QPalette.Text: (0, 0, 0), QPalette.ButtonText: (0, 0, 0), QPalette.WindowText: (0, 0, 0),
+            })
             self.setStyleSheet("""
                 QDialog, QLabel, QTableWidget, QLineEdit { color: #000000; background: #FFFFFF; }
                 QHeaderView::section { color: #000000; background: #F1F3F7; border: 0; border-right: 1px solid #E5E8EE; }
@@ -2974,12 +3067,11 @@ class ConflictResolutionDialog(QDialog):
             if idx >= 0: c.setCurrentIndex(idx)
 
     def result_map(self) -> dict:
-        out = {}
-        for (src, _dst), combo in zip(self._conflicts, self._combos):
-            choice = combo.currentText().strip().lower()
-            if choice not in ("overwrite","skip","copy"): choice="overwrite"
-            out[src] = choice
-        return out
+        return {
+            src: (choice if choice in ("overwrite", "skip", "copy") else "overwrite")
+            for (src, _dst), combo in zip(self._conflicts, self._combos)
+            for choice in [combo.currentText().strip().lower()]
+        }
 
 
 class ExplorerView(QTreeView):
@@ -4807,67 +4899,52 @@ class ExplorerPane(QWidget):
     def copy_selection(self):
         paths=self._selected_paths()
         if not paths: return
-        self.host.set_clipboard({"op":"copy","paths":paths}); self.host.flash_status(f"Copied {len(paths)} item(s)")
+        if self.host.set_clipboard({"op":"copy","paths":paths}):
+            self.host.flash_status(f"Copied {len(paths)} item(s)")
+        else:
+            self.host.flash_status("Failed to copy items to clipboard")
     def cut_selection(self):
         paths=self._selected_paths()
         if not paths: return
-        self.host.set_clipboard({"op":"cut","paths":paths}); self.host.flash_status(f"Cut {len(paths)} item(s)")
+        if self.host.set_clipboard({"op":"cut","paths":paths}):
+            self.host.flash_status(f"Cut {len(paths)} item(s)")
+        else:
+            self.host.flash_status("Failed to cut items to clipboard")
 
     def _external_clipboard_payload(self):
         try:
             cb = QApplication.clipboard()
             md = cb.mimeData()
         except Exception:
-            return None
-        if not md or not md.hasUrls():
+            md = None
+
+        if sys.platform == "win32":
+            native_payload = _read_windows_file_clipboard_payload()
+            if native_payload:
+                return native_payload
+
+        if not md:
             return None
 
-        urls = md.urls()
-
-        paths = list(dict.fromkeys(u.toLocalFile() for u in urls if u.isLocalFile()))
+        try:
+            paths = _dedupe_local_paths(
+                u.toLocalFile() for u in md.urls() if u.isLocalFile()
+            )
+        except Exception:
+            paths = []
         if not paths:
             return None
 
-        def _decode_drop_effect_from_qt():
-            if sys.platform != "win32":
-                return None
+        effect = None
+        if sys.platform == "win32":
             fmt = 'application/x-qt-windows-mime;value="Preferred DropEffect"'
-            if not md.hasFormat(fmt):
-                return None
-            try:
-                data = md.data(fmt)
-                if data and len(data) >= 4:
-                    return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
-            except Exception:
-                return None
-
-        def _decode_drop_effect_from_win32():
-            if not HAS_PYWIN32:
-                return None
-            try:
-                fmt = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
-                win32clipboard.OpenClipboard()
+            if md.hasFormat(fmt):
                 try:
-                    data = win32clipboard.GetClipboardData(fmt)
-                    if data and len(bytes(data)) >= 4:
-                        return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
-                finally:
-                    win32clipboard.CloseClipboard()
-            except Exception:
-                return None
+                    effect = _decode_preferred_drop_effect(md.data(fmt))
+                except Exception:
+                    effect = None
 
-        effect = _decode_drop_effect_from_qt()
-        if effect is None:
-            effect = _decode_drop_effect_from_win32()
-
-        op = "copy"
-        if effect is not None:
-            if effect & 2:
-                op = "move"
-            elif effect & 1:
-                op = "copy"
-
-        return {"op": op, "paths": paths}
+        return {"op": _drop_effect_to_operation(effect) or "copy", "paths": paths}
 
     def paste_into_current(self):
         clip=self.host.get_clipboard() or self._external_clipboard_payload()
@@ -4879,7 +4956,7 @@ class ExplorerPane(QWidget):
             self.host.flash_status("Clipboard has no files to paste")
             return
         self._start_bg_op("copy" if op=="copy" else "move", srcs, dst_dir)
-        if op=="cut": self.host.clear_clipboard()
+        if op in ("cut", "move"): self.host.clear_clipboard()
 
     def _start_bg_op(self, op, srcs, dst_dir):
         cur_worker = getattr(self, "_file_worker", None)
@@ -5508,49 +5585,32 @@ class MultiExplorer(QMainWindow):
         self.theme=initial_theme if initial_theme in VALID_THEMES else "dark"
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
         self.setWindowTitle(f"Multi-Pane File Explorer - {pane_count} panes"); self.resize(1500,900)
-
-
         top=QWidget(self); top_lay=QHBoxLayout(top); top_lay.setContentsMargins(6,2,6,2); top_lay.setSpacing(ROW_SPACING)
-        self.btn_layout=QToolButton(top); self.btn_layout.setToolTip("Toggle layout (4 / 6 / 8)"); self.btn_layout.setFixedHeight(UI_H)
-        self.btn_theme=QToolButton(top); self.btn_theme.setToolTip("Toggle Light/Dark"); self.btn_theme.setFixedHeight(UI_H)
-        self.btn_bm_edit=QToolButton(top); self.btn_bm_edit.setToolTip("Edit Bookmarks"); self.btn_bm_edit.setFixedHeight(UI_H)
-
-
-        self.btn_session=QToolButton(top)
-        self.btn_session.setToolTip("Session (save/load all pane paths)")
-        self.btn_session.setFixedHeight(UI_H)
-        self.btn_shortcuts=QToolButton(top); self.btn_shortcuts.setToolTip("Keyboard Shortcuts"); self.btn_shortcuts.setFixedHeight(UI_H)
-
-        self.btn_about=QToolButton(top); self.btn_about.setToolTip("About"); self.btn_about.setFixedHeight(UI_H)
-        top_lay.addWidget(self.btn_layout,0); top_lay.addWidget(self.btn_theme,0); top_lay.addWidget(self.btn_bm_edit,0)
-        top_lay.addWidget(self.btn_session,0)
-        top_lay.addWidget(self.btn_shortcuts,0)
-        top_lay.addWidget(self.btn_about,0); top_lay.addStretch(1)
-
+        for name, tip, slot in (
+            ("btn_layout", "Toggle layout (4 / 6 / 8)", self._cycle_layout),
+            ("btn_theme", "Toggle Light/Dark", self._toggle_theme),
+            ("btn_bm_edit", "Edit Bookmarks", self._open_bookmark_editor),
+            ("btn_session", "Session (save/load all pane paths)", self._open_session_manager),
+            ("btn_shortcuts", "Keyboard Shortcuts", self._show_shortcuts),
+            ("btn_about", "About", self._show_about),
+        ):
+            btn=QToolButton(top); btn.setToolTip(tip); btn.setFixedHeight(UI_H)
+            setattr(self, name, btn); top_lay.addWidget(btn,0); btn.clicked.connect(slot)
+        top_lay.addStretch(1)
         self.central=QWidget(self); self.setCentralWidget(self.central)
         vmain=QVBoxLayout(self.central); vmain.setContentsMargins(0,0,0,0); vmain.setSpacing(ROW_SPACING)
         vmain.addWidget(top,0); self.grid=QGridLayout(); vmain.addLayout(self.grid,1)
-
         self.named_bookmarks=migrate_legacy_favorites_into_named(load_named_bookmarks()); save_named_bookmarks(self.named_bookmarks)
         self._clipboard=None; self._bm_dlg=None
-
         self._update_layout_icon(); self._update_theme_icon()
-        self.btn_layout.clicked.connect(self._cycle_layout); self.btn_theme.clicked.connect(self._toggle_theme)
-        self.btn_bm_edit.clicked.connect(self._open_bookmark_editor)
-        self.btn_session.clicked.connect(self._open_session_manager)
-        self.btn_shortcuts.clicked.connect(self._show_shortcuts)
-        self.btn_about.clicked.connect(self._show_about)
         self._help_shortcut = QShortcut(QKeySequence("F1"), self)
         self._help_shortcut.setContext(Qt.ApplicationShortcut)
         self._help_shortcut.activated.connect(self._show_shortcuts)
-
         self.panes=[]; self.build_panes(pane_count, start_paths or []); self._update_theme_dependent_icons()
         self._install_focus_tracker()
         if getattr(self, "panes", None):
             self.mark_active_pane(self.panes[0])
-
         self.statusBar().showMessage("Ready", 1500)
-
         self._wd_timer = None
         if DEBUG:
             self._wd_timer=QTimer(self); self._wd_timer.setInterval(50); self._wd_last=time.perf_counter()
@@ -5559,7 +5619,6 @@ class MultiExplorer(QMainWindow):
                 if gap>200: dlog(f"[STALL] UI event loop blocked ~{gap:.0f} ms")
                 self._wd_last=now
             self._wd_timer.timeout.connect(_wd_tick); self._wd_timer.start()
-
         settings=QSettings(ORG_NAME, APP_NAME); geo=settings.value("window/geometry")
         if isinstance(geo, QtCore.QByteArray): self._safe_restore_geometry(geo)
 
@@ -5620,16 +5679,16 @@ class MultiExplorer(QMainWindow):
         if idx>=len(states) or idx<0: idx=0; self._layout_idx=0
         state=states[idx]; self.btn_layout.setIcon(icon_grid_layout(state, self.theme))
     def _update_theme_icon(self):
-        if hasattr(self, "btn_theme") and self.btn_theme:
-            self.btn_theme.setIcon(icon_theme_toggle(self.theme))
-        if hasattr(self, "btn_bm_edit") and self.btn_bm_edit:
-            self.btn_bm_edit.setIcon(icon_bookmark_edit(self.theme))
-        if hasattr(self, "btn_session") and self.btn_session:
-            self.btn_session.setIcon(icon_session(self.theme))
-        if hasattr(self, "btn_shortcuts") and self.btn_shortcuts:
-            self.btn_shortcuts.setIcon(icon_shortcuts(self.theme))
-        if hasattr(self, "btn_about") and self.btn_about:
-            self.btn_about.setIcon(icon_info(self.theme))
+        for name, icon_fn in (
+            ("btn_theme", icon_theme_toggle),
+            ("btn_bm_edit", icon_bookmark_edit),
+            ("btn_session", icon_session),
+            ("btn_shortcuts", icon_shortcuts),
+            ("btn_about", icon_info),
+        ):
+            btn = getattr(self, name, None)
+            if btn:
+                btn.setIcon(icon_fn(self.theme))
 
     def _update_theme_dependent_icons(self):
         self._update_layout_icon(); self._update_theme_icon()
@@ -5658,11 +5717,7 @@ class MultiExplorer(QMainWindow):
             s=QSettings(ORG_NAME, APP_NAME); s.setValue("ui/theme", self.theme); s.sync()
 
     def _toggle_theme(self):
-        if self.theme == "dark":
-            next_theme = "light"
-        else:
-            next_theme = "dark"
-        self._apply_theme(next_theme, persist=True)
+        self._apply_theme("light" if self.theme == "dark" else "dark", persist=True)
 
     def build_panes(self, n:int, start_paths):
         was_max = self.isMaximized()
@@ -5886,9 +5941,24 @@ class MultiExplorer(QMainWindow):
 
 
     def _current_paths(self): return [p.current_path() for p in self.panes]
-    def set_clipboard(self,payload:dict): self._clipboard=payload
-    def get_clipboard(self): return self._clipboard
-    def clear_clipboard(self): self._clipboard=None
+    def set_clipboard(self,payload:dict):
+        payload = _normalize_file_clipboard_payload(payload)
+        if sys.platform == "win32":
+            if payload and _write_windows_file_clipboard_payload(payload):
+                self._clipboard = _read_windows_file_clipboard_payload() or payload
+            else:
+                self._clipboard = None
+        else:
+            self._clipboard = payload
+        return bool(self._clipboard)
+    def get_clipboard(self):
+        if sys.platform == "win32":
+            self._clipboard = _read_windows_file_clipboard_payload()
+        return self._clipboard
+    def clear_clipboard(self):
+        if sys.platform == "win32":
+            _clear_windows_clipboard()
+        self._clipboard=None
     def flash_status(self,text:str):
         try: self.statusBar().showMessage(text,2000)
         except Exception: pass
@@ -5944,27 +6014,16 @@ class MultiExplorer(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Keyboard Shortcuts")
         dlg.resize(780, 460)
-
         lay = QVBoxLayout(dlg)
         lbl = QLabel("The same shortcut descriptions documented in README.md", dlg)
         lay.addWidget(lbl)
-
-        table = QTableWidget(dlg)
-        table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["Key", "Action"])
-        table.setRowCount(len(KEYBOARD_SHORTCUTS))
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table = _setup_readonly_table(
+            QTableWidget(dlg), ["Key", "Action"], [QHeaderView.ResizeToContents, QHeaderView.Stretch], row_count=len(KEYBOARD_SHORTCUTS)
+        )
         for r, (key_text, action_text) in enumerate(KEYBOARD_SHORTCUTS):
-            table.setItem(r, 0, QTableWidgetItem(key_text))
-            table.setItem(r, 1, QTableWidgetItem(action_text))
+            _set_table_row_items(table, r, key_text, action_text)
         lay.addWidget(table, 1)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok, dlg)
-        btns.accepted.connect(dlg.accept)
-        lay.addWidget(btns)
+        _add_dialog_button_box(lay, dlg, QDialogButtonBox.Ok, dlg.accept)
         dlg.exec_()
 
     def _show_about(self):
@@ -5972,14 +6031,14 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.1.2</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.2.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
         lay.addWidget(lbl)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok, dlg); lay.addWidget(btns); btns.accepted.connect(dlg.accept)
-        pal=dlg.palette(); pal.setColor(QPalette.Window, QColor(255,255,255)); pal.setColor(QPalette.WindowText, QColor(0,0,0))
-        dlg.setPalette(pal); dlg.setStyleSheet("QLabel { color: #000; } QDialog { background: #FFF; }")
+        _add_dialog_button_box(lay, dlg, QDialogButtonBox.Ok, dlg.accept)
+        _apply_palette_colors(dlg, {QPalette.Window: (255, 255, 255), QPalette.WindowText: (0, 0, 0)})
+        dlg.setStyleSheet("QLabel { color: #000; } QDialog { background: #FFF; }")
         dlg.resize(380,180); dlg.exec_()
 
     def closeEvent(self,e):
@@ -6078,9 +6137,7 @@ class MultiExplorer(QMainWindow):
         except Exception: pass
 
     def _open_session_manager(self):
-        dlg = SessionManagerDialog(self, self._get_sessions())
-        if dlg.exec_() == QDialog.Accepted:
-            pass
+        SessionManagerDialog(self, self._get_sessions()).exec_()
 
 class SessionManagerDialog(QDialog):
     def __init__(self, parent: MultiExplorer, sessions: list):
@@ -6088,38 +6145,26 @@ class SessionManagerDialog(QDialog):
         self.setWindowTitle("Session Manager")
         self.resize(560, 400)
 
-        self.table = QTableWidget(self)
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Name", "Panes", "Saved"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table = _setup_readonly_table(
+            QTableWidget(self),
+            ["Name", "Panes", "Saved"],
+            [QHeaderView.Stretch, QHeaderView.ResizeToContents, QHeaderView.ResizeToContents],
+        )
 
-        self.btn_save = QPushButton("Save Current", self)
-        self.btn_load = QPushButton("Load Selected", self)
-        self.btn_delete = QPushButton("Delete Selected", self)
-        self.btn_close = QPushButton("Close", self)
-
+        self.btn_save, self.btn_load, self.btn_delete, self.btn_close = [QPushButton(text, self) for text in (
+            "Save Current", "Load Selected", "Delete Selected", "Close"
+        )]
         btns = QHBoxLayout()
-        btns.addWidget(self.btn_save)
-        btns.addWidget(self.btn_load)
-        btns.addWidget(self.btn_delete)
+        for btn in (self.btn_save, self.btn_load, self.btn_delete): btns.addWidget(btn)
         btns.addStretch(1)
         btns.addWidget(self.btn_close)
-
         lay = QVBoxLayout(self)
         lay.addWidget(self.table, 1)
         lay.addLayout(btns)
-
         self._sessions = []
         self.set_sessions(sessions)
-
-        self.btn_close.clicked.connect(self.accept)
-        self.btn_load.clicked.connect(self._on_load)
-        self.btn_delete.clicked.connect(self._on_delete)
-        self.btn_save.clicked.connect(self._on_save)
+        for btn, slot in ((self.btn_close, self.accept), (self.btn_load, self._on_load), (self.btn_delete, self._on_delete), (self.btn_save, self._on_save)):
+            btn.clicked.connect(slot)
 
     def set_sessions(self, items: list):
         self._sessions = list(items or [])
@@ -6129,18 +6174,12 @@ class SessionManagerDialog(QDialog):
             panes = int(it.get("panes", 0))
             ts = float(it.get("ts", time.time()))
             dt = QDateTime.fromSecsSinceEpoch(int(ts)).toString("yyyy-MM-dd HH:mm:ss")
-
-            self.table.setItem(r, 0, QTableWidgetItem(name))
-            self.table.setItem(r, 1, QTableWidgetItem(str(panes)))
-            self.table.setItem(r, 2, QTableWidgetItem(dt))
+            _set_table_row_items(self.table, r, name, panes, dt)
         self.table.resizeColumnsToContents()
 
     def _selected_name(self) -> str | None:
         rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        r = rows[0].row()
-        it = self.table.item(r, 0)
+        it = self.table.item(rows[0].row(), 0) if rows else None
         return it.text().strip() if it else None
 
     def _on_load(self):
@@ -6195,37 +6234,26 @@ class BookmarkEditDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Edit Bookmarks (max 10)")
         self.resize(760, 420)
-
-        self.table = QTableWidget(self)
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Enabled", "Name", "Path"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-
+        self.table = _setup_readonly_table(
+            QTableWidget(self),
+            ["Enabled", "Name", "Path"],
+            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
+        )
         self.table.setRowCount(10)
         self._rows = []
-
         lay = QVBoxLayout(self); lay.addWidget(self.table, 1)
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
-        lay.addWidget(btns)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
-
+        _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         items = list(items or [])
         for i in range(10):
-            it = items[i] if i < len(items) else {"enabled": False, "name": "", "path": ""}
+            it = items[i] if i < len(items) else _empty_bookmark_item()
             self._add_row(i, it)
 
     def _add_row(self, row: int, data: dict):
         chk = QCheckBox(self.table); chk.setChecked(bool(data.get("enabled", False)))
         self.table.setCellWidget(row, 0, chk)
-
         name_edit = QLineEdit(self.table); name_edit.setText(str(data.get("name", "")))
         name_edit.setPlaceholderText("Bookmark name"); name_edit.setClearButtonEnabled(True); name_edit.setFixedHeight(UI_H)
         self.table.setCellWidget(row, 1, name_edit)
-
         path_wrap = QWidget(self.table); h = QHBoxLayout(path_wrap); h.setContentsMargins(0,0,0,0); h.setSpacing(ROW_SPACING)
         path_edit = QLineEdit(path_wrap); path_edit.setText(str(data.get("path", ""))); path_edit.setPlaceholderText("Folder path"); path_edit.setClearButtonEnabled(True); path_edit.setFixedHeight(UI_H)
         btn = QToolButton(path_wrap); btn.setText("..."); btn.setFixedHeight(UI_H)
@@ -6239,19 +6267,17 @@ class BookmarkEditDialog(QDialog):
         self._rows.append((chk, name_edit, path_edit))
 
     def values(self) -> list:
-        out=[]
-        for chk, name_edit, path_edit in self._rows:
-            enabled = chk.isChecked()
-            name = name_edit.text().strip()
-            path = path_edit.text().strip()
-            if name or path or enabled:
-                out.append({"enabled": enabled, "name": name, "path": path})
-        return out
+        return [
+            {"enabled": enabled, "name": name, "path": path}
+            for chk, name_edit, path_edit in self._rows
+            for enabled, name, path in [(chk.isChecked(), name_edit.text().strip(), path_edit.text().strip())]
+            if name or path or enabled
+        ]
 
     def set_items(self, items: list):
         items = list(items or [])
         for r in range(10):
-            it = items[r] if r < len(items) else {"enabled": False, "name": "", "path": ""}
+            it = items[r] if r < len(items) else _empty_bookmark_item()
             chk, name_edit, path_edit = self._rows[r]
             chk.setChecked(bool(it.get("enabled", False)))
             name_edit.setText(str(it.get("name", "")))
@@ -6260,17 +6286,12 @@ class BookmarkEditDialog(QDialog):
 
 
 def _load_start_paths(desired_panes:int, cli_paths):
-    s=QSettings(ORG_NAME, APP_NAME); saved_n=s.value("layout/pane_count", type=int); paths=[]
-    if not cli_paths and saved_n:
-        for i in range(desired_panes):
-            p=s.value(f"layout/pane_{i}_path", QDir.homePath(), type=str)
-            paths.append(p if p and os.path.exists(p) else QDir.homePath())
-    else:
-        for i in range(desired_panes):
-            if i<len(cli_paths) and os.path.exists(cli_paths[i]): paths.append(cli_paths[i])
-            else:
-                p=s.value(f"layout/pane_{i}_path", QDir.homePath(), type=str)
-                paths.append(p if p and os.path.exists(p) else QDir.homePath())
+    s=QSettings(ORG_NAME, APP_NAME); cli_paths=list(cli_paths or []); paths=[]
+    for i in range(desired_panes):
+        if i<len(cli_paths) and os.path.exists(cli_paths[i]):
+            paths.append(cli_paths[i]); continue
+        p=s.value(f"layout/pane_{i}_path", QDir.homePath(), type=str)
+        paths.append(p if p and os.path.exists(p) else QDir.homePath())
     return paths
 
 def parse_args():
