@@ -173,6 +173,158 @@ def _read_windows_file_clipboard_payload():
     return {"op": _drop_effect_to_operation(effect) or "copy", "paths": paths}
 
 
+def _normalize_file_clipboard_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+    paths = _dedupe_local_paths(payload.get("paths") or [])
+    if not paths:
+        return None
+    op = str(payload.get("op") or "copy").strip().lower()
+    if op not in {"copy", "cut", "move"}:
+        op = "copy"
+    return {"op": op, "paths": paths}
+
+
+def _clipboard_operation_to_drop_effect(op):
+    return 2 if str(op).strip().lower() in {"cut", "move"} else 1
+
+
+def _write_windows_file_clipboard_payload(payload):
+    payload = _normalize_file_clipboard_payload(payload)
+    if sys.platform != "win32" or not HAS_PYWIN32 or not payload:
+        return False
+
+    class _Point(ctypes.Structure):
+        _fields_ = [
+            ("x", ctypes.c_long),
+            ("y", ctypes.c_long),
+        ]
+
+    class _DropFiles(ctypes.Structure):
+        _fields_ = [
+            ("pFiles", ctypes.c_uint32),
+            ("pt", _Point),
+            ("fNC", ctypes.c_int),
+            ("fWide", ctypes.c_int),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    global_alloc = kernel32.GlobalAlloc
+    global_alloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    global_alloc.restype = ctypes.c_void_p
+    global_lock = kernel32.GlobalLock
+    global_lock.argtypes = [ctypes.c_void_p]
+    global_lock.restype = ctypes.c_void_p
+    global_unlock = kernel32.GlobalUnlock
+    global_unlock.argtypes = [ctypes.c_void_p]
+    global_unlock.restype = ctypes.c_int
+    global_free = kernel32.GlobalFree
+    global_free.argtypes = [ctypes.c_void_p]
+    global_free.restype = ctypes.c_void_p
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = [ctypes.c_void_p]
+    open_clipboard.restype = ctypes.c_int
+    empty_clipboard = user32.EmptyClipboard
+    empty_clipboard.argtypes = []
+    empty_clipboard.restype = ctypes.c_int
+    set_clipboard_data = user32.SetClipboardData
+    set_clipboard_data.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    set_clipboard_data.restype = ctypes.c_void_p
+    close_clipboard = user32.CloseClipboard
+    close_clipboard.argtypes = []
+    close_clipboard.restype = ctypes.c_int
+    register_clipboard_format = user32.RegisterClipboardFormatW
+    register_clipboard_format.argtypes = [ctypes.c_wchar_p]
+    register_clipboard_format.restype = ctypes.c_uint
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+
+    def _alloc_global_bytes(raw):
+        handle = global_alloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(raw))
+        if not handle:
+            raise OSError("GlobalAlloc failed")
+        ptr = global_lock(handle)
+        if not ptr:
+            global_free(handle)
+            raise OSError("GlobalLock failed")
+        try:
+            ctypes.memmove(ptr, raw, len(raw))
+        finally:
+            global_unlock(handle)
+        return handle
+
+    file_list = ("\0".join(payload["paths"]) + "\0\0").encode("utf-16le")
+    dropfiles = _DropFiles()
+    dropfiles.pFiles = ctypes.sizeof(_DropFiles)
+    dropfiles.fNC = 0
+    dropfiles.fWide = 1
+    hdrop = None
+    heffect = None
+
+    try:
+        hdrop = _alloc_global_bytes(bytes(dropfiles) + file_list)
+        heffect = _alloc_global_bytes(
+            _clipboard_operation_to_drop_effect(payload["op"]).to_bytes(4, "little")
+        )
+        effect_fmt = register_clipboard_format("Preferred DropEffect")
+
+        opened = False
+        for _ in range(8):
+            if open_clipboard(None):
+                opened = True
+                break
+            time.sleep(0.03)
+        if not opened:
+            return False
+        try:
+            if not empty_clipboard():
+                return False
+            if not set_clipboard_data(win32con.CF_HDROP, hdrop):
+                return False
+            hdrop = None
+            if not set_clipboard_data(effect_fmt, heffect):
+                return False
+            heffect = None
+            return True
+        finally:
+            close_clipboard()
+    except Exception:
+        return False
+    finally:
+        if hdrop:
+            global_free(hdrop)
+        if heffect:
+            global_free(heffect)
+
+
+def _clear_windows_clipboard():
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    open_clipboard = user32.OpenClipboard
+    open_clipboard.argtypes = [ctypes.c_void_p]
+    open_clipboard.restype = ctypes.c_int
+    empty_clipboard = user32.EmptyClipboard
+    empty_clipboard.argtypes = []
+    empty_clipboard.restype = ctypes.c_int
+    close_clipboard = user32.CloseClipboard
+    close_clipboard.argtypes = []
+    close_clipboard.restype = ctypes.c_int
+    opened = False
+    for _ in range(8):
+        if open_clipboard(None):
+            opened = True
+            break
+        time.sleep(0.03)
+    if not opened:
+        return False
+    try:
+        return bool(empty_clipboard())
+    finally:
+        close_clipboard()
+
+
 try:
     from send2trash import send2trash
     HAS_SEND2TRASH = True
@@ -4875,11 +5027,17 @@ class ExplorerPane(QWidget):
     def copy_selection(self):
         paths=self._selected_paths()
         if not paths: return
-        self.host.set_clipboard({"op":"copy","paths":paths}); self.host.flash_status(f"Copied {len(paths)} item(s)")
+        if self.host.set_clipboard({"op":"copy","paths":paths}):
+            self.host.flash_status(f"Copied {len(paths)} item(s)")
+        else:
+            self.host.flash_status("Failed to copy items to clipboard")
     def cut_selection(self):
         paths=self._selected_paths()
         if not paths: return
-        self.host.set_clipboard({"op":"cut","paths":paths}); self.host.flash_status(f"Cut {len(paths)} item(s)")
+        if self.host.set_clipboard({"op":"cut","paths":paths}):
+            self.host.flash_status(f"Cut {len(paths)} item(s)")
+        else:
+            self.host.flash_status("Failed to cut items to clipboard")
 
     def _external_clipboard_payload(self):
         try:
@@ -4926,7 +5084,7 @@ class ExplorerPane(QWidget):
             self.host.flash_status("Clipboard has no files to paste")
             return
         self._start_bg_op("copy" if op=="copy" else "move", srcs, dst_dir)
-        if op=="cut": self.host.clear_clipboard()
+        if op in ("cut", "move"): self.host.clear_clipboard()
 
     def _start_bg_op(self, op, srcs, dst_dir):
         cur_worker = getattr(self, "_file_worker", None)
@@ -5933,9 +6091,24 @@ class MultiExplorer(QMainWindow):
 
 
     def _current_paths(self): return [p.current_path() for p in self.panes]
-    def set_clipboard(self,payload:dict): self._clipboard=payload
-    def get_clipboard(self): return self._clipboard
-    def clear_clipboard(self): self._clipboard=None
+    def set_clipboard(self,payload:dict):
+        payload = _normalize_file_clipboard_payload(payload)
+        if sys.platform == "win32":
+            if payload and _write_windows_file_clipboard_payload(payload):
+                self._clipboard = _read_windows_file_clipboard_payload() or payload
+            else:
+                self._clipboard = None
+        else:
+            self._clipboard = payload
+        return bool(self._clipboard)
+    def get_clipboard(self):
+        if sys.platform == "win32":
+            self._clipboard = _read_windows_file_clipboard_payload()
+        return self._clipboard
+    def clear_clipboard(self):
+        if sys.platform == "win32":
+            _clear_windows_clipboard()
+        self._clipboard=None
     def flash_status(self,text:str):
         try: self.statusBar().showMessage(text,2000)
         except Exception: pass
