@@ -105,6 +105,74 @@ except Exception:
     HAS_PYWIN32 = False
 
 
+def _dedupe_local_paths(paths):
+    out = []
+    seen = set()
+    for raw in paths or ():
+        if not raw:
+            continue
+        try:
+            path = os.path.normpath(os.fspath(raw))
+        except Exception:
+            continue
+        key = os.path.normcase(path) if sys.platform == "win32" else path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _decode_preferred_drop_effect(raw):
+    try:
+        data = bytes(raw) if raw is not None else b""
+    except Exception:
+        return None
+    if len(data) < 4:
+        return None
+    return int.from_bytes(data[:4], byteorder="little", signed=False)
+
+
+def _drop_effect_to_operation(effect):
+    if effect is None:
+        return None
+    if effect & 2:
+        return "move"
+    if effect & 1:
+        return "copy"
+    return None
+
+
+def _read_windows_file_clipboard_payload():
+    if sys.platform != "win32" or not HAS_PYWIN32:
+        return None
+    try:
+        drop_effect_fmt = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
+        win32clipboard.OpenClipboard()
+        try:
+            paths = []
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                data = win32clipboard.GetClipboardData(win32con.CF_HDROP)
+                if isinstance(data, (tuple, list)):
+                    paths = [os.fspath(p) for p in data if p]
+                elif data:
+                    paths = [os.fspath(data)]
+            effect = None
+            if win32clipboard.IsClipboardFormatAvailable(drop_effect_fmt):
+                effect = _decode_preferred_drop_effect(
+                    win32clipboard.GetClipboardData(drop_effect_fmt)
+                )
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+    paths = _dedupe_local_paths(paths)
+    if not paths:
+        return None
+    return {"op": _drop_effect_to_operation(effect) or "copy", "paths": paths}
+
+
 try:
     from send2trash import send2trash
     HAS_SEND2TRASH = True
@@ -4818,56 +4886,35 @@ class ExplorerPane(QWidget):
             cb = QApplication.clipboard()
             md = cb.mimeData()
         except Exception:
-            return None
-        if not md or not md.hasUrls():
+            md = None
+
+        if sys.platform == "win32":
+            native_payload = _read_windows_file_clipboard_payload()
+            if native_payload:
+                return native_payload
+
+        if not md:
             return None
 
-        urls = md.urls()
-
-        paths = list(dict.fromkeys(u.toLocalFile() for u in urls if u.isLocalFile()))
+        try:
+            paths = _dedupe_local_paths(
+                u.toLocalFile() for u in md.urls() if u.isLocalFile()
+            )
+        except Exception:
+            paths = []
         if not paths:
             return None
 
-        def _decode_drop_effect_from_qt():
-            if sys.platform != "win32":
-                return None
+        effect = None
+        if sys.platform == "win32":
             fmt = 'application/x-qt-windows-mime;value="Preferred DropEffect"'
-            if not md.hasFormat(fmt):
-                return None
-            try:
-                data = md.data(fmt)
-                if data and len(data) >= 4:
-                    return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
-            except Exception:
-                return None
-
-        def _decode_drop_effect_from_win32():
-            if not HAS_PYWIN32:
-                return None
-            try:
-                fmt = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
-                win32clipboard.OpenClipboard()
+            if md.hasFormat(fmt):
                 try:
-                    data = win32clipboard.GetClipboardData(fmt)
-                    if data and len(bytes(data)) >= 4:
-                        return int.from_bytes(bytes(data)[:4], byteorder="little", signed=False)
-                finally:
-                    win32clipboard.CloseClipboard()
-            except Exception:
-                return None
+                    effect = _decode_preferred_drop_effect(md.data(fmt))
+                except Exception:
+                    effect = None
 
-        effect = _decode_drop_effect_from_qt()
-        if effect is None:
-            effect = _decode_drop_effect_from_win32()
-
-        op = "copy"
-        if effect is not None:
-            if effect & 2:
-                op = "move"
-            elif effect & 1:
-                op = "copy"
-
-        return {"op": op, "paths": paths}
+        return {"op": _drop_effect_to_operation(effect) or "copy", "paths": paths}
 
     def paste_into_current(self):
         clip=self.host.get_clipboard() or self._external_clipboard_payload()
