@@ -3437,11 +3437,13 @@ class ExplorerPane(QWidget):
     def _configure_header_search(self):
         header = self.view.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        name_width = max(self._browse_name_min_width, header.sectionSize(0))
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.resizeSection(0, name_width)
         header.resizeSection(1, SIZE_COL_WIDTH)
         header.resizeSection(2, 44)
         header.resizeSection(3, DATE_COL_WIDTH)
@@ -6031,7 +6033,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.2.0</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.2.1</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
