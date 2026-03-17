@@ -1145,6 +1145,41 @@ class GenericIconProvider(QFileIconProvider):
 class _MSG(ctypes.Structure):
     _fields_=[("hwnd",ctypes.c_void_p),("message",ctypes.c_uint),("wParam",ctypes.c_size_t),("lParam",ctypes.c_size_t),("time",ctypes.c_uint),("pt_x",ctypes.c_long),("pt_y",ctypes.c_long)]
 
+def _native_event_type_name(event_type) -> str:
+    if event_type is None:
+        return ""
+    if isinstance(event_type, str):
+        return event_type
+    try:
+        raw = bytes(event_type)
+    except Exception:
+        raw = None
+    if raw is not None:
+        try:
+            return raw.decode(errors="ignore")
+        except Exception:
+            pass
+    try:
+        return str(event_type)
+    except Exception:
+        return ""
+
+def _coerce_hwnd(hwnd_like) -> int:
+    try:
+        hwnd = int(hwnd_like)
+    except Exception:
+        return 0
+    return hwnd if hwnd > 0 else 0
+
+def _is_valid_window_handle(hwnd_like) -> bool:
+    hwnd = _coerce_hwnd(hwnd_like)
+    if not (HAS_PYWIN32 and hwnd):
+        return False
+    try:
+        return bool(win32gui.IsWindow(hwnd))
+    except Exception:
+        return False
+
 class WinCtxMenuEventFilter(QtCore.QAbstractNativeEventFilter):
     def __init__(self): super().__init__(); self._cm2=None; self._cm3=None
     def set_context(self, cm_iface):
@@ -1157,7 +1192,9 @@ class WinCtxMenuEventFilter(QtCore.QAbstractNativeEventFilter):
             except Exception: self._cm2 = None
     def clear(self): self._cm2=None; self._cm3=None
     def nativeEventFilter(self, eventType, message):
-        if eventType != 'windows_generic_MSG': return False, 0
+        event_name = _native_event_type_name(eventType)
+        if event_name not in {"windows_generic_MSG", "windows_dispatcher_MSG"}:
+            return False, 0
         if not (self._cm2 or self._cm3): return False, 0
         msg = _MSG.from_address(int(message)); m = msg.message
         if HAS_PYWIN32 and m in (win32con.WM_INITMENU, win32con.WM_INITMENUPOPUP, win32con.WM_DRAWITEM, win32con.WM_MEASUREITEM, win32con.WM_MENUCHAR):
@@ -1396,6 +1433,7 @@ def _launch_git_bash_here(owner_hwnd, work_dir: str, paths=None) -> bool:
 
 def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_first=1, id_last=None):
     shown=False
+    owner_hwnd = _coerce_hwnd(owner_hwnd)
     try:
         win32gui.SetForegroundWindow(owner_hwnd)
     except Exception: pass
@@ -1513,6 +1551,7 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
     if not HAS_PYWIN32 or not paths: return False
     pythoncom.CoInitialize()
     try:
+        owner_hwnd = _coerce_hwnd(owner_hwnd)
 
         norm_paths = []
         seen = set()
@@ -1533,23 +1572,27 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
 
         cm=_icm_via_shellitems(norm_paths)
         if cm:
-            evf.set_context(cm); hMenu=win32gui.CreatePopupMenu()
-            flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
-            if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
-            id_first=1
             try:
-                id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-                ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
-                evf.clear()
-                if ok: return True
+                evf.set_context(cm); hMenu=win32gui.CreatePopupMenu()
+                flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
+                if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
+                id_first=1
+                try:
+                    id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+                    ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
+                    if ok: return True
+                finally:
+                    try: win32gui.DestroyMenu(hMenu)
+                    except Exception: pass
             except Exception as e:
                 if DEBUG: print("[ctx] ShellItems QueryContextMenu failed:", e)
+            finally:
                 evf.clear()
 
         try:
             desktop=shell.SHGetDesktopFolder()
             abs_pidls=tuple(_abs_pidl(p) for p in norm_paths)
-            cm=desktop.GetUIObjectOf(0,abs_pidls,shell.IID_IContextMenu,0); cm=_as_interface(cm)
+            cm=desktop.GetUIObjectOf(owner_hwnd,abs_pidls,shell.IID_IContextMenu,0); cm=_as_interface(cm)
         except Exception as e:
             if DEBUG: print("[ctx] desktop GetUIObjectOf failed:", e); cm=None
         if not cm: return False
@@ -1558,9 +1601,14 @@ def show_explorer_context_menu(owner_hwnd, paths, screen_pt):
         flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
         id_first=1
-        id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
-        evf.clear(); return ok
+        try:
+            id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+            ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,parent_dir,paths=norm_paths,id_first=id_first,id_last=id_last)
+            return ok
+        finally:
+            evf.clear()
+            try: win32gui.DestroyMenu(hMenu)
+            except Exception: pass
     finally:
         pythoncom.CoUninitialize()
 
@@ -1569,7 +1617,8 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
     pythoncom.CoInitialize()
     try:
         sf=_bind_folder(folder_path)
-        try: cm=sf.CreateViewObject(0, shell.IID_IContextMenu); cm=_as_interface(cm)
+        owner_hwnd = _coerce_hwnd(owner_hwnd)
+        try: cm=sf.CreateViewObject(owner_hwnd, shell.IID_IContextMenu); cm=_as_interface(cm)
         except Exception: cm=None
         if not cm: return False
         app=QApplication.instance(); evf=_ensure_event_filter(app); evf.set_context(cm)
@@ -1577,9 +1626,14 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
         flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
         id_first=1
-        id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=[folder_path],id_first=id_first,id_last=id_last)
-        evf.clear(); return ok
+        try:
+            id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+            ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=[folder_path],id_first=id_first,id_last=id_last)
+            return ok
+        finally:
+            evf.clear()
+            try: win32gui.DestroyMenu(hMenu)
+            except Exception: pass
     finally:
         pythoncom.CoUninitialize()
 
@@ -5473,6 +5527,32 @@ class ExplorerPane(QWidget):
             g = self.view.viewport().mapToGlobal(pos)
             return g.x(), g.y()
 
+    def _context_menu_owner_hwnd(self) -> int:
+        if not HAS_PYWIN32:
+            return 0
+        seen = set()
+        candidates = []
+        widgets = [self.view.viewport(), self.view, self.window(), self]
+        app = QApplication.instance()
+        active = app.activeWindow() if app else None
+        if active is not None:
+            widgets.append(active)
+        for widget in widgets:
+            if widget is None:
+                continue
+            for attr in ("winId", "effectiveWinId"):
+                getter = getattr(widget, attr, None)
+                if not callable(getter):
+                    continue
+                hwnd = _coerce_hwnd(getter())
+                if hwnd and hwnd not in seen:
+                    seen.add(hwnd)
+                    candidates.append(hwnd)
+        for hwnd in candidates:
+            if _is_valid_window_handle(hwnd):
+                return hwnd
+        return candidates[0] if candidates else 0
+
     def _try_native_context_menu(self, pos, owner_hwnd: int, paths: list[str]) -> bool:
         if not HAS_PYWIN32:
             return False
@@ -5482,7 +5562,7 @@ class ExplorerPane(QWidget):
         return show_explorer_background_menu(owner_hwnd, self.current_path(), screen_pt)
 
     def _on_context_menu(self, pos):
-        owner_hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
+        owner_hwnd = self._context_menu_owner_hwnd()
         paths = self._selected_paths()
 
 
