@@ -78,6 +78,7 @@ $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 | `F2` | Rename |
 | `Ctrl+Shift+R` | Bulk rename |
 | `Ctrl+Shift+C` | Copy full path |
+| `Ctrl+Shift+D` | Open the selected item's containing folder |
 | `Alt+Shift+C` | Copy folder path (parent folder if a file is selected) |
 
 ## Settings
@@ -91,6 +92,7 @@ Stored values include:
 - Pane count and per-pane last path
 - Bookmarks and sessions
 - Per-pane sort column and sort order
+- Per-pane search result column widths
 
 ## Build (optional)
 You can build with PyInstaller using `makeExe.bat` or `MultiPaneExplorer.spec`.
