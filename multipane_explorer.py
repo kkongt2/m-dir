@@ -69,9 +69,11 @@ SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
 PATH_HISTORY_LIMIT = 30
+BOOKMARK_LIMIT = 30
 VALID_THEMES = ("dark", "light")
 SIZE_COL_WIDTH = 60
 DATE_COL_WIDTH = 122
+SEARCH_FOLDER_COL_WIDTH = 240
 LIST_DATETIME_FMT = "yyyy-MM-dd HH:mm"
 HOVER_TOOLTIP_DURATION_MULTIPLIER = 9
 
@@ -92,6 +94,7 @@ KEYBOARD_SHORTCUTS = [
     ("F2", "Rename"),
     ("Ctrl+Shift+R", "Bulk rename"),
     ("Ctrl+Shift+C", "Copy full path"),
+    ("Ctrl+Shift+D", "Open the selected item's containing folder"),
     ("Alt+Shift+C", "Copy folder path (parent folder if a file is selected)"),
 ]
 
@@ -1691,12 +1694,12 @@ def load_named_bookmarks() -> list:
                             "name": str(it.get("name","")),
                             "path": str(it.get("path",""))})
             except Exception: pass
-        return out[:10]
+        return out[:BOOKMARK_LIMIT]
     return []
 
 def save_named_bookmarks(items: list):
     s = QSettings(ORG_NAME, APP_NAME)
-    s.setValue("bookmarks/named_items", items[:10]); s.sync()
+    s.setValue("bookmarks/named_items", items[:BOOKMARK_LIMIT]); s.sync()
 
 def _derive_name_from_path(p: str) -> str:
     try:
@@ -1719,16 +1722,16 @@ def migrate_legacy_favorites_into_named(items: list) -> list:
     try:
         s = QSettings(ORG_NAME, APP_NAME)
         favs = s.value("favorites/paths", [])
-        if not favs: return items[:10]
+        if not favs: return items[:BOOKMARK_LIMIT]
         existing = {os.path.normcase(x.get("path","")) for x in items}
         for p in favs:
             np = nice_path(str(p))
             if os.path.normcase(np) in existing: continue
-            if len(items) >= 10: break
+            if len(items) >= BOOKMARK_LIMIT: break
             items.append({"enabled": True, "name": _derive_name_from_path(np), "path": np})
-        s.remove("favorites/paths"); return items[:10]
+        s.remove("favorites/paths"); return items[:BOOKMARK_LIMIT]
     except Exception:
-        return items[:10]
+        return items[:BOOKMARK_LIMIT]
 
 
 IS_DIR_ROLE = Qt.UserRole + 99
@@ -1987,7 +1990,12 @@ class FastStatWorker(QtCore.QThread):
 
 class DirEnumWorker(QtCore.QThread):
     batchReady=QtCore.pyqtSignal(list); finished=QtCore.pyqtSignal(); error=QtCore.pyqtSignal(str)
-    def __init__(self, root:str, parent=None): super().__init__(parent); self.root=root; self._cancel=False
+    def __init__(self, root:str, parent=None, preload_size: bool = False, preload_mtime: bool = False):
+        super().__init__(parent)
+        self.root=root
+        self._cancel=False
+        self._preload_size = bool(preload_size)
+        self._preload_mtime = bool(preload_mtime)
     def cancel(self): self._cancel=True
     def run(self):
         batch, BATCH=[], 400
@@ -1999,14 +2007,28 @@ class DirEnumWorker(QtCore.QThread):
                     try: is_dir=entry.is_dir(follow_symlinks=False)
                     except Exception: is_dir=os.path.isdir(p)
                     ext = file_extension_label(name, is_dir)
+                    size_val = None
+                    mtime_val = None
+                    if self._preload_size or self._preload_mtime:
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            if self._preload_size:
+                                size_val = 0 if is_dir else int(st.st_size)
+                            if self._preload_mtime:
+                                mtime_val = float(st.st_mtime)
+                        except Exception:
+                            if self._preload_size:
+                                size_val = 0 if is_dir else None
+                            if self._preload_mtime:
+                                mtime_val = None
                     batch.append({
                         "name": name,
                         "name_l": name.lower(),
                         "path": p,
                         "is_dir": is_dir,
                         "ext": ext,
-                        "size": None,
-                        "mtime": None,
+                        "size": size_val,
+                        "mtime": mtime_val,
                     })
                     if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
                 if batch: self.batchReady.emit(batch)
@@ -2200,6 +2222,13 @@ class StatOverlayProxy(QIdentityProxyModel):
 
         rec = self._cache.get(p) if p else None
 
+        info = None
+        if rec is None and p:
+            try:
+                info = src.fileInfo(sidx)
+            except Exception:
+                info = None
+
         if col == 1:
             if is_dir:
                 if role == SIZE_BYTES_ROLE:
@@ -2219,6 +2248,17 @@ class StatOverlayProxy(QIdentityProxyModel):
                 if role == Qt.DisplayRole:
                     return human_size(size_val)
 
+            if info is not None:
+                try:
+                    size_val = max(0, int(info.size()))
+                    if role == SIZE_BYTES_ROLE:
+                        return size_val
+                    if role == Qt.EditRole:
+                        return size_val
+                    if role == Qt.DisplayRole:
+                        return human_size(size_val)
+                except Exception:
+                    pass
 
             if role in (SIZE_BYTES_ROLE, Qt.EditRole):
                 return 0
@@ -2240,6 +2280,16 @@ class StatOverlayProxy(QIdentityProxyModel):
                 if role == Qt.EditRole:
                     return dt
 
+            if info is not None:
+                try:
+                    dt = info.lastModified()
+                    if dt and dt.isValid():
+                        if role == Qt.DisplayRole:
+                            return dt.toString(LIST_DATETIME_FMT)
+                        if role == Qt.EditRole:
+                            return dt
+                except Exception:
+                    pass
 
             if role == Qt.DisplayRole:
                 return ""
@@ -3314,6 +3364,8 @@ class ExplorerPane(QWidget):
         self._dirload_timer={}
         self._sort_column = 0
         self._sort_order = Qt.AscendingOrder
+        self._search_sort_column = 0
+        self._search_sort_order = Qt.AscendingOrder
         self._header_resize_guard = False
         self._browse_name_min_width = 140
         self._visible_stats_interval_ms = 60
@@ -3436,18 +3488,29 @@ class ExplorerPane(QWidget):
 
     def _configure_header_search(self):
         header = self.view.header()
-        header.setStretchLastSection(False)
         name_width = max(self._browse_name_min_width, header.sectionSize(0))
-        header.setSectionResizeMode(0, QHeaderView.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-        header.resizeSection(0, name_width)
-        header.resizeSection(1, SIZE_COL_WIDTH)
-        header.resizeSection(2, 44)
-        header.resizeSection(3, DATE_COL_WIDTH)
-        self.view.setColumnHidden(2, True)
+        size_width = self._load_search_header_width(1, SIZE_COL_WIDTH)
+        ext_width = self._load_search_header_width(2, 44)
+        date_width = self._load_search_header_width(3, DATE_COL_WIDTH)
+        folder_width = self._load_search_header_width(4, SEARCH_FOLDER_COL_WIDTH)
+        self._header_resize_guard = True
+        try:
+            header.blockSignals(True)
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(0, QHeaderView.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.Interactive)
+            header.setSectionResizeMode(2, QHeaderView.Interactive)
+            header.setSectionResizeMode(3, QHeaderView.Interactive)
+            header.setSectionResizeMode(4, QHeaderView.Interactive)
+            header.resizeSection(0, name_width)
+            header.resizeSection(1, size_width)
+            header.resizeSection(2, ext_width)
+            header.resizeSection(3, date_width)
+            header.resizeSection(4, folder_width)
+            self.view.setColumnHidden(2, True)
+        finally:
+            header.blockSignals(False)
+            self._header_resize_guard = False
 
     def _schedule_browse_name_autofit(self):
         if self._search_mode:
@@ -3484,7 +3547,12 @@ class ExplorerPane(QWidget):
             self._header_resize_guard = False
 
     def _on_header_section_resized(self, logical_index:int, _old_size:int, _new_size:int):
-        if self._header_resize_guard or self._search_mode:
+        if self._header_resize_guard:
+            return
+
+        if self._search_mode:
+            if logical_index in (1, 2, 3, 4):
+                self._save_search_header_width(logical_index, _new_size)
             return
 
         if logical_index in (1, 2, 3):
@@ -3547,6 +3615,7 @@ class ExplorerPane(QWidget):
 
 
         add_sc("Ctrl+Shift+C", lambda: self._copy_path_shortcut(False))
+        add_sc("Ctrl+Shift+D", self._open_selected_item_container)
         add_sc("Alt+Shift+C",  lambda: self._copy_path_shortcut(True))
 
     def _set_search_button_state(self, running: bool):
@@ -3583,6 +3652,8 @@ class ExplorerPane(QWidget):
         except Exception:
             self._sort_column = 0
             self._sort_order = Qt.AscendingOrder
+        self._search_sort_column = 0
+        self._search_sort_order = Qt.AscendingOrder
 
     def _save_sort_settings(self):
         try:
@@ -3593,13 +3664,92 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-    def _apply_saved_sort(self):
+    def _get_sort_state(self, search_mode: bool | None = None) -> tuple[int, Qt.SortOrder]:
+        is_search = self._search_mode if search_mode is None else bool(search_mode)
+        if is_search:
+            col = getattr(self, "_search_sort_column", 0)
+            order = getattr(self, "_search_sort_order", Qt.AscendingOrder)
+            max_col = 4
+        else:
+            col = getattr(self, "_sort_column", 0)
+            order = getattr(self, "_sort_order", Qt.AscendingOrder)
+            max_col = 3
+        try:
+            col = int(col)
+        except Exception:
+            col = 0
+        if col < 0 or col > max_col:
+            col = 0
+        order = Qt.DescendingOrder if order == Qt.DescendingOrder else Qt.AscendingOrder
+        return col, order
+
+    def _set_sort_state(self, column: int, order, search_mode: bool | None = None):
+        is_search = self._search_mode if search_mode is None else bool(search_mode)
+        col, normalized_order = self._get_sort_state(search_mode=is_search)
+        try:
+            col = int(column)
+        except Exception:
+            pass
+        max_col = 4 if is_search else 3
+        if col < 0 or col > max_col:
+            col = 0
+        normalized_order = Qt.DescendingOrder if order == Qt.DescendingOrder else Qt.AscendingOrder
+        if is_search:
+            self._search_sort_column = col
+            self._search_sort_order = normalized_order
+        else:
+            self._sort_column = col
+            self._sort_order = normalized_order
+            self._save_sort_settings()
+        return col, normalized_order
+
+    def _sync_sort_state_from_view(self):
+        v = getattr(self, "view", None)
+        if v is None:
+            return
+        header = v.header()
+        if header is None:
+            return
+        try:
+            col = header.sortIndicatorSection()
+            order = header.sortIndicatorOrder()
+        except Exception:
+            return
+        self._set_sort_state(col, order, search_mode=self._search_mode)
+
+    def _load_search_header_width(self, logical_index: int, default: int) -> int:
+        fallback = max(24, int(default))
+        try:
+            s = QSettings(ORG_NAME, APP_NAME)
+            width = s.value(f"pane_{self.pane_id}/search_width_{logical_index}", fallback, type=int)
+            return max(24, int(width))
+        except Exception:
+            return fallback
+
+    def _save_search_header_width(self, logical_index: int, width: int):
+        try:
+            s = QSettings(ORG_NAME, APP_NAME)
+            s.setValue(f"pane_{self.pane_id}/search_width_{logical_index}", max(24, int(width)))
+            s.sync()
+        except Exception:
+            pass
+
+    def _apply_saved_sort(self, search_mode: bool | None = None):
         try:
             v = self.view
+            col, order = self._get_sort_state(search_mode=search_mode)
+            model = v.model()
+            if model is not None:
+                try:
+                    max_col = max(0, int(model.columnCount()) - 1)
+                except Exception:
+                    max_col = 0
+                if col > max_col:
+                    col = 0
             if not v.isSortingEnabled():
                 v.setSortingEnabled(True)
-            v.header().setSortIndicator(self._sort_column, self._sort_order)
-            v.sortByColumn(self._sort_column, self._sort_order)
+            v.header().setSortIndicator(col, order)
+            v.sortByColumn(col, order)
         except Exception:
             pass
 
@@ -3713,6 +3863,91 @@ class ExplorerPane(QWidget):
                 self.host.statusBar().showMessage("Failed to copy path to clipboard.", 2000)
             except Exception:
                 pass
+
+    def _select_visible_path(self, target_path: str, focus: bool = False) -> bool:
+        target_path = nice_path(target_path)
+        target_key = os.path.normcase(target_path)
+
+        try:
+            if focus and self.view and not self.view.hasFocus():
+                self.view.setFocus(Qt.ShortcutFocusReason)
+        except Exception:
+            pass
+
+        if self._search_mode:
+            return False
+
+        try:
+            if self._using_fast:
+                rows = self._fast_model.rowCount()
+                for r in range(rows):
+                    rp = self._fast_model.row_path(r)
+                    if rp and os.path.normcase(rp) == target_key:
+                        prx_ix = self._fast_proxy.index(r, 0)
+                        sm = self.view.selectionModel()
+                        sm.clearSelection()
+                        sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+                        self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
+                        self.view.setCurrentIndex(prx_ix)
+                        return True
+            else:
+                src_ix = self.source_model.index(target_path)
+                if src_ix.isValid():
+                    st_ix = self.stat_proxy.mapFromSource(src_ix)
+                    prx_ix = self.proxy.mapFromSource(st_ix)
+                    sm = self.view.selectionModel()
+                    sm.clearSelection()
+                    sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+                    self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
+                    self.view.setCurrentIndex(prx_ix)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _schedule_select_visible_path(self, target_path: str, focus: bool = False):
+        target_path = nice_path(target_path)
+        for delay in (0, 80, 200, 450, 900, 1500):
+            QTimer.singleShot(delay, lambda p=target_path, f=focus: self._select_visible_path(p, focus=f))
+
+    def _open_selected_item_container(self):
+        if not self._search_mode:
+            try:
+                self.host.statusBar().showMessage("This shortcut is available in search mode.", 2000)
+            except Exception:
+                pass
+            return
+
+        sel = self._selected_paths()
+        if len(sel) != 1:
+            try:
+                self.host.statusBar().showMessage("Select exactly one item.", 2000)
+            except Exception:
+                pass
+            return
+
+        target_path = nice_path(sel[0])
+        try:
+            container_path = str(Path(target_path).parent)
+        except Exception:
+            container_path = os.path.dirname(target_path.rstrip("\\/")) or target_path
+
+        if not container_path:
+            container_path = target_path
+
+        if not os.path.isdir(container_path):
+            try:
+                self.host.statusBar().showMessage("Containing folder is not available.", 2000)
+            except Exception:
+                pass
+            return
+
+        self.set_path(container_path, push_history=True)
+        self._schedule_select_visible_path(target_path, focus=True)
+        try:
+            self.host.flash_status("Opened containing folder")
+        except Exception:
+            pass
 
     def _stop_worker_thread(self, w, wait_ms: int = 100, label: str = "") -> bool:
         if not w:
@@ -4221,20 +4456,17 @@ class ExplorerPane(QWidget):
         if not v.isSortingEnabled():
             v.setSortingEnabled(True)
 
+        cur_col, cur_order = self._get_sort_state()
 
-        if col == self._sort_column:
-            new_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        if col == cur_col:
+            new_order = Qt.DescendingOrder if cur_order == Qt.AscendingOrder else Qt.AscendingOrder
         else:
             new_order = Qt.AscendingOrder
 
-        self._sort_column = col
-        self._sort_order = new_order
+        col, new_order = self._set_sort_state(col, new_order, search_mode=self._search_mode)
 
         v.header().setSortIndicator(col, new_order)
         v.sortByColumn(col, new_order)
-
-
-        self._save_sort_settings()
 
     def _mark_self_active(self):
         try:
@@ -4463,6 +4695,10 @@ class ExplorerPane(QWidget):
         self._fast_enum_count = 0
         self._fast_enum_root = path
         self._fast_enum_done = False
+        sort_col, sort_order = self._get_sort_state(search_mode=False)
+        preload_size = (sort_col == 1)
+        preload_mtime = (sort_col == 3)
+        live_sort_during_enum = (preload_size or preload_mtime)
 
 
 
@@ -4480,18 +4716,30 @@ class ExplorerPane(QWidget):
 
 
         was_sorting = self.view.isSortingEnabled()
-        if was_sorting:
+        if was_sorting and not live_sort_during_enum:
             self.view.setSortingEnabled(False)
-        self.view.setUpdatesEnabled(False)
+        self.view.setUpdatesEnabled(not live_sort_during_enum)
+        if live_sort_during_enum:
+            self._apply_saved_sort(search_mode=False)
 
         self._fast_batch_counter = 0
-        self._enum_worker = DirEnumWorker(path, self)
+        self._enum_worker = DirEnumWorker(
+            path,
+            self,
+            preload_size=preload_size,
+            preload_mtime=preload_mtime,
+        )
 
 
         def _on_batch(rows):
             self._fast_model.append_rows(rows)
             self._fast_enum_count += len(rows or [])
             self._fast_batch_counter += 1
+            if live_sort_during_enum and (self._fast_batch_counter % 2) == 0:
+                try:
+                    self._fast_proxy.sort(sort_col, sort_order)
+                except Exception:
+                    pass
             if (self._fast_batch_counter % 6) == 0:
                 self._request_visible_stats(0)
 
@@ -4823,6 +5071,7 @@ class ExplorerPane(QWidget):
     def refresh(self):
         self.hard_refresh()
     def hard_refresh(self):
+        self._sync_sort_state_from_view()
         if self._search_mode:
             self._apply_filter()
             try:
@@ -5293,6 +5542,7 @@ class ExplorerPane(QWidget):
 
 
     def _enter_browse_mode(self):
+        self._sync_sort_state_from_view()
 
         try:
             if hasattr(self, "_cancel_search_worker"):
@@ -5334,11 +5584,12 @@ class ExplorerPane(QWidget):
         if not self.view.isSortingEnabled():
             self.view.setSortingEnabled(True)
 
-        self._apply_saved_sort()
+        self._apply_saved_sort(search_mode=False)
 
         self._request_visible_stats(0)
 
     def _enter_search_mode(self, model:QStandardItemModel):
+        self._sync_sort_state_from_view()
         self._cancel_fast_stat_worker()
         self._using_fast=False
         self._search_mode=True
@@ -5355,10 +5606,8 @@ class ExplorerPane(QWidget):
 
         self._hook_selection_model()
 
-        header = self.view.header()
         self._configure_header_search()
-        if not self.view.isSortingEnabled(): self.view.setSortingEnabled(True)
-        header.setSortIndicator(0, Qt.AscendingOrder); self.view.sortByColumn(0, Qt.AscendingOrder)
+        self._apply_saved_sort(search_mode=True)
 
 
     def _apply_filter(self):
@@ -5982,15 +6231,15 @@ class MultiExplorer(QMainWindow):
             if not it.get("name"): it["name"]=_derive_name_from_path(np)
             self.named_bookmarks[idx]=it
         else:
-            if len(self.named_bookmarks)>=10 and all(x.get("enabled") for x in self.named_bookmarks):
-                QMessageBox.information(self,"Bookmarks","Bookmark limit reached (10). Please edit bookmarks to free a slot.")
+            if len(self.named_bookmarks)>=BOOKMARK_LIMIT and all(x.get("enabled") for x in self.named_bookmarks):
+                QMessageBox.information(self,"Bookmarks",f"Bookmark limit reached ({BOOKMARK_LIMIT}). Please edit bookmarks to free a slot.")
                 self._open_bookmark_editor(); return
             reused=False
             for i,it in enumerate(self.named_bookmarks):
                 if not it.get("enabled") and not it.get("name") and not it.get("path"):
                     self.named_bookmarks[i]={"enabled":True,"name":_derive_name_from_path(np),"path":np}; reused=True; break
             if not reused: self.named_bookmarks.append({"enabled":True,"name":_derive_name_from_path(np),"path":np})
-            if len(self.named_bookmarks)>10: self.named_bookmarks=self.named_bookmarks[:10]
+            if len(self.named_bookmarks)>BOOKMARK_LIMIT: self.named_bookmarks=self.named_bookmarks[:BOOKMARK_LIMIT]
         save_named_bookmarks(self.named_bookmarks); self.namedBookmarksChanged.emit(self.named_bookmarks); self.flash_status("Bookmarks updated")
 
     def _open_bookmark_editor(self):
@@ -6002,9 +6251,9 @@ class MultiExplorer(QMainWindow):
         dlg.finished.connect(self._on_bmdlg_closed)
         if dlg.exec_()==QDialog.Accepted:
             new_items=dlg.values(); cleaned=[]
-            for it in new_items[:10]:
+            for it in new_items[:BOOKMARK_LIMIT]:
                 cleaned.append({"name":it.get("name","").strip(),"path":it.get("path","").strip(),"enabled":bool(it.get("enabled",False))})
-            self.named_bookmarks=cleaned[:10]; save_named_bookmarks(self.named_bookmarks); self.namedBookmarksChanged.emit(self.named_bookmarks)
+            self.named_bookmarks=cleaned[:BOOKMARK_LIMIT]; save_named_bookmarks(self.named_bookmarks); self.namedBookmarksChanged.emit(self.named_bookmarks)
 
     def _on_bmdlg_closed(self,*_):
         try:
@@ -6033,7 +6282,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.2.1</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
@@ -6234,19 +6483,19 @@ class SessionManagerDialog(QDialog):
 class BookmarkEditDialog(QDialog):
     def __init__(self, parent=None, items=None):
         super().__init__(parent)
-        self.setWindowTitle("Edit Bookmarks (max 10)")
-        self.resize(760, 420)
+        self.setWindowTitle(f"Edit Bookmarks (max {BOOKMARK_LIMIT})")
+        self.resize(760, 520)
         self.table = _setup_readonly_table(
             QTableWidget(self),
             ["Enabled", "Name", "Path"],
             [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
         )
-        self.table.setRowCount(10)
+        self.table.setRowCount(BOOKMARK_LIMIT)
         self._rows = []
         lay = QVBoxLayout(self); lay.addWidget(self.table, 1)
         _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         items = list(items or [])
-        for i in range(10):
+        for i in range(BOOKMARK_LIMIT):
             it = items[i] if i < len(items) else _empty_bookmark_item()
             self._add_row(i, it)
 
@@ -6278,7 +6527,7 @@ class BookmarkEditDialog(QDialog):
 
     def set_items(self, items: list):
         items = list(items or [])
-        for r in range(10):
+        for r in range(BOOKMARK_LIMIT):
             it = items[r] if r < len(items) else _empty_bookmark_item()
             chk, name_edit, path_edit = self._rows[r]
             chk.setChecked(bool(it.get("enabled", False)))
