@@ -68,6 +68,7 @@ ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
+FILEOP_ERROR_DETAIL_LIMIT = 50
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 VALID_THEMES = ("dark", "light")
@@ -515,6 +516,8 @@ class FileOpWorker(QtCore.QThread):
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
         self._src_size_cache = {}
+        self.errors = []
+        self.error_count = 0
 
     def cancel(self): self._cancel = True
 
@@ -580,15 +583,19 @@ class FileOpWorker(QtCore.QThread):
     def _emit_progress(self, force: bool = False):
         total = max(1, int(self._total or 1))
         pct = min(100, int(self._done * 100 / total))
+        if not force:
+            pct = min(99, pct)
         now = time.perf_counter()
         should_emit = (
             force
             or pct >= 100
             or self._last_progress_pct < 0
-            or pct > self._last_progress_pct
-            and (
-                (pct - self._last_progress_pct) >= 1
-                or (now - self._last_progress_emit_ts) >= 0.05
+            or (
+                pct > self._last_progress_pct
+                and (
+                    (pct - self._last_progress_pct) >= 1
+                    or (now - self._last_progress_emit_ts) >= 0.05
+                )
             )
         )
         if not should_emit:
@@ -611,6 +618,7 @@ class FileOpWorker(QtCore.QThread):
 
     def _skip_source_progress(self, src):
         if self._count_progress:
+            self._tick_count_unit(1)
             return
         try:
             delta = self._src_size_cache.get(_path_key(src))
@@ -621,36 +629,72 @@ class FileOpWorker(QtCore.QThread):
         self._tick_progress(delta)
 
     def _emit_source_done(self):
-        if self._count_progress:
-            self._done += 1
-            self._emit_progress()
-            return
         self._emit_progress()
 
     def _copy_file(self, src, dst):
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-            while True:
-                if self._cancel: return
-                buf = fsrc.read(1024 * 1024)
-                if not buf: break
-                fdst.write(buf)
-                self._tick_progress(len(buf))
-        self._tick_count_unit(1)
-        try: shutil.copystat(src, dst, follow_symlinks=True)
-        except Exception: pass
+        copied = 0
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                while True:
+                    if self._cancel:
+                        return False
+                    buf = fsrc.read(1024 * 1024)
+                    if not buf: break
+                    fdst.write(buf)
+                    copied += len(buf)
+                    self._tick_progress(len(buf))
+            self._tick_count_unit(1)
+            try: shutil.copystat(src, dst, follow_symlinks=True)
+            except Exception: pass
+            return True
+        except Exception:
+            self._skip_file_progress(src, copied)
+            raise
+
+    def _skip_file_progress(self, src, copied_bytes: int = 0):
+        if self._count_progress:
+            self._tick_count_unit(1)
+            return
+        try:
+            size = max(0, int(os.path.getsize(src)))
+        except Exception:
+            size = 0
+        self._tick_progress(max(0, size - max(0, int(copied_bytes or 0))))
+
+    def _record_copy_error(self, src, dst, exc):
+        if self._cancel:
+            return
+        self.error_count += 1
+        if len(self.errors) < FILEOP_ERROR_DETAIL_LIMIT:
+            self.errors.append(f"{src} -> {dst}: {exc}")
+        name = os.path.basename(str(src).rstrip("\\/")) or str(src)
+        self.status.emit(f"Failed: {name}")
 
     def _copy_dir_recursive(self, src_dir, dst_dir):
+        ok = True
         for root, dirs, files in os.walk(src_dir):
-            if self._cancel: return
+            if self._cancel: return ok
             rel = os.path.relpath(root, src_dir)
             target_root = os.path.join(dst_dir, "" if rel == "." else rel)
-            os.makedirs(target_root, exist_ok=True)
+            try:
+                os.makedirs(target_root, exist_ok=True)
+            except Exception as e:
+                self._record_copy_error(root, target_root, e)
+                for f in files:
+                    self._skip_file_progress(os.path.join(root, f))
+                ok = False
+                continue
             for f in files:
-                if self._cancel: return
+                if self._cancel: return ok
                 sfile = os.path.join(root, f)
                 dfile = os.path.join(target_root, f)
-                self._copy_file(sfile, dfile)
+                try:
+                    self._copy_file(sfile, dfile)
+                except Exception as e:
+                    self._record_copy_error(sfile, dfile, e)
+                    ok = False
+        return ok
 
     def run(self):
         try:
@@ -663,6 +707,7 @@ class FileOpWorker(QtCore.QThread):
             for src in self.srcs:
                 if self._cancel: break
                 if not os.path.exists(src):
+                    self._skip_source_progress(src)
                     self._emit_source_done()
                     continue
 
@@ -699,9 +744,17 @@ class FileOpWorker(QtCore.QThread):
                             elif action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
                             elif action == "overwrite":
-                                try: shutil.rmtree(dst)
-                                except Exception: pass
-                        os.makedirs(dst, exist_ok=True)
+                                if not (os.path.isdir(dst) and not os.path.islink(dst)):
+                                    try:
+                                        remove_any(dst)
+                                    except Exception as e:
+                                        self._record_copy_error(src, dst, e)
+                                        self._skip_source_progress(src); self._emit_source_done(); continue
+                        try:
+                            os.makedirs(dst, exist_ok=True)
+                        except Exception as e:
+                            self._record_copy_error(src, dst, e)
+                            self._skip_source_progress(src); self._emit_source_done(); continue
                         self._copy_dir_recursive(src, dst)
                     else:
                         if exists:
@@ -709,8 +762,17 @@ class FileOpWorker(QtCore.QThread):
                                 self._skip_source_progress(src); self._emit_source_done(); continue
                             elif action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
+                            elif action == "overwrite" and os.path.isdir(dst) and not os.path.islink(dst):
+                                try:
+                                    shutil.rmtree(dst)
+                                except Exception as e:
+                                    self._record_copy_error(src, dst, e)
+                                    self._skip_source_progress(src); self._emit_source_done(); continue
 
-                        self._copy_file(src, dst)
+                        try:
+                            self._copy_file(src, dst)
+                        except Exception as e:
+                            self._record_copy_error(src, dst, e)
 
 
                 else:
@@ -731,6 +793,7 @@ class FileOpWorker(QtCore.QThread):
                         if src_progress_size is None:
                             src_progress_size = self._size_of(final if os.path.exists(final) else src)
                         self._tick_progress(src_progress_size)
+                        self._tick_count_unit(1)
                     except Exception:
                         # Cross-device move or permission failures: fall back to copy.
                         if os.path.isdir(src) and not os.path.islink(src):
@@ -739,20 +802,32 @@ class FileOpWorker(QtCore.QThread):
                                 except Exception: pass
                             if os.path.exists(dst) and action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
-                            os.makedirs(dst, exist_ok=True)
-                            self._copy_dir_recursive(src, dst)
-                            if not self._cancel:
-                                shutil.rmtree(src)
+                            try:
+                                os.makedirs(dst, exist_ok=True)
+                            except Exception as e:
+                                self._record_copy_error(src, dst, e)
+                                self._skip_source_progress(src); self._emit_source_done(); continue
+                            copied_ok = self._copy_dir_recursive(src, dst)
+                            if not self._cancel and copied_ok:
+                                try:
+                                    shutil.rmtree(src)
+                                except Exception as e:
+                                    self._record_copy_error(src, dst, e)
                         else:
                             if os.path.exists(dst) and action == "overwrite":
                                 try: os.remove(dst)
                                 except Exception: pass
                             if os.path.exists(dst) and action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
-                            self._copy_file(src, dst)
-                            if not self._cancel:
+                            copied_ok = False
+                            try:
+                                copied_ok = bool(self._copy_file(src, dst))
+                            except Exception as e:
+                                self._record_copy_error(src, dst, e)
+                            if not self._cancel and copied_ok:
                                 try: os.remove(src)
-                                except Exception: pass
+                                except Exception as e:
+                                    self._record_copy_error(src, dst, e)
 
                 self._emit_source_done()
 
@@ -5292,10 +5367,11 @@ class ExplorerPane(QWidget):
         worker=FileOpWorker(op, valid_srcs, dst_dir, conflict_map=conflict_map, parent=self)
         dlgp=QProgressDialog(f"{op.title()} in progress...", "Cancel", 0, 100, self)
         dlgp.setWindowTitle(f"{op.title()} files"); dlgp.setWindowModality(Qt.WindowModal)
-        dlgp.setAutoClose(True); dlgp.setAutoReset(True)
+        dlgp.setAutoClose(False); dlgp.setAutoReset(False)
         dlgp.setMinimumDuration(0)
 
         worker.progress.connect(dlgp.setValue)
+        worker.status.connect(dlgp.setLabelText)
         worker.status.connect(lambda s: self.host.statusBar().showMessage(s,2000))
 
         def _on_error(msg):
@@ -5309,6 +5385,19 @@ class ExplorerPane(QWidget):
             except Exception: pass
             if not self._using_fast and not self._search_mode: self.stat_proxy.clear_cache()
             self._request_visible_stats(0); self._update_pane_status()
+            failed = int(getattr(worker, "error_count", 0) or len(getattr(worker, "errors", [])))
+            if failed:
+                details_list = list(getattr(worker, "errors", []) or [])
+                details = "\n".join(details_list)
+                if failed > len(details_list):
+                    details = (details + "\n" if details else "") + f"... {failed - len(details_list)} more error(s)."
+                QMessageBox.warning(
+                    self,
+                    f"{op.title()} completed with errors",
+                    f"{op.title()} finished, but {failed} file(s) could not be processed.\n\n{details[:2000]}",
+                )
+                self.host.flash_status(f"{op.title()} finished with {failed} error(s)")
+                return
             self.host.flash_status(f"{op.title()} complete")
 
         def _cleanup_worker():
@@ -6282,7 +6371,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.0</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.1</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
