@@ -69,6 +69,8 @@ SEARCH_RESULT_LIMIT = 50000
 FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
 FILEOP_SIZE_SCAN_TIME_MS = 1200
 FILEOP_ERROR_DETAIL_LIMIT = 50
+LARGE_FOLDER_THRESHOLD = 3000
+GENERIC_ICON_THRESHOLD = 1200
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 VALID_THEMES = ("dark", "light")
@@ -90,7 +92,7 @@ KEYBOARD_SHORTCUTS = [
     ("Esc (in filter input)", "Clear filter + return to browse mode"),
     ("F5", "Hard refresh"),
     ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy / Cut / Paste"),
-    ("Ctrl+Z", "Undo (new folder / rename actions)"),
+    ("Ctrl+Z", "Undo (new folder / rename / safe copy-move actions)"),
     ("Delete / Shift+Delete", "Recycle / Permanent delete"),
     ("F2", "Rename"),
     ("Ctrl+Shift+R", "Bulk rename"),
@@ -422,12 +424,9 @@ def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
             return (res == 0) and (not aborted)
         except Exception as e:
             if DEBUG: print("[delete] SHFileOperation failed:", e)
-    try:
-        remove_any(path)
-        return True
-    except Exception as e:
-        if DEBUG: print("[delete] fallback remove failed:", e)
-        return False
+    if DEBUG:
+        print("[delete] refusing permanent fallback for Recycle Bin delete:", path)
+    return False
 
 def move_with_collision(src: str, dst_dir: str) -> str:
     name = os.path.basename(src); dst = os.path.join(dst_dir, name)
@@ -518,6 +517,8 @@ class FileOpWorker(QtCore.QThread):
         self._src_size_cache = {}
         self.errors = []
         self.error_count = 0
+        self.undo_remove_paths = []
+        self.undo_move_pairs = []
 
     def cancel(self): self._cancel = True
 
@@ -671,6 +672,22 @@ class FileOpWorker(QtCore.QThread):
         name = os.path.basename(str(src).rstrip("\\/")) or str(src)
         self.status.emit(f"Failed: {name}")
 
+    def _can_undo_new_destination(self, existed_before: bool, action: str | None) -> bool:
+        return (not existed_before) or action == "copy"
+
+    def _remember_created_for_undo(self, path: str):
+        if not path:
+            return
+        key = _path_key(path)
+        if any(_path_key(p) == key for p in self.undo_remove_paths):
+            return
+        self.undo_remove_paths.append(path)
+
+    def _remember_move_for_undo(self, final_path: str, original_path: str):
+        if not final_path or not original_path:
+            return
+        self.undo_move_pairs.append((final_path, original_path))
+
     def _copy_dir_recursive(self, src_dir, dst_dir):
         ok = True
         for root, dirs, files in os.walk(src_dir):
@@ -738,6 +755,7 @@ class FileOpWorker(QtCore.QThread):
 
                 if self.op == "copy":
                     if os.path.isdir(src) and not os.path.islink(src):
+                        created_for_undo = self._can_undo_new_destination(exists, action)
                         if exists:
                             if action == "skip":
                                 self._skip_source_progress(src); self._emit_source_done(); continue
@@ -755,8 +773,11 @@ class FileOpWorker(QtCore.QThread):
                         except Exception as e:
                             self._record_copy_error(src, dst, e)
                             self._skip_source_progress(src); self._emit_source_done(); continue
-                        self._copy_dir_recursive(src, dst)
+                        copied_ok = self._copy_dir_recursive(src, dst)
+                        if copied_ok and created_for_undo:
+                            self._remember_created_for_undo(dst)
                     else:
+                        created_for_undo = self._can_undo_new_destination(exists, action)
                         if exists:
                             if action == "skip":
                                 self._skip_source_progress(src); self._emit_source_done(); continue
@@ -770,13 +791,16 @@ class FileOpWorker(QtCore.QThread):
                                     self._skip_source_progress(src); self._emit_source_done(); continue
 
                         try:
-                            self._copy_file(src, dst)
+                            copied_ok = self._copy_file(src, dst)
+                            if copied_ok and created_for_undo:
+                                self._remember_created_for_undo(dst)
                         except Exception as e:
                             self._record_copy_error(src, dst, e)
 
 
                 else:
                     keep_both = (action == "copy")
+                    can_undo_move = self._can_undo_new_destination(exists, action)
                     src_progress_size = self._src_size_cache.get(_path_key(src))
                     if exists:
                         if action == "skip":
@@ -794,6 +818,8 @@ class FileOpWorker(QtCore.QThread):
                             src_progress_size = self._size_of(final if os.path.exists(final) else src)
                         self._tick_progress(src_progress_size)
                         self._tick_count_unit(1)
+                        if can_undo_move:
+                            self._remember_move_for_undo(final, src)
                     except Exception:
                         # Cross-device move or permission failures: fall back to copy.
                         if os.path.isdir(src) and not os.path.islink(src):
@@ -808,11 +834,15 @@ class FileOpWorker(QtCore.QThread):
                                 self._record_copy_error(src, dst, e)
                                 self._skip_source_progress(src); self._emit_source_done(); continue
                             copied_ok = self._copy_dir_recursive(src, dst)
+                            removed_src = False
                             if not self._cancel and copied_ok:
                                 try:
                                     shutil.rmtree(src)
+                                    removed_src = True
                                 except Exception as e:
                                     self._record_copy_error(src, dst, e)
+                            if removed_src and can_undo_move:
+                                self._remember_move_for_undo(dst, src)
                         else:
                             if os.path.exists(dst) and action == "overwrite":
                                 try: os.remove(dst)
@@ -824,10 +854,15 @@ class FileOpWorker(QtCore.QThread):
                                 copied_ok = bool(self._copy_file(src, dst))
                             except Exception as e:
                                 self._record_copy_error(src, dst, e)
+                            removed_src = False
                             if not self._cancel and copied_ok:
-                                try: os.remove(src)
+                                try:
+                                    os.remove(src)
+                                    removed_src = True
                                 except Exception as e:
                                     self._record_copy_error(src, dst, e)
+                            if removed_src and can_undo_move:
+                                self._remember_move_for_undo(dst, src)
 
                 self._emit_source_done()
 
@@ -912,7 +947,10 @@ class DeleteWorker(QtCore.QThread):
                         if recycle_path_to_trash(path, self.hwnd):
                             self.deleted_count += 1
                         else:
-                            self.errors.append(f"{path}: Could not move item to Recycle Bin.")
+                            self.errors.append(
+                                f"{path}: Could not move item to Recycle Bin. It was not deleted; "
+                                "use Shift+Delete only if you want permanent deletion."
+                            )
                 except Exception as e:
                     self.errors.append(f"{path}: {e}")
 
@@ -938,6 +976,7 @@ def _common_css():
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
     QToolButton#quickBookmarkBtn {{ text-align: left; }}
+    QLabel#modeBadge {{ padding: 0 6px; border-radius: 6px; }}
     QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
 
@@ -1005,6 +1044,7 @@ _THEME_CSS_TEMPLATE = """
         QPushButton#crumb { background: %(crumb_bg)s; border: 1px solid %(crumb_border)s; padding: 0 6px; border-radius: 6px; text-align: left; color: %(crumb_fg)s; }
         QPushButton#crumb:hover { background: %(crumb_hover_bg)s; }
         QLabel#crumbSep { color: %(crumb_sep)s; }
+        QLabel#modeBadge { color: %(mode_badge_fg)s; background: %(mode_badge_bg)s; border: 1px solid %(mode_badge_border)s; }
         QScrollArea#crumbScroll, QScrollArea#crumbScroll[active="true"] { border: 0px solid transparent; }
         QScrollArea#crumbScroll > QWidget#crumbViewport { background: transparent; }
         QWidget#paneRoot { border: 1px solid transparent; border-radius: 10px; }
@@ -1036,6 +1076,7 @@ _THEME_STYLE_SPECS = {
             "menu_bg": "#20232A", "menu_fg": "#E6E9EE", "menu_border": "#2B2E34", "menu_selected_bg": "#2D3550",
             "crumb_bg": "rgba(255,255,255,0.05)", "crumb_border": "#2B2E34", "crumb_fg": "#E6E9EE",
             "crumb_hover_bg": "rgba(255,255,255,0.09)", "crumb_sep": "#7F8796",
+            "mode_badge_fg": "#DDE8FF", "mode_badge_bg": "rgba(94,155,255,0.16)", "mode_badge_border": "rgba(94,155,255,0.38)",
             "active_root_bg": "rgba(94, 155, 255, 0.06)", "active_crumb_bg": "rgba(94,155,255,0.16)",
             "active_crumb_border": "rgba(94,155,255,0.40)", "active_crumb_hover_bg": "rgba(94,155,255,0.22)",
             "active_tree_border": "rgba(94,155,255,0.45)", "active_lineedit_border": "rgba(94,155,255,0.35)",
@@ -1064,6 +1105,7 @@ _THEME_STYLE_SPECS = {
             "menu_bg": "#FFFFFF", "menu_fg": "#1C1C1E", "menu_border": "#CED3DB", "menu_selected_bg": "#EAEFFF",
             "crumb_bg": "rgba(0,0,0,0.04)", "crumb_border": "#E5E8EE", "crumb_fg": "#1C1C1E",
             "crumb_hover_bg": "rgba(0,0,0,0.07)", "crumb_sep": "#7A7F89",
+            "mode_badge_fg": "#1A3B8A", "mode_badge_bg": "#EAF2FF", "mode_badge_border": "#BBD0FF",
             "active_root_bg": "rgba(64, 128, 255, 0.06)", "active_crumb_bg": "rgba(64,128,255,0.12)",
             "active_crumb_border": "rgba(64,128,255,0.40)", "active_crumb_hover_bg": "rgba(64,128,255,0.18)",
             "active_tree_border": "rgba(64,128,255,0.40)", "active_lineedit_border": "rgba(64,128,255,0.35)",
@@ -3433,6 +3475,7 @@ class ExplorerPane(QWidget):
         self._fast_enum_count = 0
         self._fast_enum_root = ""
         self._fast_enum_done = False
+        self._large_folder_mode = False
         self._deferred_normal_load_path = None
         self._file_worker=None
         self._op_progress_dialog=None
@@ -3635,10 +3678,34 @@ class ExplorerPane(QWidget):
 
     def _build_status_row(self):
         self.lbl_sel=QLabel("", self); self.lbl_free=QLabel("", self)
+        self.lbl_mode=QLabel("", self)
+        self.lbl_mode.setObjectName("modeBadge")
+        self.lbl_mode.setFixedHeight(UI_H)
+        self.lbl_mode.hide()
         row_status=QHBoxLayout(); row_status.setContentsMargins(0,0,0,0); row_status.setSpacing(ROW_SPACING)
-        row_status.addWidget(self.lbl_sel,0); row_status.addStretch(1); row_status.addWidget(self.lbl_free,0)
+        row_status.addWidget(self.lbl_sel,0); row_status.addWidget(self.lbl_mode,0); row_status.addStretch(1); row_status.addWidget(self.lbl_free,0)
         self._row_status=row_status
         return row_status
+
+    def _set_large_folder_mode(self, active: bool, count: int | None = None, complete: bool = False):
+        self._large_folder_mode = bool(active)
+        lbl = getattr(self, "lbl_mode", None)
+        if not lbl:
+            return
+        if not active:
+            lbl.clear()
+            lbl.hide()
+            return
+        text = "Large folder mode"
+        if count is not None:
+            try:
+                n = max(0, int(count))
+                text += f": {n:,}{'' if complete else '+'} items"
+            except Exception:
+                pass
+        lbl.setText(text)
+        lbl.setToolTip("Using fast listing for a large folder; native details may load differently.")
+        lbl.show()
 
     def _apply_layout(self, row_toolbar, row_path, row_filter, row_status):
         root_layout=QVBoxLayout(self); root_layout.setContentsMargins(*PANE_MARGIN); root_layout.setSpacing(max(1, ROW_SPACING//2))
@@ -4767,6 +4834,7 @@ class ExplorerPane(QWidget):
         self.view.setModel(self._fast_proxy)
         self.view.setRootIndex(QtCore.QModelIndex())
         self._configure_header_fast()
+        self._set_large_folder_mode(False)
         self._fast_enum_count = 0
         self._fast_enum_root = path
         self._fast_enum_done = False
@@ -4809,6 +4877,8 @@ class ExplorerPane(QWidget):
         def _on_batch(rows):
             self._fast_model.append_rows(rows)
             self._fast_enum_count += len(rows or [])
+            if self._fast_enum_count >= LARGE_FOLDER_THRESHOLD:
+                self._set_large_folder_mode(True, count=self._fast_enum_count, complete=False)
             self._fast_batch_counter += 1
             if live_sort_during_enum and (self._fast_batch_counter % 2) == 0:
                 try:
@@ -4878,14 +4948,12 @@ class ExplorerPane(QWidget):
         self._dirload_timer[path.lower()] = t
 
 
-        HUGE_THRESHOLD = 3000
-        GENERIC_THRESHOLD = 1200
         if known_count is not None:
             try:
                 count = max(0, int(known_count))
             except Exception:
                 count = 0
-            is_huge = count >= HUGE_THRESHOLD
+            is_huge = count >= LARGE_FOLDER_THRESHOLD
         else:
             count = 0
             is_huge = False
@@ -4893,7 +4961,7 @@ class ExplorerPane(QWidget):
                 with os.scandir(path) as it:
                     for _ in it:
                         count += 1
-                        if count >= HUGE_THRESHOLD:
+                        if count >= LARGE_FOLDER_THRESHOLD:
                             is_huge = True
                             break
             except Exception:
@@ -4902,14 +4970,21 @@ class ExplorerPane(QWidget):
 
         if is_huge:
 
-            dlog(f"[perf] Skip QFileSystemModel for huge folder (>= {HUGE_THRESHOLD} items): {path}")
+            dlog(f"[perf] Skip QFileSystemModel for huge folder (>= {LARGE_FOLDER_THRESHOLD} items): {path}")
             self._pending_normal_root = None
+            self._set_large_folder_mode(True, count=count, complete=(known_count is not None))
+            try:
+                self.host.statusBar().showMessage("Large folder mode is active for this pane.", 3000)
+            except Exception:
+                pass
             self._request_visible_stats(0)
             return
 
+        self._set_large_folder_mode(False)
+
 
         try:
-            use_generic = ALWAYS_GENERIC_ICONS or count >= GENERIC_THRESHOLD
+            use_generic = ALWAYS_GENERIC_ICONS or count >= GENERIC_ICON_THRESHOLD
             if use_generic and self._icon_provider_mode != "generic":
                 self.source_model.setIconProvider(self._generic_icons)
                 self._icon_provider_mode = "generic"
@@ -5284,6 +5359,20 @@ class ExplorerPane(QWidget):
         self._start_bg_op("copy" if op=="copy" else "move", srcs, dst_dir)
         if op in ("cut", "move"): self.host.clear_clipboard()
 
+    def _push_file_op_undo(self, worker, op: str):
+        remove_paths = list(getattr(worker, "undo_remove_paths", []) or [])
+        move_pairs = list(getattr(worker, "undo_move_pairs", []) or [])
+        actions = []
+        if move_pairs:
+            actions.append({"type": "move_back", "pairs": move_pairs})
+        if remove_paths:
+            actions.append({"type": "remove_created", "paths": remove_paths})
+        if not actions:
+            return
+        act = actions[0] if len(actions) == 1 else {"type": "compound", "actions": actions}
+        act["label"] = f"Undo {op}"
+        self._undo_stack.append(act)
+
     def _start_bg_op(self, op, srcs, dst_dir):
         cur_worker = getattr(self, "_file_worker", None)
         if cur_worker and cur_worker.isRunning():
@@ -5386,6 +5475,7 @@ class ExplorerPane(QWidget):
             if not self._using_fast and not self._search_mode: self.stat_proxy.clear_cache()
             self._request_visible_stats(0); self._update_pane_status()
             failed = int(getattr(worker, "error_count", 0) or len(getattr(worker, "errors", [])))
+            self._push_file_op_undo(worker, op)
             if failed:
                 details_list = list(getattr(worker, "errors", []) or [])
                 details = "\n".join(details_list)
@@ -5607,24 +5697,57 @@ class ExplorerPane(QWidget):
         self.refresh()
         self.host.flash_status(f"Renamed {len(committed)} item(s)")
 
+    def _undo_remove_created(self, paths: list[str]) -> bool:
+        failed = []
+        hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
+        for p in reversed(list(paths or [])):
+            if not p or not os.path.exists(p):
+                continue
+            if not recycle_path_to_trash(p, hwnd):
+                failed.append(p)
+        if failed:
+            sample = "\n".join(failed[:8])
+            more = "\n..." if len(failed) > 8 else ""
+            raise RuntimeError(
+                "Could not move copied item(s) to Recycle Bin, so they were left in place:\n"
+                f"{sample}{more}"
+            )
+        return True
+
+    def _apply_undo_action(self, act: dict) -> bool:
+        t = act.get("type")
+        if t=="mkdir":
+            path=act["path"]
+            try: os.rmdir(path)
+            except OSError:
+                QMessageBox.information(self,"Undo New Folder","Folder is not empty; cannot undo safely.")
+                return False
+        elif t=="delete":
+            for p in act.get("paths",[]): remove_any(p)
+        elif t=="remove_created":
+            return self._undo_remove_created(act.get("paths", []))
+        elif t=="move_back":
+            for dst,src in reversed(list(act.get("pairs",[]))):
+                target_dir=os.path.dirname(src)
+                if target_dir:
+                    os.makedirs(target_dir, exist_ok=True)
+                if os.path.exists(src):
+                    base=os.path.basename(src); src=unique_dest_path(target_dir, base)
+                shutil.move(dst, src)
+        else:
+            return False
+        return True
+
     def undo_last(self):
         if not self._undo_stack: self.host.flash_status("Nothing to undo"); return
-        act=self._undo_stack.pop(); t=act.get("type")
+        act=self._undo_stack.pop()
         try:
-            if t=="mkdir":
-                path=act["path"]
-                try: os.rmdir(path)
-                except OSError:
-                    QMessageBox.information(self,"Undo New Folder","Folder is not empty; cannot undo safely."); return
-            elif t=="delete":
-                for p in act.get("paths",[]): remove_any(p)
-            elif t=="move_back":
-                for dst,src in act.get("pairs",[]):
-                    target_dir=os.path.dirname(src)
-                    if os.path.exists(src):
-                        base=os.path.basename(src); src=unique_dest_path(target_dir, base)
-                    shutil.move(dst, src)
-            else: return
+            if act.get("type") == "compound":
+                for sub in reversed(list(act.get("actions", []))):
+                    if not self._apply_undo_action(sub):
+                        return
+            elif not self._apply_undo_action(act):
+                return
             self.refresh(); self.host.flash_status("Undone")
         except Exception as e:
             QMessageBox.critical(self,"Undo failed",str(e))
@@ -6371,7 +6494,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.1</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.2</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
