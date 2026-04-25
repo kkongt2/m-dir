@@ -14,13 +14,13 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Per-pane back/forward/up navigation history
 - Path-bar edit mode with recent-path dropdown and folder path autocomplete
 - Folders-first sorting, with proper size/date sorting for files
-- Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff
+- Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff, with a visible large-folder mode badge
 - Auto-refresh on file system changes via `QFileSystemWatcher`
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - File operation progress dialog with cancellation
-- Delete to Recycle Bin (`send2trash`/Shell API when available), `Shift+Delete` for permanent delete
+- Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
 - Bookmark editor and quick bookmark buttons (up to 10 bookmarks)
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
@@ -73,7 +73,7 @@ $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 | `Esc` (in filter input) | Clear filter + return to browse mode |
 | `F5` | Hard refresh |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste |
-| `Ctrl+Z` | Undo (currently focused on new folder / rename actions) |
+| `Ctrl+Z` | Undo (new folder / rename / safe copy-move actions) |
 | `Delete` / `Shift+Delete` | Recycle / Permanent delete |
 | `F2` | Rename |
 | `Ctrl+Shift+R` | Bulk rename |
