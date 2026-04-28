@@ -2345,6 +2345,7 @@ class StatOverlayProxy(QIdentityProxyModel):
         self._queue = []
         self._worker = None
         self._batch_limit = 256
+        self._refresh_after_pending = set()
 
     def filePath(self, index):
         src = self.sourceModel()
@@ -2366,6 +2367,7 @@ class StatOverlayProxy(QIdentityProxyModel):
         self._cache.clear()
         self._pending.clear()
         self._queue.clear()
+        self._refresh_after_pending.clear()
         self._cancel_worker()
 
     def _cancel_worker(self):
@@ -2484,7 +2486,7 @@ class StatOverlayProxy(QIdentityProxyModel):
                 return QDateTime()
             return super().data(index, role)
 
-    def request_paths(self, paths: list[str], batch_limit: int = 256):
+    def request_paths(self, paths: list[str], batch_limit: int = 256, force: bool = False):
         try:
             self._batch_limit = max(1, int(batch_limit))
         except Exception:
@@ -2494,7 +2496,14 @@ class StatOverlayProxy(QIdentityProxyModel):
         for p in paths:
             if not p:
                 continue
-            if p in self._cache or p in self._pending:
+            if force:
+                self._cache.pop(p, None)
+            elif p in self._cache:
+                continue
+
+            if p in self._pending:
+                if force:
+                    self._refresh_after_pending.add(p)
                 continue
             self._pending.add(p)
             self._queue.append(p)
@@ -2535,9 +2544,19 @@ class StatOverlayProxy(QIdentityProxyModel):
             pass
 
     def _on_cycle_finished(self, batch):
+        retry = []
         for p in batch:
             self._pending.discard(p)
+            if p in self._refresh_after_pending:
+                self._refresh_after_pending.discard(p)
+                retry.append(p)
         self._worker = None
+        for p in retry:
+            if p in self._pending:
+                continue
+            self._cache.pop(p, None)
+            self._pending.add(p)
+            self._queue.append(p)
         self._start_next_batch()
 
 class PathBar(QWidget):
@@ -3567,6 +3586,7 @@ class ExplorerPane(QWidget):
         self._disk_free_cache_text = ""
         self._disk_free_cache_ts = 0.0
         self._disk_free_ttl_s = 2.0
+        self._fs_change_generation = 0
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -4468,6 +4488,54 @@ class ExplorerPane(QWidget):
             t.stop()
         t.start(delay)
 
+    def _visible_browse_stat_paths(self, margin_before: int = 40, margin_after: int = 80) -> list[str]:
+        if self._search_mode or self._using_fast:
+            return []
+        if self.view.model() is not self.proxy:
+            return []
+
+        model = self.proxy
+        stat_proxy = self.stat_proxy
+        src_model = self.source_model
+        root_ix = self.view.rootIndex()
+        vp = self.view.viewport()
+
+        top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
+        bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
+        start = top_ix.row() if top_ix.isValid() else 0
+        rc = model.rowCount(root_ix)
+        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, rc - 1)
+        start = max(0, start - max(0, int(margin_before)))
+        end = min(rc - 1, end + max(0, int(margin_after)))
+        if end < start:
+            end = start
+
+        paths = []
+        for r in range(start, end + 1):
+            prx_ix = model.index(r, 0, root_ix)
+            if not prx_ix.isValid():
+                continue
+            st_ix = model.mapToSource(prx_ix)
+            if not st_ix.isValid():
+                continue
+            src_ix = stat_proxy.mapToSource(st_ix)
+            if not src_ix.isValid():
+                continue
+            try:
+                p = src_model.filePath(src_ix)
+            except Exception:
+                p = None
+            if p:
+                paths.append(p)
+        return paths
+
+    def _refresh_visible_browse_stats(self, force: bool = False, generation: int | None = None):
+        if generation is not None and generation != getattr(self, "_fs_change_generation", 0):
+            return
+        paths = self._visible_browse_stat_paths()
+        if paths:
+            self.stat_proxy.request_paths(paths, force=force)
+
     def _ensure_selection_update_timer(self):
         if self._selection_update_timer is not None:
             return
@@ -4631,40 +4699,7 @@ class ExplorerPane(QWidget):
         if current_model is not self.proxy:
             return
 
-        model = self.proxy
-        stat_proxy = self.stat_proxy
-        src_model = self.source_model
-
-        paths = []
-        top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
-        bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
-        start = top_ix.row() if top_ix.isValid() else 0
-        rc = model.rowCount(root_ix)
-        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, rc - 1)
-        start = max(0, start - 40)
-        end = min(rc - 1, end + 80)
-        if end < start:
-            end = start
-
-        for r in range(start, end + 1):
-            prx_ix = model.index(r, 0, root_ix)
-            if not prx_ix.isValid():
-                continue
-            st_ix  = model.mapToSource(prx_ix)
-            if not st_ix.isValid():
-                continue
-            src_ix = stat_proxy.mapToSource(st_ix)
-            if not src_ix.isValid():
-                continue
-            try:
-                p = src_model.filePath(src_ix)
-            except Exception:
-                p = None
-            if p:
-                paths.append(p)
-
-        if paths:
-            stat_proxy.request_paths(paths)
+        self._refresh_visible_browse_stats(force=False)
 
     def _on_header_clicked(self, col:int):
         v=self.view
@@ -5277,7 +5312,14 @@ class ExplorerPane(QWidget):
                 return
 
 
-            self._request_visible_stats(0)
+            self._fs_change_generation += 1
+            generation = self._fs_change_generation
+            self._refresh_visible_browse_stats(force=True, generation=generation)
+            for delay in (350, 1200, 2500):
+                QTimer.singleShot(
+                    delay,
+                    lambda g=generation: self._refresh_visible_browse_stats(force=True, generation=g),
+                )
             self._update_pane_status()
         except Exception:
             pass
