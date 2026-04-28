@@ -406,8 +406,59 @@ def remove_any(path: str):
     if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
     else: os.remove(path)
 
+def _qt_move_path_to_trash(path: str) -> bool:
+    if not path or not hasattr(QtCore.QFile, "moveToTrash"):
+        return False
+    try:
+        result = QtCore.QFile.moveToTrash(_normalize_fs_path(path))
+        if isinstance(result, tuple):
+            return bool(result[0])
+        return bool(result)
+    except Exception as e:
+        if DEBUG: print("[delete] QFile.moveToTrash failed:", e)
+    return False
+
+def _win_shell_move_path_to_trash(path: str, hwnd: int = 0) -> bool:
+    if sys.platform != "win32" or not path:
+        return False
+    try:
+        class _SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", ctypes.c_void_p),
+                ("wFunc", ctypes.c_uint),
+                ("pFrom", ctypes.c_void_p),
+                ("pTo", ctypes.c_void_p),
+                ("fFlags", ctypes.c_ushort),
+                ("fAnyOperationsAborted", ctypes.c_int),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", ctypes.c_void_p),
+            ]
+
+        shell_path = _normalize_fs_path(os.path.abspath(path))
+        from_buf = ctypes.create_unicode_buffer(shell_path + "\0\0")
+        op = _SHFILEOPSTRUCTW()
+        op.hwnd = ctypes.c_void_p(int(hwnd or 0))
+        op.wFunc = 3  # FO_DELETE
+        op.pFrom = ctypes.cast(from_buf, ctypes.c_void_p)
+        op.pTo = None
+        op.fFlags = 0x0040 | 0x0010 | 0x0400 | 0x0004  # ALLOWUNDO, NOCONFIRMATION, NOERRORUI, SILENT
+        op.fAnyOperationsAborted = 0
+        op.hNameMappings = None
+        op.lpszProgressTitle = None
+
+        shfile_operation = ctypes.WinDLL("shell32").SHFileOperationW
+        shfile_operation.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
+        shfile_operation.restype = ctypes.c_int
+        res = shfile_operation(ctypes.byref(op))
+        return (res == 0) and (not op.fAnyOperationsAborted) and (not os.path.exists(path))
+    except Exception as e:
+        if DEBUG: print("[delete] SHFileOperationW(ctypes) failed:", e)
+    return False
+
 def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
     if not path or not os.path.exists(path):
+        return True
+    if _qt_move_path_to_trash(path):
         return True
     if HAS_SEND2TRASH:
         try:
@@ -424,6 +475,8 @@ def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
             return (res == 0) and (not aborted)
         except Exception as e:
             if DEBUG: print("[delete] SHFileOperation failed:", e)
+    if _win_shell_move_path_to_trash(path, hwnd):
+        return True
     if DEBUG:
         print("[delete] refusing permanent fallback for Recycle Bin delete:", path)
     return False
@@ -1249,6 +1302,23 @@ def icon_cmd(theme: str):
         p.drawRoundedRect(2, 4, w-4, h-6, 4, 4)
         p.setPen(QPen(textc, 2))
         p.drawLine(6, h//2, 10, h//2-3); p.drawLine(6, h//2, 10, h//2+3); p.drawLine(12, h//2+5, w-6, h//2+5)
+    return _make_icon(22, 22, paint)
+
+def icon_explorer(theme: str):
+    def paint(p: QPainter, w, h):
+        line = QColor(190, 195, 210) if theme=="dark" else QColor(90, 100, 120)
+        fill = QColor(238, 190, 72) if theme=="dark" else QColor(255, 205, 85)
+        tab = QColor(255, 220, 120) if theme=="dark" else QColor(255, 232, 150)
+        arrow = QColor(95, 180, 255) if theme=="dark" else QColor(35, 115, 220)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(line, 1.3)); p.setBrush(QBrush(tab))
+        p.drawRoundedRect(QtCore.QRectF(3.5, 5.0, 7.0, 4.5), 1.5, 1.5)
+        p.setBrush(QBrush(fill))
+        p.drawRoundedRect(QtCore.QRectF(3.0, 7.0, 16.0, 10.5), 2.3, 2.3)
+        p.setPen(QPen(arrow, 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawLine(9, 12, 15, 12)
+        p.drawLine(12, 9, 15, 12)
+        p.drawLine(12, 15, 15, 12)
     return _make_icon(22, 22, paint)
 
 class GenericIconProvider(QFileIconProvider):
@@ -3505,6 +3575,7 @@ class ExplorerPane(QWidget):
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
 
         self.btn_cmd=QToolButton(self); self.btn_cmd.setIcon(icon_cmd(self.host.theme)); self.btn_cmd.setToolTip("Open Command Prompt here"); self.btn_cmd.setFixedHeight(UI_H)
+        self.btn_explorer=QToolButton(self); self.btn_explorer.setIcon(icon_explorer(self.host.theme)); self.btn_explorer.setToolTip("Open this folder in Windows Explorer"); self.btn_explorer.setFixedHeight(UI_H)
         self.btn_up=QToolButton(self); self.btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp)); self.btn_up.setToolTip("Up"); self.btn_up.setFixedHeight(UI_H)
         self.btn_new=QToolButton(self); self.btn_new.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder)); self.btn_new.setToolTip("New Folder"); self.btn_new.setFixedHeight(UI_H)
 
@@ -3523,6 +3594,7 @@ class ExplorerPane(QWidget):
         row_toolbar.addWidget(self.btn_star)
         row_toolbar.addWidget(self._bm_btn_container,1)
         row_toolbar.addWidget(self.btn_cmd)
+        row_toolbar.addWidget(self.btn_explorer)
         row_toolbar.addWidget(self.btn_up)
         row_toolbar.addWidget(self.btn_new)
         row_toolbar.addWidget(self.btn_new_file)
@@ -3531,7 +3603,7 @@ class ExplorerPane(QWidget):
 
 
         _tight_css = "QToolButton{padding-left:4px;padding-right:4px;}"
-        for b in (self.btn_cmd, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
+        for b in (self.btn_cmd, self.btn_explorer, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh):
             b.setStyleSheet(_tight_css)
             b.setAutoRaise(True)
         return row_toolbar
@@ -3717,6 +3789,7 @@ class ExplorerPane(QWidget):
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
         self.btn_star.clicked.connect(self._on_star_toggle)
         self.btn_cmd.clicked.connect(self._open_cmd_here)
+        self.btn_explorer.clicked.connect(self._open_current_path_in_explorer)
         self.btn_up.clicked.connect(self.go_up)
         self.btn_new.clicked.connect(self.create_folder)
         self.btn_new_file.clicked.connect(self.create_text_file)
@@ -4734,6 +4807,42 @@ class ExplorerPane(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Command Prompt", f"Failed to launch cmd.exe:\n{e}")
 
+    def _open_current_path_in_explorer(self):
+        path = self.current_path() or os.getcwd()
+        try:
+            path = os.path.abspath(path)
+        except Exception:
+            pass
+
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "Windows Explorer", "Current folder is not available.")
+            return
+
+        if sys.platform == "win32":
+            if HAS_PYWIN32:
+                try:
+                    win32api.ShellExecute(
+                        int(self.window().winId()) if self.window() else 0,
+                        "open",
+                        "explorer.exe",
+                        f'"{path}"',
+                        None,
+                        win32con.SW_SHOWNORMAL
+                    )
+                    return
+                except Exception:
+                    pass
+
+            try:
+                subprocess.Popen(["explorer.exe", path])
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Windows Explorer", f"Failed to open Windows Explorer:\n{e}")
+                return
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.critical(self, "Open Folder", f"Failed to open folder:\n{path}")
+
 
     def _on_bookmarks_changed(self,*_): self._update_star_button(); self._rebuild_quick_bookmark_buttons()
     def _on_star_toggle(self): self.host.toggle_bookmark(self.current_path())
@@ -5530,7 +5639,7 @@ class ExplorerPane(QWidget):
             self._op_progress_dialog = None
 
         verb = "Deleting" if permanent else "Moving to Recycle Bin"
-        hwnd = int(self.window().winId()) if (not permanent and HAS_PYWIN32) else 0
+        hwnd = int(self.window().winId()) if (not permanent and sys.platform == "win32") else 0
         busy_mode = (
             len(valid_paths) == 1
             and os.path.isdir(valid_paths[0])
@@ -5699,7 +5808,7 @@ class ExplorerPane(QWidget):
 
     def _undo_remove_created(self, paths: list[str]) -> bool:
         failed = []
-        hwnd = int(self.window().winId()) if HAS_PYWIN32 else 0
+        hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
         for p in reversed(list(paths or [])):
             if not p or not os.path.exists(p):
                 continue
@@ -6159,6 +6268,7 @@ class MultiExplorer(QMainWindow):
             try:
                 p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
                 p.btn_cmd.setIcon(icon_cmd(self.theme))
+                p.btn_explorer.setIcon(icon_explorer(self.theme))
 
                 if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
                     p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
@@ -6494,7 +6604,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.3.2</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.4.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
