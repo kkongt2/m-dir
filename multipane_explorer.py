@@ -73,6 +73,9 @@ LARGE_FOLDER_THRESHOLD = 3000
 GENERIC_ICON_THRESHOLD = 1200
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
+QUICK_BOOKMARK_MIN_W = 42
+QUICK_BOOKMARK_MAX_W = 78
+QUICK_BOOKMARK_MORE_W = 30
 VALID_THEMES = ("dark", "light")
 SIZE_COL_WIDTH = 60
 DATE_COL_WIDTH = 122
@@ -1295,7 +1298,8 @@ def _common_css():
     QTreeView::item {{ padding: {ITEM_VPAD}px 6px; }}
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
-    QToolButton#quickBookmarkBtn {{ text-align: left; }}
+    QToolButton#quickBookmarkBtn {{ text-align: left; padding-left: 4px; padding-right: 4px; }}
+    QToolButton#quickBookmarkMoreBtn {{ padding-left: 4px; padding-right: 4px; }}
     QLabel#modeBadge {{ padding: 0 6px; border-radius: 6px; }}
     QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
@@ -3860,6 +3864,15 @@ class ExplorerPane(QWidget):
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
         self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
+        self._quick_bm_buttons = []
+        self._quick_bm_more_btn = QToolButton(self._bm_btn_container)
+        self._quick_bm_more_btn.setObjectName("quickBookmarkMoreBtn")
+        self._quick_bm_more_btn.setText("...")
+        self._quick_bm_more_btn.setToolTip("More bookmarks")
+        self._quick_bm_more_btn.setFixedHeight(UI_H)
+        self._quick_bm_more_btn.setFixedWidth(QUICK_BOOKMARK_MORE_W)
+        self._quick_bm_more_btn.setPopupMode(QToolButton.InstantPopup)
+        self._quick_bm_more_btn.hide()
 
         self.btn_cmd=QToolButton(self); self.btn_cmd.setIcon(icon_cmd(self.host.theme)); self.btn_cmd.setToolTip("Open Command Prompt here"); self.btn_cmd.setFixedHeight(UI_H)
         self.btn_explorer=QToolButton(self); self.btn_explorer.setIcon(icon_explorer(self.host.theme)); self.btn_explorer.setToolTip("Open this folder in Windows Explorer"); self.btn_explorer.setFixedHeight(UI_H)
@@ -5236,32 +5249,101 @@ class ExplorerPane(QWidget):
         idx,it=self.host.is_path_bookmarked(self.current_path()); checked=bool(it and it.get("enabled"))
         self.btn_star.setChecked(checked); self.btn_star.setIcon(icon_star(checked, getattr(self.host,"theme","dark")))
         self.btn_star.setToolTip("Remove bookmark for this folder" if checked else "Add bookmark for this folder")
+    def _quick_bookmark_button_width(self, text: str) -> int:
+        try:
+            text_w = self._bm_btn_container.fontMetrics().horizontalAdvance(str(text or ""))
+        except Exception:
+            text_w = len(str(text or "")) * 7
+        return max(QUICK_BOOKMARK_MIN_W, min(QUICK_BOOKMARK_MAX_W, text_w + 18))
+
+    def _update_quick_bookmark_more_menu(self, overflow_buttons):
+        more_btn = getattr(self, "_quick_bm_more_btn", None)
+        if more_btn is None:
+            return
+        old_menu = more_btn.menu()
+        if old_menu is not None:
+            more_btn.setMenu(None)
+            old_menu.deleteLater()
+        if not overflow_buttons:
+            more_btn.setToolTip("More bookmarks")
+            return
+
+        menu = QMenu(more_btn)
+        for btn in overflow_buttons:
+            name = str(btn.property("fullText") or btn.text() or "")
+            path = str(btn.property("bookmarkPath") or "")
+            act = QAction(name, menu)
+            act.setToolTip(path)
+            act.triggered.connect(lambda _=False, p=path: self.set_path(p, push_history=True))
+            menu.addAction(act)
+        more_btn.setMenu(menu)
+        more_btn.setToolTip(f"More bookmarks ({len(overflow_buttons)})")
+
     def _rebuild_quick_bookmark_buttons(self):
         while self._bm_btn_layout.count():
             it=self._bm_btn_layout.takeAt(0); w=it.widget()
-            if w: w.deleteLater()
+            if w and w is not getattr(self, "_quick_bm_more_btn", None): w.deleteLater()
+        self._quick_bm_buttons = []
         for it in self.host.get_enabled_bookmarks():
             name=it.get("name") or _derive_name_from_path(it.get("path","")); p=it.get("path","")
             btn=QToolButton(self._bm_btn_container)
             btn.setObjectName("quickBookmarkBtn")
             btn.setText(str(name))
             btn.setProperty("fullText", str(name))
+            btn.setProperty("bookmarkPath", str(p))
             btn.setToolTip(p)
             btn.setFixedHeight(UI_H)
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            btn.setFixedWidth(self._quick_bookmark_button_width(str(name)))
+            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _=False, path=p: self.set_path(path, push_history=True))
             self._bm_btn_layout.addWidget(btn)
+            self._quick_bm_buttons.append(btn)
+        self._bm_btn_layout.addWidget(self._quick_bm_more_btn)
         self._bm_btn_layout.addStretch(1)
         QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
 
     def _refresh_quick_bookmark_button_texts(self):
         try:
-            for btn in self._bm_btn_container.findChildren(QToolButton, "quickBookmarkBtn"):
+            buttons = list(getattr(self, "_quick_bm_buttons", []))
+            more_btn = getattr(self, "_quick_bm_more_btn", None)
+            if more_btn is None:
+                return
+            if not buttons:
+                more_btn.hide()
+                self._update_quick_bookmark_more_menu([])
+                return
+
+            available = max(0, int(self._bm_btn_container.contentsRect().width()))
+            spacing = max(0, int(self._bm_btn_layout.spacing()))
+            widths = [self._quick_bookmark_button_width(str(btn.property("fullText") or "")) for btn in buttons]
+
+            visible_count = 0
+            used = 0
+            total = len(buttons)
+            for i, w in enumerate(widths):
+                spacing_before = spacing if visible_count else 0
+                remaining_after = total - (i + 1)
+                more_reserve = (spacing + QUICK_BOOKMARK_MORE_W) if remaining_after else 0
+                if used + spacing_before + w + more_reserve <= available:
+                    used += spacing_before + w
+                    visible_count += 1
+                else:
+                    break
+
+            overflow_buttons = buttons[visible_count:]
+            for i, btn in enumerate(buttons):
+                visible = i < visible_count
+                btn.setVisible(visible)
+                if not visible:
+                    continue
                 full = str(btn.property("fullText") or btn.text() or "")
-                w = max(24, int(btn.width()) - 12)
-                elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, w)
+                btn_w = widths[i]
+                btn.setFixedWidth(btn_w)
+                elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, max(24, btn_w - 12))
                 if btn.text() != elided:
                     btn.setText(elided)
+            self._update_quick_bookmark_more_menu(overflow_buttons)
+            more_btn.setVisible(bool(overflow_buttons))
         except Exception:
             pass
 
