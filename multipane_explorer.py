@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QAction, QInputDialog, QMessageBox, QAbstractItemView,
     QMenu, QStyle, QHeaderView, QScrollArea, QFrame, QLabel, QShortcut,
     QToolButton, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
-    QCheckBox, QFileDialog, QProgressDialog, QToolTip, QSizePolicy, QFileIconProvider,
+    QCheckBox, QFileDialog, QProgressBar, QToolTip, QSizePolicy, QFileIconProvider,
     QComboBox, QSpacerItem, QCompleter, QSpinBox, QStyledItemDelegate
 )
 
@@ -73,6 +73,9 @@ LARGE_FOLDER_THRESHOLD = 3000
 GENERIC_ICON_THRESHOLD = 1200
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
+QUICK_BOOKMARK_MIN_W = 42
+QUICK_BOOKMARK_MAX_W = 78
+QUICK_BOOKMARK_MORE_W = 30
 VALID_THEMES = ("dark", "light")
 SIZE_COL_WIDTH = 60
 DATE_COL_WIDTH = 122
@@ -406,8 +409,170 @@ def remove_any(path: str):
     if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
     else: os.remove(path)
 
+class DeleteCancelled(Exception):
+    pass
+
+def _path_exists_for_delete(path: str) -> bool:
+    try:
+        return os.path.lexists(path)
+    except Exception:
+        return os.path.exists(path)
+
+def _is_junction(path: str) -> bool:
+    isjunction = getattr(os.path, "isjunction", None)
+    if not isjunction:
+        return False
+    try:
+        return bool(isjunction(path))
+    except Exception:
+        return False
+
+def _is_dir_link(path: str) -> bool:
+    try:
+        return bool(os.path.islink(path) or _is_junction(path))
+    except Exception:
+        return False
+
+def _entry_is_junction(entry) -> bool:
+    fn = getattr(entry, "is_junction", None)
+    if fn:
+        try:
+            return bool(fn())
+        except Exception:
+            pass
+    return _is_junction(getattr(entry, "path", ""))
+
+def _make_delete_writable(path: str):
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
+
+def _is_not_empty_error(exc: BaseException) -> bool:
+    return (
+        getattr(exc, "errno", None) in (errno.ENOTEMPTY, errno.EEXIST)
+        or getattr(exc, "winerror", None) in (145, 183)
+    )
+
+def _delete_error_message(path: str, exc: BaseException) -> str:
+    return f"{path}: {exc}"
+
+def _is_qt_main_thread() -> bool:
+    try:
+        app = QApplication.instance()
+        return app is None or QtCore.QThread.currentThread() == app.thread()
+    except Exception:
+        return True
+
+def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int, list[str]]:
+    """Delete everything possible under path, returning (deleted_count, errors)."""
+    deleted = 0
+    errors: list[str] = []
+
+    def check_cancel():
+        if should_cancel and should_cancel():
+            raise DeleteCancelled()
+
+    def record_error(p: str, exc: BaseException):
+        errors.append(_delete_error_message(p, exc))
+
+    def remove_file_like(p: str) -> bool:
+        nonlocal deleted
+        check_cancel()
+        if not _path_exists_for_delete(p):
+            return True
+        last_exc = None
+        for attempt in range(2):
+            try:
+                if _is_dir_link(p) and os.path.isdir(p):
+                    os.rmdir(p)
+                else:
+                    os.remove(p)
+                deleted += 1
+                return True
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _make_delete_writable(p)
+                    continue
+                break
+            except OSError as exc:
+                last_exc = exc
+                if attempt == 0 and getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+                    _make_delete_writable(p)
+                    continue
+                break
+        if last_exc:
+            record_error(p, last_exc)
+        return False
+
+    def remove_dir(p: str) -> bool:
+        nonlocal deleted
+        check_cancel()
+        child_failed = False
+        try:
+            with os.scandir(p) as it:
+                entries = list(it)
+        except OSError as exc:
+            record_error(p, exc)
+            return False
+
+        for entry in entries:
+            check_cancel()
+            child = entry.path
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_link = entry.is_symlink()
+                is_junction = _entry_is_junction(entry)
+            except OSError as exc:
+                record_error(child, exc)
+                child_failed = True
+                continue
+
+            if is_dir and not is_link and not is_junction:
+                if not remove_dir(child):
+                    child_failed = True
+            elif not remove_file_like(child):
+                child_failed = True
+
+        if not _path_exists_for_delete(p):
+            return not child_failed
+
+        last_exc = None
+        for attempt in range(2):
+            try:
+                os.rmdir(p)
+                deleted += 1
+                return not child_failed
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _make_delete_writable(p)
+                    continue
+                break
+            except OSError as exc:
+                last_exc = exc
+                if attempt == 0 and getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
+                    _make_delete_writable(p)
+                    continue
+                break
+
+        if last_exc and not (child_failed and _is_not_empty_error(last_exc)):
+            record_error(p, last_exc)
+        return False
+
+    path = _normalize_fs_path(path)
+    check_cancel()
+    if not _path_exists_for_delete(path):
+        return 1, []
+    if os.path.isdir(path) and not _is_dir_link(path):
+        remove_dir(path)
+    else:
+        remove_file_like(path)
+    return deleted, errors
+
 def _qt_move_path_to_trash(path: str) -> bool:
-    if not path or not hasattr(QtCore.QFile, "moveToTrash"):
+    if not path or not hasattr(QtCore.QFile, "moveToTrash") or not _is_qt_main_thread():
         return False
     try:
         result = QtCore.QFile.moveToTrash(_normalize_fs_path(path))
@@ -456,14 +621,15 @@ def _win_shell_move_path_to_trash(path: str, hwnd: int = 0) -> bool:
     return False
 
 def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
-    if not path or not os.path.exists(path):
+    if not path or not _path_exists_for_delete(path):
         return True
-    if _qt_move_path_to_trash(path):
+    if _qt_move_path_to_trash(path) and not _path_exists_for_delete(path):
         return True
     if HAS_SEND2TRASH:
         try:
             send2trash(path)
-            return True
+            if not _path_exists_for_delete(path):
+                return True
         except Exception as e:
             if DEBUG: print("[delete] send2trash failed:", e)
     if HAS_PYWIN32:
@@ -472,7 +638,8 @@ def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
             flags = (shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION |
                      shellcon.FOF_NOERRORUI | shellcon.FOF_SILENT)
             res, aborted = shell.SHFileOperation((int(hwnd), shellcon.FO_DELETE, pFrom, None, flags, False, None, None))
-            return (res == 0) and (not aborted)
+            if (res == 0) and (not aborted) and not _path_exists_for_delete(path):
+                return True
         except Exception as e:
             if DEBUG: print("[delete] SHFileOperation failed:", e)
     if _win_shell_move_path_to_trash(path, hwnd):
@@ -480,6 +647,88 @@ def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
     if DEBUG:
         print("[delete] refusing permanent fallback for Recycle Bin delete:", path)
     return False
+
+def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tuple[int, list[str]]:
+    """Move as much as possible to Recycle Bin, recursing when a folder move fails."""
+    deleted = 0
+    errors: list[str] = []
+
+    def check_cancel():
+        if should_cancel and should_cancel():
+            raise DeleteCancelled()
+
+    def record_error(p: str):
+        errors.append(f"{p}: Could not move item to Recycle Bin.")
+
+    def dir_has_entries(p: str) -> bool:
+        try:
+            with os.scandir(p) as it:
+                for _entry in it:
+                    return True
+        except OSError:
+            return True
+        return False
+
+    def recycle_whole(p: str) -> bool:
+        nonlocal deleted
+        check_cancel()
+        if not _path_exists_for_delete(p):
+            return True
+        if recycle_path_to_trash(p, hwnd):
+            deleted += 1
+            return True
+        return False
+
+    def recycle_dir_contents(p: str) -> bool:
+        check_cancel()
+        child_failed = False
+        try:
+            with os.scandir(p) as it:
+                entries = list(it)
+        except OSError as exc:
+            errors.append(_delete_error_message(p, exc))
+            return False
+
+        for entry in entries:
+            check_cancel()
+            child = entry.path
+            if recycle_whole(child):
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_link = entry.is_symlink()
+                is_junction = _entry_is_junction(entry)
+            except OSError as exc:
+                errors.append(_delete_error_message(child, exc))
+                child_failed = True
+                continue
+
+            if is_dir and not is_link and not is_junction:
+                if not recycle_dir_contents(child):
+                    child_failed = True
+            else:
+                record_error(child)
+                child_failed = True
+
+        if not _path_exists_for_delete(p):
+            return not child_failed
+        if recycle_whole(p):
+            return not child_failed
+        if not (child_failed and dir_has_entries(p)):
+            record_error(p)
+        return False
+
+    path = _normalize_fs_path(path)
+    check_cancel()
+    if not _path_exists_for_delete(path):
+        return 1, []
+    if recycle_whole(path):
+        return deleted, []
+    if os.path.isdir(path) and not _is_dir_link(path):
+        recycle_dir_contents(path)
+    else:
+        record_error(path)
+    return deleted, errors
 
 def move_with_collision(src: str, dst_dir: str) -> str:
     name = os.path.basename(src); dst = os.path.join(dst_dir, name)
@@ -973,7 +1222,15 @@ class DeleteWorker(QtCore.QThread):
         self.progress.emit(pct)
 
     def run(self):
+        coinit = False
         try:
+            if sys.platform == "win32" and HAS_PYWIN32:
+                try:
+                    pythoncom.CoInitialize()
+                    coinit = True
+                except Exception:
+                    coinit = False
+
             verb = "Deleting" if self.permanent else "Sending to Recycle Bin"
             total = len(self.paths)
             if total == 0:
@@ -991,19 +1248,24 @@ class DeleteWorker(QtCore.QThread):
                 self.status.emit(f"{verb} {idx}/{total}: {name}")
 
                 try:
-                    if not os.path.exists(path):
-                        self.deleted_count += 1
-                    elif self.permanent:
-                        remove_any(path)
-                        self.deleted_count += 1
+                    if self.permanent:
+                        deleted, errors = delete_any_permanent_best_effort(
+                            path,
+                            should_cancel=lambda: self._cancel,
+                        )
+                        self.deleted_count += deleted
+                        self.errors.extend(errors)
                     else:
-                        if recycle_path_to_trash(path, self.hwnd):
-                            self.deleted_count += 1
-                        else:
-                            self.errors.append(
-                                f"{path}: Could not move item to Recycle Bin. It was not deleted; "
-                                "use Shift+Delete only if you want permanent deletion."
-                            )
+                        deleted, errors = recycle_any_best_effort(
+                            path,
+                            hwnd=self.hwnd,
+                            should_cancel=lambda: self._cancel,
+                        )
+                        self.deleted_count += deleted
+                        self.errors.extend(errors)
+                except DeleteCancelled:
+                    self.error.emit("Operation cancelled.")
+                    return
                 except Exception as e:
                     self.errors.append(f"{path}: {e}")
 
@@ -1013,8 +1275,16 @@ class DeleteWorker(QtCore.QThread):
             self._done = self._total
             self._emit_progress(force=True)
             self.finished_ok.emit()
+        except DeleteCancelled:
+            self.error.emit("Operation cancelled.")
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if coinit:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
 
 def _common_css():
@@ -1028,7 +1298,8 @@ def _common_css():
     QTreeView::item {{ padding: {ITEM_VPAD}px 6px; }}
     QHeaderView::section {{ padding: {HEADER_VPAD}px {HEADER_HPAD}px; }}
     QLineEdit, QPushButton, QToolButton {{ padding: {CONTROL_VPAD}px {CONTROL_HPAD}px; }}
-    QToolButton#quickBookmarkBtn {{ text-align: left; }}
+    QToolButton#quickBookmarkBtn {{ text-align: left; padding-left: 4px; padding-right: 4px; }}
+    QToolButton#quickBookmarkMoreBtn {{ padding-left: 4px; padding-right: 4px; }}
     QLabel#modeBadge {{ padding: 0 6px; border-radius: 6px; }}
     QLabel#crumbSep {{ padding: 0 0px; margin: 0; }}
     """
@@ -3593,6 +3864,15 @@ class ExplorerPane(QWidget):
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
         self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
+        self._quick_bm_buttons = []
+        self._quick_bm_more_btn = QToolButton(self._bm_btn_container)
+        self._quick_bm_more_btn.setObjectName("quickBookmarkMoreBtn")
+        self._quick_bm_more_btn.setText("...")
+        self._quick_bm_more_btn.setToolTip("More bookmarks")
+        self._quick_bm_more_btn.setFixedHeight(UI_H)
+        self._quick_bm_more_btn.setFixedWidth(QUICK_BOOKMARK_MORE_W)
+        self._quick_bm_more_btn.setPopupMode(QToolButton.InstantPopup)
+        self._quick_bm_more_btn.hide()
 
         self.btn_cmd=QToolButton(self); self.btn_cmd.setIcon(icon_cmd(self.host.theme)); self.btn_cmd.setToolTip("Open Command Prompt here"); self.btn_cmd.setFixedHeight(UI_H)
         self.btn_explorer=QToolButton(self); self.btn_explorer.setIcon(icon_explorer(self.host.theme)); self.btn_explorer.setToolTip("Open this folder in Windows Explorer"); self.btn_explorer.setFixedHeight(UI_H)
@@ -3774,10 +4054,90 @@ class ExplorerPane(QWidget):
         self.lbl_mode.setObjectName("modeBadge")
         self.lbl_mode.setFixedHeight(UI_H)
         self.lbl_mode.hide()
+        self.op_progress_bar = QProgressBar(self)
+        self.op_progress_bar.setObjectName("paneOpProgress")
+        self.op_progress_bar.setFixedHeight(UI_H)
+        self.op_progress_bar.setMinimumWidth(120)
+        self.op_progress_bar.setMaximumWidth(240)
+        self.op_progress_bar.setTextVisible(True)
+        self.op_progress_bar.hide()
+        self.btn_op_cancel = QToolButton(self)
+        self.btn_op_cancel.setIcon(self.style().standardIcon(QStyle.SP_DialogCancelButton))
+        self.btn_op_cancel.setToolTip("Cancel file operation")
+        self.btn_op_cancel.setFixedHeight(UI_H)
+        self.btn_op_cancel.setAutoRaise(True)
+        self.btn_op_cancel.clicked.connect(self._request_file_op_cancel)
+        self.btn_op_cancel.hide()
         row_status=QHBoxLayout(); row_status.setContentsMargins(0,0,0,0); row_status.setSpacing(ROW_SPACING)
-        row_status.addWidget(self.lbl_sel,0); row_status.addWidget(self.lbl_mode,0); row_status.addStretch(1); row_status.addWidget(self.lbl_free,0)
+        row_status.addWidget(self.lbl_sel,0); row_status.addWidget(self.lbl_mode,0); row_status.addStretch(1)
+        row_status.addWidget(self.op_progress_bar,0); row_status.addWidget(self.btn_op_cancel,0)
+        row_status.addWidget(self.lbl_free,0)
         self._row_status=row_status
         return row_status
+
+    def _request_file_op_cancel(self):
+        worker = getattr(self, "_file_worker", None)
+        if worker and worker.isRunning():
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            self._set_pane_progress_status("Cancelling...")
+            try:
+                self.btn_op_cancel.setEnabled(False)
+            except Exception:
+                pass
+
+    def _show_pane_progress(self, label: str, busy: bool = False):
+        bar = getattr(self, "op_progress_bar", None)
+        btn = getattr(self, "btn_op_cancel", None)
+        if not bar or not btn:
+            return
+        label = str(label or "Working")
+        if busy:
+            bar.setRange(0, 0)
+            bar.setFormat(label)
+        else:
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat(f"{label} %p%")
+        bar.setToolTip(label)
+        btn.setEnabled(True)
+        bar.show()
+        btn.show()
+
+    def _set_pane_progress_status(self, status: str):
+        bar = getattr(self, "op_progress_bar", None)
+        if not bar:
+            return
+        bar.setToolTip(str(status or ""))
+
+    def _set_pane_progress_value(self, value: int):
+        bar = getattr(self, "op_progress_bar", None)
+        if not bar:
+            return
+        try:
+            if bar.maximum() != 0:
+                bar.setValue(int(value))
+        except Exception:
+            pass
+
+    def _hide_pane_progress(self):
+        bar = getattr(self, "op_progress_bar", None)
+        btn = getattr(self, "btn_op_cancel", None)
+        if bar:
+            try:
+                if bar.maximum() != 0:
+                    bar.setValue(100)
+                bar.hide()
+            except Exception:
+                pass
+        if btn:
+            try:
+                btn.hide()
+                btn.setEnabled(True)
+            except Exception:
+                pass
 
     def _set_large_folder_mode(self, active: bool, count: int | None = None, complete: bool = False):
         self._large_folder_mode = bool(active)
@@ -4441,6 +4801,10 @@ class ExplorerPane(QWidget):
     def _cancel_file_worker(self, wait_ms: int = 300):
         self._stop_worker_thread(getattr(self, "_file_worker", None), wait_ms, "file-op")
         self._file_worker = None
+        try:
+            self._hide_pane_progress()
+        except Exception:
+            pass
         dlg = getattr(self, "_op_progress_dialog", None)
         if dlg:
             try:
@@ -4885,32 +5249,101 @@ class ExplorerPane(QWidget):
         idx,it=self.host.is_path_bookmarked(self.current_path()); checked=bool(it and it.get("enabled"))
         self.btn_star.setChecked(checked); self.btn_star.setIcon(icon_star(checked, getattr(self.host,"theme","dark")))
         self.btn_star.setToolTip("Remove bookmark for this folder" if checked else "Add bookmark for this folder")
+    def _quick_bookmark_button_width(self, text: str) -> int:
+        try:
+            text_w = self._bm_btn_container.fontMetrics().horizontalAdvance(str(text or ""))
+        except Exception:
+            text_w = len(str(text or "")) * 7
+        return max(QUICK_BOOKMARK_MIN_W, min(QUICK_BOOKMARK_MAX_W, text_w + 18))
+
+    def _update_quick_bookmark_more_menu(self, overflow_buttons):
+        more_btn = getattr(self, "_quick_bm_more_btn", None)
+        if more_btn is None:
+            return
+        old_menu = more_btn.menu()
+        if old_menu is not None:
+            more_btn.setMenu(None)
+            old_menu.deleteLater()
+        if not overflow_buttons:
+            more_btn.setToolTip("More bookmarks")
+            return
+
+        menu = QMenu(more_btn)
+        for btn in overflow_buttons:
+            name = str(btn.property("fullText") or btn.text() or "")
+            path = str(btn.property("bookmarkPath") or "")
+            act = QAction(name, menu)
+            act.setToolTip(path)
+            act.triggered.connect(lambda _=False, p=path: self.set_path(p, push_history=True))
+            menu.addAction(act)
+        more_btn.setMenu(menu)
+        more_btn.setToolTip(f"More bookmarks ({len(overflow_buttons)})")
+
     def _rebuild_quick_bookmark_buttons(self):
         while self._bm_btn_layout.count():
             it=self._bm_btn_layout.takeAt(0); w=it.widget()
-            if w: w.deleteLater()
+            if w and w is not getattr(self, "_quick_bm_more_btn", None): w.deleteLater()
+        self._quick_bm_buttons = []
         for it in self.host.get_enabled_bookmarks():
             name=it.get("name") or _derive_name_from_path(it.get("path","")); p=it.get("path","")
             btn=QToolButton(self._bm_btn_container)
             btn.setObjectName("quickBookmarkBtn")
             btn.setText(str(name))
             btn.setProperty("fullText", str(name))
+            btn.setProperty("bookmarkPath", str(p))
             btn.setToolTip(p)
             btn.setFixedHeight(UI_H)
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            btn.setFixedWidth(self._quick_bookmark_button_width(str(name)))
+            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _=False, path=p: self.set_path(path, push_history=True))
             self._bm_btn_layout.addWidget(btn)
+            self._quick_bm_buttons.append(btn)
+        self._bm_btn_layout.addWidget(self._quick_bm_more_btn)
         self._bm_btn_layout.addStretch(1)
         QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
 
     def _refresh_quick_bookmark_button_texts(self):
         try:
-            for btn in self._bm_btn_container.findChildren(QToolButton, "quickBookmarkBtn"):
+            buttons = list(getattr(self, "_quick_bm_buttons", []))
+            more_btn = getattr(self, "_quick_bm_more_btn", None)
+            if more_btn is None:
+                return
+            if not buttons:
+                more_btn.hide()
+                self._update_quick_bookmark_more_menu([])
+                return
+
+            available = max(0, int(self._bm_btn_container.contentsRect().width()))
+            spacing = max(0, int(self._bm_btn_layout.spacing()))
+            widths = [self._quick_bookmark_button_width(str(btn.property("fullText") or "")) for btn in buttons]
+
+            visible_count = 0
+            used = 0
+            total = len(buttons)
+            for i, w in enumerate(widths):
+                spacing_before = spacing if visible_count else 0
+                remaining_after = total - (i + 1)
+                more_reserve = (spacing + QUICK_BOOKMARK_MORE_W) if remaining_after else 0
+                if used + spacing_before + w + more_reserve <= available:
+                    used += spacing_before + w
+                    visible_count += 1
+                else:
+                    break
+
+            overflow_buttons = buttons[visible_count:]
+            for i, btn in enumerate(buttons):
+                visible = i < visible_count
+                btn.setVisible(visible)
+                if not visible:
+                    continue
                 full = str(btn.property("fullText") or btn.text() or "")
-                w = max(24, int(btn.width()) - 12)
-                elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, w)
+                btn_w = widths[i]
+                btn.setFixedWidth(btn_w)
+                elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, max(24, btn_w - 12))
                 if btn.text() != elided:
                     btn.setText(elided)
+            self._update_quick_bookmark_more_menu(overflow_buttons)
+            more_btn.setVisible(bool(overflow_buttons))
         except Exception:
             pass
 
@@ -5595,23 +6028,10 @@ class ExplorerPane(QWidget):
             conflict_map.update(dlg.result_map())
 
 
-        old_dlg = getattr(self, "_op_progress_dialog", None)
-        if old_dlg:
-            try:
-                old_dlg.close()
-                old_dlg.deleteLater()
-            except Exception:
-                pass
-            self._op_progress_dialog = None
-
         worker=FileOpWorker(op, valid_srcs, dst_dir, conflict_map=conflict_map, parent=self)
-        dlgp=QProgressDialog(f"{op.title()} in progress...", "Cancel", 0, 100, self)
-        dlgp.setWindowTitle(f"{op.title()} files"); dlgp.setWindowModality(Qt.WindowModal)
-        dlgp.setAutoClose(False); dlgp.setAutoReset(False)
-        dlgp.setMinimumDuration(0)
-
-        worker.progress.connect(dlgp.setValue)
-        worker.status.connect(dlgp.setLabelText)
+        self._show_pane_progress(op.title(), busy=False)
+        worker.progress.connect(self._set_pane_progress_value)
+        worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(lambda s: self.host.statusBar().showMessage(s,2000))
 
         def _on_error(msg):
@@ -5621,8 +6041,7 @@ class ExplorerPane(QWidget):
             QMessageBox.critical(self,f"{op.title()} failed",msg)
 
         def _finish_ok():
-            try: dlgp.setValue(100); dlgp.close()
-            except Exception: pass
+            self._hide_pane_progress()
             if not self._using_fast and not self._search_mode: self.stat_proxy.clear_cache()
             self._request_visible_stats(0); self._update_pane_status()
             failed = int(getattr(worker, "error_count", 0) or len(getattr(worker, "errors", [])))
@@ -5644,22 +6063,15 @@ class ExplorerPane(QWidget):
         def _cleanup_worker():
             if getattr(self, "_file_worker", None) is worker:
                 self._file_worker = None
-            try:
-                if getattr(self, "_op_progress_dialog", None) is dlgp:
-                    self._op_progress_dialog = None
-                dlgp.close()
-                dlgp.deleteLater()
-            except Exception:
-                pass
+            self._hide_pane_progress()
             worker.deleteLater()
 
         worker.error.connect(_on_error)
         worker.finished.connect(_cleanup_worker)
-        worker.finished_ok.connect(_finish_ok); dlgp.canceled.connect(worker.cancel)
+        worker.finished_ok.connect(_finish_ok)
         self._file_worker = worker
-        self._op_progress_dialog = dlgp
+        self._op_progress_dialog = None
         worker.start()
-        dlgp.open()
 
     def _start_delete_op(self, paths, permanent: bool = False):
         cur_worker = getattr(self, "_file_worker", None)
@@ -5671,15 +6083,6 @@ class ExplorerPane(QWidget):
         if not valid_paths:
             return
 
-        old_dlg = getattr(self, "_op_progress_dialog", None)
-        if old_dlg:
-            try:
-                old_dlg.close()
-                old_dlg.deleteLater()
-            except Exception:
-                pass
-            self._op_progress_dialog = None
-
         verb = "Deleting" if permanent else "Moving to Recycle Bin"
         hwnd = int(self.window().winId()) if (not permanent and sys.platform == "win32") else 0
         busy_mode = (
@@ -5689,16 +6092,10 @@ class ExplorerPane(QWidget):
         )
 
         worker = DeleteWorker(valid_paths, permanent=permanent, hwnd=hwnd, parent=self)
-        dlgp = QProgressDialog(f"{verb}...", "Cancel", 0, 0 if busy_mode else 100, self)
-        dlgp.setWindowTitle("Delete files" if permanent else "Recycle Bin")
-        dlgp.setWindowModality(Qt.WindowModal)
-        dlgp.setAutoClose(True)
-        dlgp.setAutoReset(True)
-        dlgp.setMinimumDuration(0)
-
+        self._show_pane_progress("Delete" if permanent else "Recycle", busy=busy_mode)
         if not busy_mode:
-            worker.progress.connect(dlgp.setValue)
-        worker.status.connect(dlgp.setLabelText)
+            worker.progress.connect(self._set_pane_progress_value)
+        worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(lambda s: self.host.statusBar().showMessage(s, 2000))
 
         def _refresh_after_cancel():
@@ -5713,13 +6110,7 @@ class ExplorerPane(QWidget):
             QMessageBox.critical(self, "Delete failed", msg)
 
         def _finish_ok():
-            try:
-                if busy_mode:
-                    dlgp.setRange(0, 100)
-                dlgp.setValue(100)
-                dlgp.close()
-            except Exception:
-                pass
+            self._hide_pane_progress()
 
             if not self._using_fast and not self._search_mode:
                 self.stat_proxy.clear_cache()
@@ -5758,23 +6149,15 @@ class ExplorerPane(QWidget):
         def _cleanup_worker():
             if getattr(self, "_file_worker", None) is worker:
                 self._file_worker = None
-            try:
-                if getattr(self, "_op_progress_dialog", None) is dlgp:
-                    self._op_progress_dialog = None
-                dlgp.close()
-                dlgp.deleteLater()
-            except Exception:
-                pass
+            self._hide_pane_progress()
             worker.deleteLater()
 
         worker.error.connect(_on_error)
         worker.finished.connect(_cleanup_worker)
         worker.finished_ok.connect(_finish_ok)
-        dlgp.canceled.connect(worker.cancel)
         self._file_worker = worker
-        self._op_progress_dialog = dlgp
+        self._op_progress_dialog = None
         worker.start()
-        dlgp.open()
 
 
     def delete_selection(self, permanent:bool=False):
@@ -6646,7 +7029,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.4.1</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.5.0</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )

@@ -19,9 +19,9 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
-- File operation progress dialog with cancellation
+- Per-pane file operation progress bar with cancellation
 - Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
-- Bookmark editor and quick bookmark buttons (up to 10 bookmarks)
+- Bookmark editor and compact quick bookmark buttons (up to 30 bookmarks, with overflow menu)
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise
