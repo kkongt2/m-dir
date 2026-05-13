@@ -1,8 +1,53 @@
+from __future__ import annotations
 
-
+import importlib.util
 import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat
 from contextlib import contextmanager
 from pathlib import Path
+
+
+def _configure_qt_for_linux():
+    """Make PyQt5's bundled Qt plugins discoverable on Linux.
+
+    Some Linux environments do not populate Qt's plugin search path before
+    QApplication is created, which can produce an "xcb" platform plugin error
+    with an empty plugin path.  Point Qt at PyQt5's bundled plugins when the
+    caller has not explicitly configured a plugin path.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    plugin_roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        plugin_roots.extend([
+            Path(meipass) / "PyQt5" / "Qt5" / "plugins",
+            Path(meipass) / "Qt5" / "plugins",
+            Path(meipass) / "plugins",
+        ])
+
+    spec = importlib.util.find_spec("PyQt5")
+    if spec and spec.submodule_search_locations:
+        pyqt_dir = Path(next(iter(spec.submodule_search_locations)))
+        plugin_roots.extend([
+            pyqt_dir / "Qt5" / "plugins",
+            pyqt_dir / "Qt" / "plugins",
+            pyqt_dir / "plugins",
+        ])
+
+    plugin_root = next((root for root in plugin_roots if (root / "platforms").is_dir()), None)
+    if plugin_root:
+        os.environ.setdefault("QT_PLUGIN_PATH", str(plugin_root))
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plugin_root / "platforms"))
+
+    # In headless Linux containers/CI there is no X11/Wayland server.  Use the
+    # offscreen backend so startup and smoke tests do not fail while leaving
+    # normal desktop sessions on the xcb/wayland backend.
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+_configure_qt_for_linux()
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import (
