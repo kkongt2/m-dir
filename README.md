@@ -1,13 +1,13 @@
 # Multi-Pane File Explorer (PyQt5)
 
-A multi-pane file explorer for Windows.
+A multi-pane file explorer for Windows and Linux.
 This README reflects the current behavior of `multipane_explorer.py`.
 
 ## Requirements
-- Windows 10/11 (recommended)
-- Python 3.10+
+- Windows 10/11 (recommended) or Linux desktop environment
+- Python 3.9+
 - PyQt5
-- Optional: `pywin32`, `send2trash`
+- Optional: `pywin32` on Windows, `send2trash`
 
 ## Features
 - 4/6/8 pane layout switching (top toolbar + `--panes`), with last layout/path restore
@@ -33,6 +33,8 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install PyQt5 pywin32 send2trash
 ```
+
+For Linux, install PyQt5 and ensure the Qt/XCB runtime libraries for your distribution are available. The app automatically points Qt at PyQt5's bundled plugin directory and uses the offscreen backend only when no `DISPLAY` or `WAYLAND_DISPLAY` is present.
 
 `pywin32` and `send2trash` are optional but recommended for native context-menu integration and reliable Recycle Bin behavior.
 
