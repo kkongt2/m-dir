@@ -6,50 +6,93 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-def _configure_qt_for_linux():
-    """Make PyQt5's bundled Qt plugins discoverable on Linux.
+def _candidate_qt_plugin_roots(qtcore=None):
+    """Return existing Qt plugin roots for PyQt5/PyInstaller layouts."""
+    roots = []
 
-    Some Linux environments do not populate Qt's plugin search path before
-    QApplication is created, which can produce an "xcb" platform plugin error
-    with an empty plugin path.  Point Qt at PyQt5's bundled plugins when the
-    caller has not explicitly configured a plugin path.
-    """
-    if not sys.platform.startswith("linux"):
-        return
+    def add(path):
+        if path:
+            candidate = Path(path)
+            if candidate not in roots:
+                roots.append(candidate)
 
-    plugin_roots = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        plugin_roots.extend([
-            Path(meipass) / "PyQt5" / "Qt5" / "plugins",
-            Path(meipass) / "Qt5" / "plugins",
-            Path(meipass) / "plugins",
-        ])
+        base = Path(meipass)
+        for rel in (
+            ("PyQt5", "Qt5", "plugins"),
+            ("PyQt5", "Qt", "plugins"),
+            ("Qt5", "plugins"),
+            ("plugins",),
+        ):
+            add(base.joinpath(*rel))
+
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+        for rel in (
+            ("PyQt5", "Qt5", "plugins"),
+            ("PyQt5", "Qt", "plugins"),
+            ("Qt5", "plugins"),
+            ("plugins",),
+        ):
+            add(base.joinpath(*rel))
 
     spec = importlib.util.find_spec("PyQt5")
     if spec and spec.submodule_search_locations:
         pyqt_dir = Path(next(iter(spec.submodule_search_locations)))
-        plugin_roots.extend([
-            pyqt_dir / "Qt5" / "plugins",
-            pyqt_dir / "Qt" / "plugins",
-            pyqt_dir / "plugins",
-        ])
+        for rel in (("Qt5", "plugins"), ("Qt", "plugins"), ("plugins",)):
+            add(pyqt_dir.joinpath(*rel))
 
-    plugin_root = next((root for root in plugin_roots if (root / "platforms").is_dir()), None)
+    if qtcore is not None:
+        try:
+            add(qtcore.QLibraryInfo.location(qtcore.QLibraryInfo.PluginsPath))
+        except Exception:
+            pass
+
+    return [root for root in roots if (root / "platforms").is_dir()]
+
+
+def _set_env_if_blank(name, value):
+    if value and not os.environ.get(name):
+        os.environ[name] = str(value)
+
+
+def _configure_qt_for_linux(qtcore=None):
+    """Make Qt platform plugins discoverable on Linux.
+
+    Some Linux environments leave Qt's platform plugin path empty before
+    QApplication is created, which can produce an "xcb" plugin error with an
+    empty location.  Point Qt at an existing PyQt5/PyInstaller plugin root and,
+    after QtCore is imported, register the same roots with Qt itself.
+    """
+    if not sys.platform.startswith("linux"):
+        return []
+
+    plugin_roots = _candidate_qt_plugin_roots(qtcore)
+    plugin_root = plugin_roots[0] if plugin_roots else None
     if plugin_root:
-        os.environ.setdefault("QT_PLUGIN_PATH", str(plugin_root))
-        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plugin_root / "platforms"))
+        _set_env_if_blank("QT_PLUGIN_PATH", plugin_root)
+        _set_env_if_blank("QT_QPA_PLATFORM_PLUGIN_PATH", plugin_root / "platforms")
+
+    if qtcore is not None:
+        for root in reversed(plugin_roots):
+            try:
+                qtcore.QCoreApplication.addLibraryPath(str(root))
+            except Exception:
+                pass
 
     # In headless Linux containers/CI there is no X11/Wayland server.  Use the
     # offscreen backend so startup and smoke tests do not fail while leaving
     # normal desktop sessions on the xcb/wayland backend.
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        _set_env_if_blank("QT_QPA_PLATFORM", "offscreen")
 
+    return plugin_roots
 
 _configure_qt_for_linux()
 
 from PyQt5 import QtCore
+_configure_qt_for_linux(QtCore)
 from PyQt5.QtCore import (
     Qt, QDir, QUrl, QDateTime, QSortFilterProxyModel,
     pyqtSignal, QSettings, QEvent, QTimer, QSize, QAbstractTableModel,
