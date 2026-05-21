@@ -817,6 +817,7 @@ class FileOpWorker(QtCore.QThread):
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
         self._src_size_cache = {}
+        self._src_unit_cache = {}
         self.errors = []
         self.error_count = 0
         self.undo_remove_paths = []
@@ -844,6 +845,7 @@ class FileOpWorker(QtCore.QThread):
         scanned = 0
         total = 0
         self._src_size_cache = {}
+        self._src_unit_cache = {}
         deadline = time.perf_counter() + (FILEOP_SIZE_SCAN_TIME_MS / 1000.0)
         for s in self.srcs:
             if self._cancel:
@@ -851,35 +853,44 @@ class FileOpWorker(QtCore.QThread):
             skey = _path_key(s)
             if os.path.isdir(s) and not os.path.islink(s):
                 src_total = 0
+                src_units = 0
                 for _fp, sz in self._iter_files(s):
                     cur = max(0, int(sz or 0))
                     src_total += cur
                     total += cur
+                    src_units += 1
                     scanned += 1
                     if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
-                        # Switch to count-based progress when size scan is too large/slow.
+                        # Switch to item-count progress when size scan is too large/slow.
                         self._src_size_cache[skey] = src_total
+                        self._src_unit_cache[skey] = max(1, src_units)
                         self._count_progress = True
                         self._total = max(1, scanned, len(self.srcs))
                         self._done = 0
                         return
                 self._src_size_cache[skey] = src_total
+                self._src_unit_cache[skey] = max(1, src_units)
             else:
                 src_total = 0
+                src_units = 1
                 try:
                     src_total = max(0, int(os.path.getsize(s)))
                     total += src_total
                 except Exception:
                     pass
                 self._src_size_cache[skey] = src_total
+                self._src_unit_cache[skey] = src_units
                 scanned += 1
                 if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
                     self._count_progress = True
                     self._total = max(1, scanned, len(self.srcs))
                     self._done = 0
                     return
-        self._count_progress = False
-        self._total = max(1, total)
+        # Prefer per-item progress so the visible percentage reflects how many
+        # files/items are actually completed, not just transferred bytes.
+        self._count_progress = True
+        total_units = sum(max(1, int(v or 0)) for v in self._src_unit_cache.values())
+        self._total = max(1, total_units)
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
 
@@ -921,7 +932,11 @@ class FileOpWorker(QtCore.QThread):
 
     def _skip_source_progress(self, src):
         if self._count_progress:
-            self._tick_count_unit(1)
+            try:
+                units = self._src_unit_cache.get(_path_key(src), 1)
+            except Exception:
+                units = 1
+            self._tick_count_unit(max(1, int(units or 1)))
             return
         try:
             delta = self._src_size_cache.get(_path_key(src))
