@@ -66,8 +66,6 @@ CONTROL_HPAD= 6
 CRUMB_MAX_SEG_W = 180
 ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
-FILEOP_SIZE_SCAN_FILE_LIMIT = 6000
-FILEOP_SIZE_SCAN_TIME_MS = 1200
 FILEOP_ERROR_DETAIL_LIMIT = 50
 LARGE_FOLDER_THRESHOLD = 3000
 GENERIC_ICON_THRESHOLD = 1200
@@ -464,7 +462,48 @@ def _is_qt_main_thread() -> bool:
     except Exception:
         return True
 
-def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int, list[str]]:
+def _scan_delete_item_counts(path: str, should_cancel=None) -> tuple[int, dict[str, int]]:
+    """Return the total item count and subtree counts without following directory links."""
+    counts: dict[str, int] = {}
+
+    def check_cancel():
+        if should_cancel and should_cancel():
+            raise DeleteCancelled()
+
+    def visit(p: str) -> int:
+        check_cancel()
+        key = _path_key(p)
+        if not _path_exists_for_delete(p):
+            counts[key] = 1
+            return 1
+
+        if not (os.path.isdir(p) and not _is_dir_link(p)):
+            counts[key] = 1
+            return 1
+
+        total = 1  # the directory itself
+        try:
+            with os.scandir(p) as it:
+                entries = list(it)
+        except OSError:
+            counts[key] = total
+            return total
+
+        for entry in entries:
+            total += visit(entry.path)
+        counts[key] = total
+        return total
+
+    path = _normalize_fs_path(path)
+    return visit(path), counts
+
+
+def delete_any_permanent_best_effort(
+    path: str,
+    should_cancel=None,
+    on_items_done=None,
+    item_count_of=None,
+) -> tuple[int, list[str]]:
     """Delete everything possible under path, returning (deleted_count, errors)."""
     deleted = 0
     errors: list[str] = []
@@ -473,6 +512,21 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
         if should_cancel and should_cancel():
             raise DeleteCancelled()
 
+    def planned_count(p: str) -> int:
+        if item_count_of:
+            try:
+                return max(1, int(item_count_of(p)))
+            except Exception:
+                pass
+        return 1
+
+    def mark_done(units: int = 1):
+        if on_items_done:
+            try:
+                on_items_done(max(0, int(units)))
+            except Exception:
+                pass
+
     def record_error(p: str, exc: BaseException):
         errors.append(_delete_error_message(p, exc))
 
@@ -480,6 +534,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
         nonlocal deleted
         check_cancel()
         if not _path_exists_for_delete(p):
+            mark_done(1)
             return True
         last_exc = None
         for attempt in range(2):
@@ -489,6 +544,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
                 else:
                     os.remove(p)
                 deleted += 1
+                mark_done(1)
                 return True
             except PermissionError as exc:
                 last_exc = exc
@@ -504,6 +560,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
                 break
         if last_exc:
             record_error(p, last_exc)
+        mark_done(1)
         return False
 
     def remove_dir(p: str) -> bool:
@@ -515,6 +572,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
                 entries = list(it)
         except OSError as exc:
             record_error(p, exc)
+            mark_done(planned_count(p))
             return False
 
         for entry in entries:
@@ -526,6 +584,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
                 is_junction = _entry_is_junction(entry)
             except OSError as exc:
                 record_error(child, exc)
+                mark_done(planned_count(child))
                 child_failed = True
                 continue
 
@@ -536,6 +595,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
                 child_failed = True
 
         if not _path_exists_for_delete(p):
+            mark_done(1)
             return not child_failed
 
         last_exc = None
@@ -543,6 +603,7 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
             try:
                 os.rmdir(p)
                 deleted += 1
+                mark_done(1)
                 return not child_failed
             except PermissionError as exc:
                 last_exc = exc
@@ -559,12 +620,14 @@ def delete_any_permanent_best_effort(path: str, should_cancel=None) -> tuple[int
 
         if last_exc and not (child_failed and _is_not_empty_error(last_exc)):
             record_error(p, last_exc)
+        mark_done(1)
         return False
 
     path = _normalize_fs_path(path)
     check_cancel()
     if not _path_exists_for_delete(path):
-        return 1, []
+        mark_done(planned_count(path))
+        return 0, []
     if os.path.isdir(path) and not _is_dir_link(path):
         remove_dir(path)
     else:
@@ -648,14 +711,35 @@ def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
         print("[delete] refusing permanent fallback for Recycle Bin delete:", path)
     return False
 
-def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tuple[int, list[str]]:
-    """Move as much as possible to Recycle Bin, recursing when a folder move fails."""
+def recycle_any_best_effort(
+    path: str,
+    hwnd: int = 0,
+    should_cancel=None,
+    on_items_done=None,
+    item_count_of=None,
+) -> tuple[int, list[str]]:
+    """Move as much as possible to Recycle Bin while reporting subtree progress."""
     deleted = 0
     errors: list[str] = []
 
     def check_cancel():
         if should_cancel and should_cancel():
             raise DeleteCancelled()
+
+    def planned_count(p: str) -> int:
+        if item_count_of:
+            try:
+                return max(1, int(item_count_of(p)))
+            except Exception:
+                pass
+        return 1
+
+    def mark_done(units: int):
+        if on_items_done:
+            try:
+                on_items_done(max(0, int(units)))
+            except Exception:
+                pass
 
     def record_error(p: str):
         errors.append(f"{p}: Could not move item to Recycle Bin.")
@@ -669,13 +753,16 @@ def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tup
             return True
         return False
 
-    def recycle_whole(p: str) -> bool:
+    def recycle_whole(p: str, units: int | None = None) -> bool:
         nonlocal deleted
         check_cancel()
+        work_units = planned_count(p) if units is None else max(1, int(units))
         if not _path_exists_for_delete(p):
+            mark_done(work_units)
             return True
         if recycle_path_to_trash(p, hwnd):
-            deleted += 1
+            deleted += work_units
+            mark_done(work_units)
             return True
         return False
 
@@ -687,6 +774,7 @@ def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tup
                 entries = list(it)
         except OSError as exc:
             errors.append(_delete_error_message(p, exc))
+            mark_done(planned_count(p))
             return False
 
         for entry in entries:
@@ -700,6 +788,7 @@ def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tup
                 is_junction = _entry_is_junction(entry)
             except OSError as exc:
                 errors.append(_delete_error_message(child, exc))
+                mark_done(planned_count(child))
                 child_failed = True
                 continue
 
@@ -708,26 +797,31 @@ def recycle_any_best_effort(path: str, hwnd: int = 0, should_cancel=None) -> tup
                     child_failed = True
             else:
                 record_error(child)
+                mark_done(1)
                 child_failed = True
 
         if not _path_exists_for_delete(p):
+            mark_done(1)
             return not child_failed
-        if recycle_whole(p):
+        if recycle_whole(p, units=1):
             return not child_failed
         if not (child_failed and dir_has_entries(p)):
             record_error(p)
+        mark_done(1)
         return False
 
     path = _normalize_fs_path(path)
     check_cancel()
     if not _path_exists_for_delete(path):
-        return 1, []
+        mark_done(planned_count(path))
+        return 0, []
     if recycle_whole(path):
         return deleted, []
     if os.path.isdir(path) and not _is_dir_link(path):
         recycle_dir_contents(path)
     else:
         record_error(path)
+        mark_done(1)
     return deleted, errors
 
 def move_with_collision(src: str, dst_dir: str) -> str:
@@ -811,87 +905,84 @@ class FileOpWorker(QtCore.QThread):
         self.dst_dir = dst_dir
         self.conflict_map = dict(conflict_map or {})
         self._cancel = False
-        self._total = 0
-        self._done = 0
-        self._count_progress = False
+        self._total_bytes = 0
+        self._done_bytes = 0
+        self._total_items = 0
+        self._done_items = 0
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
-        self._src_size_cache = {}
+        self._src_progress_cache: dict[str, tuple[int, int]] = {}
         self.errors = []
         self.error_count = 0
         self.undo_remove_paths = []
         self.undo_move_pairs = []
 
-    def cancel(self): self._cancel = True
+    def cancel(self):
+        self._cancel = True
 
-    def _iter_files(self, path):
+    def _scan_source_progress(self, path: str) -> tuple[int, int]:
+        total_bytes = 0
+        total_items = 0
         if os.path.isdir(path) and not os.path.islink(path):
-            for root, dirs, files in os.walk(path):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    try: size = os.path.getsize(fp)
-                    except Exception: size = 0
-                    yield fp, size
+            for root, _dirs, files in os.walk(path):
+                if self._cancel:
+                    break
+                total_items += 1  # each visited directory
+                for filename in files:
+                    if self._cancel:
+                        break
+                    fp = os.path.join(root, filename)
+                    total_items += 1
+                    try:
+                        total_bytes += max(0, int(os.path.getsize(fp)))
+                    except Exception:
+                        pass
         else:
-            try: size = os.path.getsize(path)
-            except Exception: size = 0
-            yield path, size
-
-    def _size_of(self, path) -> int:
-        return sum(sz for _, sz in self._iter_files(path))
+            total_items = 1
+            try:
+                total_bytes = max(0, int(os.path.getsize(path)))
+            except Exception:
+                total_bytes = 0
+        return total_bytes, max(1, total_items)
 
     def _calc_total(self):
-        scanned = 0
-        total = 0
-        self._src_size_cache = {}
-        deadline = time.perf_counter() + (FILEOP_SIZE_SCAN_TIME_MS / 1000.0)
-        for s in self.srcs:
+        self._total_bytes = 0
+        self._done_bytes = 0
+        self._total_items = 0
+        self._done_items = 0
+        self._src_progress_cache = {}
+        for idx, src in enumerate(self.srcs, start=1):
             if self._cancel:
                 break
-            skey = _path_key(s)
-            if os.path.isdir(s) and not os.path.islink(s):
-                src_total = 0
-                for _fp, sz in self._iter_files(s):
-                    cur = max(0, int(sz or 0))
-                    src_total += cur
-                    total += cur
-                    scanned += 1
-                    if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
-                        # Switch to count-based progress when size scan is too large/slow.
-                        self._src_size_cache[skey] = src_total
-                        self._count_progress = True
-                        self._total = max(1, scanned, len(self.srcs))
-                        self._done = 0
-                        return
-                self._src_size_cache[skey] = src_total
-            else:
-                src_total = 0
-                try:
-                    src_total = max(0, int(os.path.getsize(s)))
-                    total += src_total
-                except Exception:
-                    pass
-                self._src_size_cache[skey] = src_total
-                scanned += 1
-                if scanned >= FILEOP_SIZE_SCAN_FILE_LIMIT or time.perf_counter() >= deadline:
-                    self._count_progress = True
-                    self._total = max(1, scanned, len(self.srcs))
-                    self._done = 0
-                    return
-        self._count_progress = False
-        self._total = max(1, total)
+            name = os.path.basename(src.rstrip("\\/")) or src
+            self.status.emit(f"Scanning {idx}/{len(self.srcs)}: {name}")
+            stats = self._scan_source_progress(src)
+            self._src_progress_cache[_path_key(src)] = stats
+            self._total_bytes += stats[0]
+            self._total_items += stats[1]
+        self._total_items = max(1, self._total_items)
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
+        self._emit_progress()
 
     def _emit_progress(self, force: bool = False):
-        total = max(1, int(self._total or 1))
-        pct = min(100, int(self._done * 100 / total))
-        if not force:
-            pct = min(99, pct)
+        if force:
+            pct = 100
+        else:
+            item_ratio = min(1.0, self._done_items / max(1, self._total_items))
+            if self._total_bytes > 0:
+                byte_ratio = min(1.0, self._done_bytes / self._total_bytes)
+                # File count matters more as the number of entries grows, while a
+                # single large file still advances smoothly by copied bytes.
+                item_weight = 0.35 * (self._total_items / (self._total_items + 20.0))
+                ratio = (byte_ratio * (1.0 - item_weight)) + (item_ratio * item_weight)
+            else:
+                ratio = item_ratio
+            pct = min(99, max(0, int(ratio * 100)))
+
         now = time.perf_counter()
         should_emit = (
             force
-            or pct >= 100
             or self._last_progress_pct < 0
             or (
                 pct > self._last_progress_pct
@@ -907,29 +998,21 @@ class FileOpWorker(QtCore.QThread):
         self._last_progress_emit_ts = now
         self.progress.emit(pct)
 
-    def _tick_progress(self, delta_bytes):
-        if self._count_progress:
-            return
-        self._done += max(0, int(delta_bytes))
+    def _tick_progress(self, delta_bytes: int = 0, delta_items: int = 0):
+        self._done_bytes += max(0, int(delta_bytes or 0))
+        self._done_items += max(0, int(delta_items or 0))
         self._emit_progress()
 
-    def _tick_count_unit(self, units: int = 1):
-        if not self._count_progress:
-            return
-        self._done += max(0, int(units))
-        self._emit_progress()
+    def _source_progress(self, src: str) -> tuple[int, int]:
+        try:
+            stats = self._src_progress_cache.get(_path_key(src))
+        except Exception:
+            stats = None
+        return stats if stats is not None else self._scan_source_progress(src)
 
     def _skip_source_progress(self, src):
-        if self._count_progress:
-            self._tick_count_unit(1)
-            return
-        try:
-            delta = self._src_size_cache.get(_path_key(src))
-        except Exception:
-            delta = None
-        if delta is None:
-            delta = self._size_of(src)
-        self._tick_progress(delta)
+        total_bytes, total_items = self._source_progress(src)
+        self._tick_progress(total_bytes, total_items)
 
     def _emit_source_done(self):
         self._emit_progress()
@@ -943,27 +1026,28 @@ class FileOpWorker(QtCore.QThread):
                     if self._cancel:
                         return False
                     buf = fsrc.read(1024 * 1024)
-                    if not buf: break
+                    if not buf:
+                        break
                     fdst.write(buf)
                     copied += len(buf)
-                    self._tick_progress(len(buf))
-            self._tick_count_unit(1)
-            try: shutil.copystat(src, dst, follow_symlinks=True)
-            except Exception: pass
+                    self._tick_progress(delta_bytes=len(buf))
+            self._tick_progress(delta_items=1)
+            try:
+                shutil.copystat(src, dst, follow_symlinks=True)
+            except Exception:
+                pass
             return True
         except Exception:
             self._skip_file_progress(src, copied)
             raise
 
     def _skip_file_progress(self, src, copied_bytes: int = 0):
-        if self._count_progress:
-            self._tick_count_unit(1)
-            return
         try:
             size = max(0, int(os.path.getsize(src)))
         except Exception:
             size = 0
-        self._tick_progress(max(0, size - max(0, int(copied_bytes or 0))))
+        remaining = max(0, size - max(0, int(copied_bytes or 0)))
+        self._tick_progress(delta_bytes=remaining, delta_items=1)
 
     def _record_copy_error(self, src, dst, exc):
         if self._cancel:
@@ -992,22 +1076,26 @@ class FileOpWorker(QtCore.QThread):
 
     def _copy_dir_recursive(self, src_dir, dst_dir):
         ok = True
-        for root, dirs, files in os.walk(src_dir):
-            if self._cancel: return ok
+        for root, _dirs, files in os.walk(src_dir):
+            if self._cancel:
+                return ok
             rel = os.path.relpath(root, src_dir)
             target_root = os.path.join(dst_dir, "" if rel == "." else rel)
             try:
                 os.makedirs(target_root, exist_ok=True)
+                self._tick_progress(delta_items=1)
             except Exception as e:
                 self._record_copy_error(root, target_root, e)
-                for f in files:
-                    self._skip_file_progress(os.path.join(root, f))
+                self._tick_progress(delta_items=1)
+                for filename in files:
+                    self._skip_file_progress(os.path.join(root, filename))
                 ok = False
                 continue
-            for f in files:
-                if self._cancel: return ok
-                sfile = os.path.join(root, f)
-                dfile = os.path.join(target_root, f)
+            for filename in files:
+                if self._cancel:
+                    return ok
+                sfile = os.path.join(root, filename)
+                dfile = os.path.join(target_root, filename)
                 try:
                     self._copy_file(sfile, dfile)
                 except Exception as e:
@@ -1017,14 +1105,16 @@ class FileOpWorker(QtCore.QThread):
 
     def run(self):
         try:
+            self.status.emit(f"Scanning items for {self.op} ...")
             self._calc_total()
-            if self._count_progress:
-                self.status.emit(f"Preparing {self.op} (quick estimate) ...")
-            else:
-                self.status.emit(f"Preparing {self.op} ...")
+            if self._cancel:
+                self.error.emit("Operation cancelled.")
+                return
+            self.status.emit(f"Preparing {self.op} ...")
 
             for src in self.srcs:
-                if self._cancel: break
+                if self._cancel:
+                    break
                 if not os.path.exists(src):
                     self._skip_source_progress(src)
                     self._emit_source_done()
@@ -1032,7 +1122,6 @@ class FileOpWorker(QtCore.QThread):
 
                 base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
                 dst = os.path.join(self.dst_dir, base)
-
 
                 if _paths_same(src, dst):
                     if self.op == "copy":
@@ -1043,9 +1132,7 @@ class FileOpWorker(QtCore.QThread):
                         self._emit_source_done()
                         continue
 
-
                 if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
-                    # Prevent copying/moving a folder into its own subtree.
                     self.status.emit(f"Skipped nested destination: {base}")
                     self._skip_source_progress(src)
                     self._emit_source_done()
@@ -1053,7 +1140,6 @@ class FileOpWorker(QtCore.QThread):
 
                 exists = os.path.exists(dst)
                 action = self.conflict_map.get(src) if exists else None
-
 
                 if self.op == "copy":
                     if os.path.isdir(src) and not os.path.islink(src):
@@ -1099,11 +1185,10 @@ class FileOpWorker(QtCore.QThread):
                         except Exception as e:
                             self._record_copy_error(src, dst, e)
 
-
                 else:
                     keep_both = (action == "copy")
                     can_undo_move = self._can_undo_new_destination(exists, action)
-                    src_progress_size = self._src_size_cache.get(_path_key(src))
+                    src_progress = self._source_progress(src)
                     if exists:
                         if action == "skip":
                             self._skip_source_progress(src); self._emit_source_done(); continue
@@ -1111,23 +1196,25 @@ class FileOpWorker(QtCore.QThread):
                             dst = unique_dest_path(self.dst_dir, base)
                         elif action == "overwrite":
                             try:
-                                if os.path.isdir(dst) and not os.path.islink(dst): shutil.rmtree(dst)
-                                else: os.remove(dst)
-                            except Exception: pass
+                                if os.path.isdir(dst) and not os.path.islink(dst):
+                                    shutil.rmtree(dst)
+                                else:
+                                    os.remove(dst)
+                            except Exception:
+                                pass
                     try:
                         final = shutil.move(src, dst if keep_both else self.dst_dir)
-                        if src_progress_size is None:
-                            src_progress_size = self._size_of(final if os.path.exists(final) else src)
-                        self._tick_progress(src_progress_size)
-                        self._tick_count_unit(1)
+                        self._tick_progress(src_progress[0], src_progress[1])
                         if can_undo_move:
                             self._remember_move_for_undo(final, src)
                     except Exception:
                         # Cross-device move or permission failures: fall back to copy.
                         if os.path.isdir(src) and not os.path.islink(src):
                             if os.path.exists(dst) and action == "overwrite":
-                                try: shutil.rmtree(dst)
-                                except Exception: pass
+                                try:
+                                    shutil.rmtree(dst)
+                                except Exception:
+                                    pass
                             if os.path.exists(dst) and action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
                             try:
@@ -1147,8 +1234,10 @@ class FileOpWorker(QtCore.QThread):
                                 self._remember_move_for_undo(dst, src)
                         else:
                             if os.path.exists(dst) and action == "overwrite":
-                                try: os.remove(dst)
-                                except Exception: pass
+                                try:
+                                    os.remove(dst)
+                                except Exception:
+                                    pass
                             if os.path.exists(dst) and action == "copy":
                                 dst = unique_dest_path(self.dst_dir, base)
                             copied_ok = False
@@ -1169,8 +1258,10 @@ class FileOpWorker(QtCore.QThread):
                 self._emit_source_done()
 
             if self._cancel:
-                self.error.emit("Operation cancelled."); return
-            self._done = max(self._done, self._total)
+                self.error.emit("Operation cancelled.")
+                return
+            self._done_bytes = max(self._done_bytes, self._total_bytes)
+            self._done_items = max(self._done_items, self._total_items)
             self._emit_progress(force=True)
             self.finished_ok.emit()
         except Exception as e:
@@ -1189,10 +1280,11 @@ class DeleteWorker(QtCore.QThread):
         self.permanent = permanent
         self.hwnd = int(hwnd or 0)
         self._cancel = False
-        self._total = max(1, len(self.paths))
+        self._total = 1
         self._done = 0
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
+        self._subtree_item_counts: dict[str, int] = {}
         self.deleted_count = 0
         self.errors = []
 
@@ -1200,12 +1292,14 @@ class DeleteWorker(QtCore.QThread):
         self._cancel = True
 
     def _emit_progress(self, force: bool = False):
-        total = max(1, int(self._total or 1))
-        pct = min(100, int(self._done * 100 / total))
+        if force:
+            pct = 100
+        else:
+            total = max(1, int(self._total or 1))
+            pct = min(99, max(0, int(self._done * 100 / total)))
         now = time.perf_counter()
         should_emit = (
             force
-            or pct >= 100
             or self._last_progress_pct < 0
             or (
                 pct > self._last_progress_pct
@@ -1221,9 +1315,42 @@ class DeleteWorker(QtCore.QThread):
         self._last_progress_emit_ts = now
         self.progress.emit(pct)
 
+    def _scan_total_items(self):
+        self._total = 0
+        self._done = 0
+        self._subtree_item_counts = {}
+        for idx, path in enumerate(self.paths, start=1):
+            if self._cancel:
+                raise DeleteCancelled()
+            name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
+            self.status.emit(f"Scanning {idx}/{len(self.paths)}: {name}")
+            count, subtree_counts = _scan_delete_item_counts(
+                path,
+                should_cancel=lambda: self._cancel,
+            )
+            self._total += count
+            self._subtree_item_counts.update(subtree_counts)
+        self._total = max(1, self._total)
+        self._last_progress_pct = -1
+        self._last_progress_emit_ts = 0.0
+        self._emit_progress()
+
+    def _item_count_of(self, path: str) -> int:
+        return max(1, int(self._subtree_item_counts.get(_path_key(path), 1)))
+
+    def _on_items_done(self, units: int):
+        self._done += max(0, int(units or 0))
+        self._emit_progress()
+
     def run(self):
         coinit = False
         try:
+            self.status.emit("Scanning items for delete ...")
+            self._scan_total_items()
+            if self._cancel:
+                self.error.emit("Operation cancelled.")
+                return
+
             if sys.platform == "win32" and HAS_PYWIN32:
                 try:
                     pythoncom.CoInitialize()
@@ -1232,8 +1359,8 @@ class DeleteWorker(QtCore.QThread):
                     coinit = False
 
             verb = "Deleting" if self.permanent else "Sending to Recycle Bin"
-            total = len(self.paths)
-            if total == 0:
+            total_paths = len(self.paths)
+            if total_paths == 0:
                 self._done = self._total
                 self._emit_progress(force=True)
                 self.finished_ok.emit()
@@ -1245,34 +1372,34 @@ class DeleteWorker(QtCore.QThread):
                     return
 
                 name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
-                self.status.emit(f"{verb} {idx}/{total}: {name}")
+                self.status.emit(f"{verb} {idx}/{total_paths}: {name}")
 
                 try:
                     if self.permanent:
                         deleted, errors = delete_any_permanent_best_effort(
                             path,
                             should_cancel=lambda: self._cancel,
+                            on_items_done=self._on_items_done,
+                            item_count_of=self._item_count_of,
                         )
-                        self.deleted_count += deleted
-                        self.errors.extend(errors)
                     else:
                         deleted, errors = recycle_any_best_effort(
                             path,
                             hwnd=self.hwnd,
                             should_cancel=lambda: self._cancel,
+                            on_items_done=self._on_items_done,
+                            item_count_of=self._item_count_of,
                         )
-                        self.deleted_count += deleted
-                        self.errors.extend(errors)
+                    self.deleted_count += deleted
+                    self.errors.extend(errors)
                 except DeleteCancelled:
                     self.error.emit("Operation cancelled.")
                     return
                 except Exception as e:
                     self.errors.append(f"{path}: {e}")
+                    self._on_items_done(self._item_count_of(path))
 
-                self._done = idx
-                self._emit_progress()
-
-            self._done = self._total
+            self._done = max(self._done, self._total)
             self._emit_progress(force=True)
             self.finished_ok.emit()
         except DeleteCancelled:
@@ -1285,6 +1412,7 @@ class DeleteWorker(QtCore.QThread):
                     pythoncom.CoUninitialize()
                 except Exception:
                     pass
+
 
 
 def _common_css():
@@ -6085,16 +6213,9 @@ class ExplorerPane(QWidget):
 
         verb = "Deleting" if permanent else "Moving to Recycle Bin"
         hwnd = int(self.window().winId()) if (not permanent and sys.platform == "win32") else 0
-        busy_mode = (
-            len(valid_paths) == 1
-            and os.path.isdir(valid_paths[0])
-            and not os.path.islink(valid_paths[0])
-        )
-
         worker = DeleteWorker(valid_paths, permanent=permanent, hwnd=hwnd, parent=self)
-        self._show_pane_progress("Delete" if permanent else "Recycle", busy=busy_mode)
-        if not busy_mode:
-            worker.progress.connect(self._set_pane_progress_value)
+        self._show_pane_progress("Delete" if permanent else "Recycle", busy=False)
+        worker.progress.connect(self._set_pane_progress_value)
         worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(lambda s: self.host.statusBar().showMessage(s, 2000))
 
@@ -7029,7 +7150,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.5.0</b></div>"
+            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.5.1</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
@@ -7322,3 +7443,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
