@@ -8003,7 +8003,9 @@ class MultiExplorer(QMainWindow):
             animation.addAnimation(fade_in)
             animation.addAnimation(hold)
             animation.addAnimation(fade_out)
-            animation.start(QSequentialAnimationGroup.DeleteWhenStopped)
+            animation.setLoopCount(-1)
+            dlg._about_animation = animation
+            animation.start()
 
         _add_dialog_button_box(lay, dlg, QDialogButtonBox.Ok, dlg.accept)
         _apply_palette_colors(dlg, {QPalette.Window: (255, 255, 255), QPalette.WindowText: (0, 0, 0)})
