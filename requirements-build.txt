@@ -1,0 +1,4 @@
+PyInstaller>=6.0
+PyQt5>=5.15
+send2trash>=1.8
+pywin32>=306; platform_system == "Windows"

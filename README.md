@@ -95,7 +95,16 @@ Stored values include:
 - Per-pane search result column widths
 
 ## Build (optional)
-You can build with PyInstaller using `makeExe.bat` or `MultiPaneExplorer.spec`.
+Install the build requirements, then run PyInstaller in one-file mode:
+
+```powershell
+pip install -r requirements-build.txt
+pyinstaller --onefile --windowed --name MultiPaneExplorer multipane_explorer.py
+```
+
+On Windows, you can run `makeExe.bat` to execute the same one-file build. The executable is written to `dist\MultiPaneExplorer.exe`.
+
+To download a prebuilt executable from GitHub, open the **Build Windows EXE** workflow run for this branch or pull request, then download the `MultiPaneExplorer-windows-exe` artifact.
 
 ## License
 MIT
