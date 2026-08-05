@@ -96,6 +96,7 @@ DATE_COL_WIDTH = 122
 SEARCH_FOLDER_COL_WIDTH = 240
 LIST_DATETIME_FMT = "yyyy-MM-dd HH:mm"
 HOVER_TOOLTIP_DURATION_MULTIPLIER = 9
+APP_ICON_FILENAME = "images-5.ico"
 ABOUT_IMAGE_FILENAME = "images-6.ico"
 
 GLOBAL_SHELL_ICON_CACHE = {}
@@ -7356,6 +7357,7 @@ class MultiExplorer(QMainWindow):
     namedBookmarksChanged=pyqtSignal(list)
     def __init__(self, pane_count:int=6, start_paths=None, initial_theme:str="dark"):
         super().__init__()
+        self.setWindowIcon(QIcon(app_resource_path(APP_ICON_FILENAME)))
         self.theme=initial_theme if initial_theme in VALID_THEMES else "dark"
         self._layout_states=[4,6,8]; self._layout_idx=self._layout_states.index(pane_count) if pane_count in self._layout_states else 1
         self.setWindowTitle(f"Multi-Pane File Explorer - {pane_count} panes"); self.resize(1500,900)
@@ -7965,6 +7967,7 @@ class MultiExplorer(QMainWindow):
 
     def _show_about(self):
         dlg=QDialog(self); dlg.setWindowTitle("About")
+        dlg.setWindowIcon(QIcon(app_resource_path(ABOUT_IMAGE_FILENAME)))
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
@@ -8313,6 +8316,7 @@ def main():
     except Exception:
         pass
     app=QApplication(sys.argv)
+    app.setWindowIcon(QIcon(app_resource_path(APP_ICON_FILENAME)))
     base_font=QFont("Segoe UI"); base_font.setPointSizeF(FONT_PT); app.setFont(base_font)
     app.setOrganizationName(ORG_NAME); app.setApplicationName(APP_NAME); app.setApplicationVersion(APP_VERSION)
     settings=QSettings(ORG_NAME, APP_NAME); theme=settings.value("ui/theme","dark")

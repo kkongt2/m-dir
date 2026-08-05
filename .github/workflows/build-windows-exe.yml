@@ -28,7 +28,7 @@ jobs:
         run: python -m pip install -r requirements-build.txt
 
       - name: Build one-file executable
-        run: python -m PyInstaller --onefile --windowed --name MultiPaneExplorer multipane_explorer.py
+        run: python -m PyInstaller --clean --noconfirm MultiPaneExplorer.spec
 
       - name: Upload executable artifact
         uses: actions/upload-artifact@v6

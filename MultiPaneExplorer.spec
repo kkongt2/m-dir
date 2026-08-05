@@ -5,7 +5,10 @@ a = Analysis(
     ['multipane_explorer.py'],
     pathex=[],
     binaries=[],
-    datas=[('images-6.ico', '.')],
+    datas=[
+        ('images-5.ico', '.'),
+        ('images-6.ico', '.'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +38,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='images-5.ico',
 )

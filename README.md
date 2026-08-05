@@ -95,14 +95,14 @@ Stored values include:
 - Per-pane search result column widths
 
 ## Build (optional)
-Install the build requirements, then run PyInstaller in one-file mode:
+Install the build requirements, then build from the checked-in PyInstaller spec:
 
 ```powershell
 pip install -r requirements-build.txt
-pyinstaller --onefile --windowed --name MultiPaneExplorer multipane_explorer.py
+python -m PyInstaller --clean --noconfirm MultiPaneExplorer.spec
 ```
 
-On Windows, you can run `makeExe.bat` to execute the same one-file build. The executable is written to `dist\MultiPaneExplorer.exe`.
+On Windows, you can run `makeExe.bat` to execute the same one-file build. The executable and taskbar use `images-5.ico`; the About dialog uses `images-6.ico`. The executable is written to `dist\MultiPaneExplorer.exe`.
 
 To download a prebuilt executable from GitHub, open the **Build Windows EXE** workflow run for this branch or pull request, then download the `MultiPaneExplorer-windows-exe` artifact.
 
