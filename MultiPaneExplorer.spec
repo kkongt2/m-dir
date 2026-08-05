@@ -5,7 +5,7 @@ a = Analysis(
     ['multipane_explorer.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('images-6.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

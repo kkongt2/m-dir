@@ -8,7 +8,8 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import (
     Qt, QDir, QUrl, QDateTime, QSortFilterProxyModel,
     pyqtSignal, QSettings, QEvent, QTimer, QSize, QAbstractTableModel,
-    QIdentityProxyModel, QElapsedTimer, QStringListModel
+    QIdentityProxyModel, QElapsedTimer, QStringListModel, QPropertyAnimation,
+    QSequentialAnimationGroup, QPauseAnimation
 )
 from PyQt5.QtGui import (
     QDesktopServices, QPalette, QColor, QKeySequence, QIcon,
@@ -22,9 +23,16 @@ from PyQt5.QtWidgets import (
     QMenu, QStyle, QHeaderView, QScrollArea, QFrame, QLabel, QShortcut,
     QToolButton, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QCheckBox, QFileDialog, QProgressBar, QToolTip, QSizePolicy, QFileIconProvider,
-    QComboBox, QSpacerItem, QCompleter, QSpinBox, QStyledItemDelegate
+    QComboBox, QSpacerItem, QCompleter, QSpinBox, QStyledItemDelegate,
+    QGraphicsOpacityEffect
 )
 
+
+
+def app_resource_path(filename: str) -> str:
+    """Return a bundled resource path in both source and PyInstaller builds."""
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, filename)
 
 def _env_flag(name: str) -> bool:
     v = os.environ.get(name, "")
@@ -88,6 +96,7 @@ DATE_COL_WIDTH = 122
 SEARCH_FOLDER_COL_WIDTH = 240
 LIST_DATETIME_FMT = "yyyy-MM-dd HH:mm"
 HOVER_TOOLTIP_DURATION_MULTIPLIER = 9
+ABOUT_IMAGE_FILENAME = "images-6.ico"
 
 GLOBAL_SHELL_ICON_CACHE = {}
 GLOBAL_SHELL_ICON_FAILURES = {}
@@ -7964,10 +7973,39 @@ class MultiExplorer(QMainWindow):
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
         lay.addWidget(lbl)
+
+        about_pixmap = QPixmap(app_resource_path(ABOUT_IMAGE_FILENAME))
+        if not about_pixmap.isNull():
+            img_lbl = QLabel(dlg)
+            img_lbl.setAlignment(Qt.AlignCenter)
+            img_lbl.setPixmap(about_pixmap.scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            opacity = QGraphicsOpacityEffect(img_lbl)
+            opacity.setOpacity(0.0)
+            img_lbl.setGraphicsEffect(opacity)
+            lay.addWidget(img_lbl)
+
+            fade_in = QPropertyAnimation(opacity, b"opacity", dlg)
+            fade_in.setDuration(5000)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+
+            hold = QPauseAnimation(3000, dlg)
+
+            fade_out = QPropertyAnimation(opacity, b"opacity", dlg)
+            fade_out.setDuration(5000)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.0)
+
+            animation = QSequentialAnimationGroup(dlg)
+            animation.addAnimation(fade_in)
+            animation.addAnimation(hold)
+            animation.addAnimation(fade_out)
+            animation.start(QSequentialAnimationGroup.DeleteWhenStopped)
+
         _add_dialog_button_box(lay, dlg, QDialogButtonBox.Ok, dlg.accept)
         _apply_palette_colors(dlg, {QPalette.Window: (255, 255, 255), QPalette.WindowText: (0, 0, 0)})
         dlg.setStyleSheet("QLabel { color: #000; } QDialog { background: #FFF; }")
-        dlg.resize(380,180); dlg.exec_()
+        dlg.resize(380,290); dlg.exec_()
 
     def closeEvent(self, e):
         manager = getattr(self, "file_ops", None)
