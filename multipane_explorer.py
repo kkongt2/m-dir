@@ -46,6 +46,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
+APP_VERSION = "2.6.2"
 
 
 BASE_FONT_PT = 9.5
@@ -1061,6 +1062,9 @@ class FileOperationManager(QtCore.QObject):
                 return
             except Exception:
                 self._workers.discard(worker)
+
+    def queued_count(self) -> int:
+        return len(self._queue)
 
     def cancel_all(self, wait_ms: int = 8000) -> bool:
         workers = list(self._workers)
@@ -3202,7 +3206,8 @@ class SearchWorker(QtCore.QThread):
 
     def _emit_progress(self, folder: str = ""):
         now = time.monotonic()
-        if self._last_progress_emit and (now - self._last_progress_emit) < 0.2:
+        interval_s = max(0.05, SEARCH_PROGRESS_INTERVAL / 1000.0)
+        if self._last_progress_emit and (now - self._last_progress_emit) < interval_s:
             return
         self._last_progress_emit = now
         self.progress.emit(self._visited_dirs, self._visited_entries, folder)
@@ -3256,7 +3261,7 @@ class SearchWorker(QtCore.QThread):
 
 
                             if is_dir:
-                                if entry.name in DEFAULT_SEARCH_EXCLUDE_DIRS:
+                                if entry.name.lower() in DEFAULT_SEARCH_EXCLUDE_DIRS:
                                     continue
                                 try:
                                     if entry.is_symlink():
@@ -5421,7 +5426,8 @@ class ExplorerPane(QWidget):
             rows = self._search_model.rowCount() if self._search_model is not None else 0
         except Exception:
             rows = 0
-        self.host.statusBar().showMessage(f"Search complete: {rows} result(s)", 4000)
+        stale = " Results may be stale." if getattr(self, "_search_results_stale", False) else ""
+        self.host.statusBar().showMessage(f"Search complete: {rows} result(s).{stale}", 4000)
 
     def _start_next_search_stat_worker(self, batch_limit: int = 220):
         cur = getattr(self, "_search_stat_worker", None)
@@ -5586,6 +5592,7 @@ class ExplorerPane(QWidget):
             cached = self._icon_cache.get(key) or GLOBAL_SHELL_ICON_CACHE.get(key)
             if cached is not None:
                 self._icon_cache[key] = cached
+                self._icon_failed.pop(key, None)
                 self._apply_icon_to_models(key, cached)
                 continue
             failed_at = self._icon_failed.get(key)
@@ -6494,6 +6501,7 @@ class ExplorerPane(QWidget):
 
 
             if getattr(self, "_using_fast", False):
+                self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
                 self._use_fast_model(self.current_path())
                 return
 
@@ -7951,7 +7959,7 @@ class MultiExplorer(QMainWindow):
         lay=QVBoxLayout(dlg)
         lbl=QLabel(dlg); lbl.setTextFormat(Qt.RichText)
         lbl.setText(
-            "<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v2.6.1</b></div>"
+            f"<div style='color:#000; font-size:12pt;'><b>Multi-Pane File Explorer v{APP_VERSION}</b></div>"
             "<div style='color:#111; margin-top:6px;'>A compact multi-pane file explorer for Windows (PyQt5).</div>"
             "<div style='color:#111; margin-top:6px;'>For feedback, contact <b>kkongt2.kang</b>.</div>"
         )
@@ -7963,11 +7971,11 @@ class MultiExplorer(QMainWindow):
 
     def closeEvent(self, e):
         manager = getattr(self, "file_ops", None)
-        if manager and manager.is_busy():
+        if manager and manager.has_pending():
             answer = QMessageBox.question(
                 self,
                 "File operation in progress",
-                "A copy, move, or delete operation is still running.\n\n"
+                "A copy, move, or delete operation is still running or queued.\n\n"
                 "Cancel the operation and exit?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -8268,7 +8276,7 @@ def main():
         pass
     app=QApplication(sys.argv)
     base_font=QFont("Segoe UI"); base_font.setPointSizeF(FONT_PT); app.setFont(base_font)
-    app.setOrganizationName(ORG_NAME); app.setApplicationName(APP_NAME)
+    app.setOrganizationName(ORG_NAME); app.setApplicationName(APP_NAME); app.setApplicationVersion(APP_VERSION)
     settings=QSettings(ORG_NAME, APP_NAME); theme=settings.value("ui/theme","dark")
     if theme not in VALID_THEMES: theme="dark"
     apply_theme_by_name(app, theme)
