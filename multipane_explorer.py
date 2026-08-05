@@ -66,9 +66,16 @@ CONTROL_HPAD= 6
 CRUMB_MAX_SEG_W = 180
 ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
+SEARCH_PROGRESS_INTERVAL = 250
+DEFAULT_SEARCH_EXCLUDE_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv",
+    "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+}
 FILEOP_ERROR_DETAIL_LIMIT = 50
 LARGE_FOLDER_THRESHOLD = 3000
+FILEOP_FAST_PROGRESS_SCAN_LIMIT = 4000
 GENERIC_ICON_THRESHOLD = 1200
+SHELL_ICON_FAILURE_TTL_S = 300
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 QUICK_BOOKMARK_MIN_W = 42
@@ -80,6 +87,9 @@ DATE_COL_WIDTH = 122
 SEARCH_FOLDER_COL_WIDTH = 240
 LIST_DATETIME_FMT = "yyyy-MM-dd HH:mm"
 HOVER_TOOLTIP_DURATION_MULTIPLIER = 9
+
+GLOBAL_SHELL_ICON_CACHE = {}
+GLOBAL_SHELL_ICON_FAILURES = {}
 
 # Keep this list in sync with the README keyboard-shortcuts section.
 KEYBOARD_SHORTCUTS = [
@@ -957,9 +967,12 @@ class FileOperationManager(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._workers = set()
+        self._queue = []
 
     def _prune_finished(self):
         for worker in list(self._workers):
+            if worker in self._queue:
+                continue
             try:
                 running = worker.isRunning()
             except Exception:
@@ -976,8 +989,29 @@ class FileOperationManager(QtCore.QObject):
         self._prune_finished()
         return any(worker.isRunning() for worker in list(self._workers))
 
+    def has_pending(self) -> bool:
+        self._prune_finished()
+        return self.is_busy() or bool(self._queue)
+
     def owns(self, worker) -> bool:
         return worker in self._workers
+
+    def cancel_worker(self, worker, wait_ms: int = 300) -> bool:
+        if worker not in self._workers:
+            return False
+        if worker in self._queue:
+            self._queue.remove(worker)
+            self._workers.discard(worker)
+            worker.deleteLater()
+            self.busyChanged.emit(self.has_pending())
+            return True
+        try:
+            if worker.isRunning() and hasattr(worker, "cancel"):
+                worker.cancel()
+                worker.wait(max(0, int(wait_ms)))
+            return True
+        except Exception:
+            return False
 
     def register(self, worker) -> bool:
         if worker is None or self.is_busy():
@@ -988,6 +1022,21 @@ class FileOperationManager(QtCore.QObject):
         self.busyChanged.emit(True)
         return True
 
+    def submit(self, worker) -> str:
+        if worker is None:
+            return "rejected"
+        busy = self.is_busy()
+        worker.setParent(self)
+        self._workers.add(worker)
+        worker.finished.connect(self._on_worker_finished)
+        if busy:
+            self._queue.append(worker)
+            self.busyChanged.emit(True)
+            return "queued"
+        worker.start()
+        self.busyChanged.emit(True)
+        return "started"
+
     @QtCore.pyqtSlot()
     def _on_worker_finished(self):
         worker = self.sender()
@@ -997,10 +1046,25 @@ class FileOperationManager(QtCore.QObject):
                 worker.deleteLater()
             except Exception:
                 pass
-        self.busyChanged.emit(self.is_busy())
+        self._start_next_queued()
+        self.busyChanged.emit(self.has_pending())
+
+    def _start_next_queued(self):
+        if any(worker.isRunning() for worker in list(self._workers)):
+            return
+        while self._queue:
+            worker = self._queue.pop(0)
+            if worker not in self._workers:
+                continue
+            try:
+                worker.start()
+                return
+            except Exception:
+                self._workers.discard(worker)
 
     def cancel_all(self, wait_ms: int = 8000) -> bool:
         workers = list(self._workers)
+        self._queue.clear()
         for worker in workers:
             try:
                 if worker.isRunning() and hasattr(worker, "cancel"):
@@ -1046,6 +1110,7 @@ class FileOpWorker(QtCore.QThread):
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
         self._src_progress_cache: dict[str, tuple[int, int]] = {}
+        self._progress_estimated = False
         self.errors = []
         self.error_count = 0
         self.undo_remove_paths = []
@@ -1077,11 +1142,17 @@ class FileOpWorker(QtCore.QThread):
                 if self._cancel:
                     break
                 total_items += 1
+                if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
+                    self._progress_estimated = True
+                    break
                 for filename in files:
                     if self._cancel:
                         break
                     fp = os.path.join(root, filename)
                     total_items += 1
+                    if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
+                        self._progress_estimated = True
+                        break
                     try:
                         total_bytes += max(0, int(os.path.getsize(fp)))
                     except Exception:
@@ -1109,6 +1180,9 @@ class FileOpWorker(QtCore.QThread):
             self._src_progress_cache[_path_key(src)] = stats
             self._total_bytes += stats[0]
             self._total_items += stats[1]
+            if self._progress_estimated:
+                self.status.emit("Large operation detected; starting with estimated progress ...")
+                break
         self._total_items = max(1, self._total_items)
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
@@ -1125,7 +1199,8 @@ class FileOpWorker(QtCore.QThread):
                 ratio = (byte_ratio * (1.0 - item_weight)) + (item_ratio * item_weight)
             else:
                 ratio = item_ratio
-            pct = min(99, max(0, int(ratio * 100)))
+            cap = 95 if self._progress_estimated else 99
+            pct = min(cap, max(0, int(ratio * 100)))
 
         now = time.perf_counter()
         should_emit = (
@@ -1148,6 +1223,9 @@ class FileOpWorker(QtCore.QThread):
     def _tick_progress(self, delta_bytes: int = 0, delta_items: int = 0):
         self._done_bytes += max(0, int(delta_bytes or 0))
         self._done_items += max(0, int(delta_items or 0))
+        if self._progress_estimated:
+            self._total_bytes = max(self._total_bytes, self._done_bytes + max(1, delta_bytes or 0))
+            self._total_items = max(self._total_items, self._done_items + max(1, delta_items or 0))
         self._emit_progress()
 
     def _source_progress(self, src: str) -> tuple[int, int]:
@@ -1155,7 +1233,11 @@ class FileOpWorker(QtCore.QThread):
             stats = self._src_progress_cache.get(_path_key(src))
         except Exception:
             stats = None
-        return stats if stats is not None else self._scan_source_progress(src)
+        if stats is not None:
+            return stats
+        if self._progress_estimated:
+            return 0, 1
+        return self._scan_source_progress(src)
 
     def _skip_source_progress(self, src):
         total_bytes, total_items = self._source_progress(src)
@@ -3083,6 +3165,7 @@ class NormalStatWorker(QtCore.QThread):
 
 class SearchWorker(QtCore.QThread):
     batchReady = pyqtSignal(str, list)
+    progress = pyqtSignal(int, int, str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
     truncated = pyqtSignal(int)
@@ -3093,6 +3176,9 @@ class SearchWorker(QtCore.QThread):
         self._cancel = False
         self._max_results = max(1, int(max_results))
         self._matches = 0
+        self._visited_dirs = 0
+        self._visited_entries = 0
+        self._last_progress_emit = 0
         self._truncated = False
 
         raw = (pattern_str or "").replace(",", " ").replace(";", " ").split()
@@ -3114,6 +3200,13 @@ class SearchWorker(QtCore.QThread):
 
     def cancel(self): self._cancel = True
 
+    def _emit_progress(self, folder: str = ""):
+        now = time.monotonic()
+        if self._last_progress_emit and (now - self._last_progress_emit) < 0.2:
+            return
+        self._last_progress_emit = now
+        self.progress.emit(self._visited_dirs, self._visited_entries, folder)
+
     def _match(self, name_lower: str) -> bool:
         for t in self._tests:
             if t(name_lower):
@@ -3128,11 +3221,14 @@ class SearchWorker(QtCore.QThread):
             batch = []
             while stack and not self._cancel:
                 d = stack.pop()
+                self._visited_dirs += 1
+                self._emit_progress(d)
                 try:
                     with os.scandir(d) as it:
                         for entry in it:
                             if self._cancel:
                                 break
+                            self._visited_entries += 1
                             try:
                                 is_dir = entry.is_dir(follow_symlinks=False)
                             except Exception:
@@ -3160,6 +3256,8 @@ class SearchWorker(QtCore.QThread):
 
 
                             if is_dir:
+                                if entry.name in DEFAULT_SEARCH_EXCLUDE_DIRS:
+                                    continue
                                 try:
                                     if entry.is_symlink():
                                         continue
@@ -3172,6 +3270,7 @@ class SearchWorker(QtCore.QThread):
 
             if batch:
                 self.batchReady.emit(base, batch)
+            self.progress.emit(self._visited_dirs, self._visited_entries, "")
             if self._truncated:
                 self.truncated.emit(self._matches)
         except Exception as e:
@@ -4497,6 +4596,7 @@ class ExplorerPane(QWidget):
         self._search_pending_items={}; self._search_stats_done=set(); self._search_stat_worker=None
         self._search_stat_queue=[]; self._search_stat_pending=set()
         self._search_running = False
+        self._search_results_stale = False
         self._back_stack=[]; self._fwd_stack=[]; self._undo_stack=[]
         self._last_hover_index=QtCore.QModelIndex(); self._tooltip_last_ms=0.0; self._tooltip_interval_ms=180; self._tooltip_last_text=""
         self._tooltip_display_ms = 36000
@@ -4515,7 +4615,7 @@ class ExplorerPane(QWidget):
         self._large_folder_mode = False
         self._file_worker=None
         self._icon_cache = {}
-        self._icon_failed = set()
+        self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
         self._icon_pending = set()
         self._icon_queue = []
         self._icon_worker = None
@@ -5277,6 +5377,21 @@ class ExplorerPane(QWidget):
         self._search_model.append_rows(rows)
         self._request_visible_stats(0)
 
+    @QtCore.pyqtSlot(int, int, str)
+    def _on_search_progress(self, dirs: int, entries: int, folder: str):
+        if not getattr(self, "_search_running", False):
+            return
+        tail = ""
+        if folder:
+            try:
+                tail = f" — {nice_path(folder)}"
+            except Exception:
+                tail = f" — {folder}"
+        self.host.statusBar().showMessage(
+            f"Searching... {int(dirs)} folders, {int(entries)} items{tail}",
+            1200,
+        )
+
     @QtCore.pyqtSlot()
     def _on_search_finished(self):
         worker = self.sender()
@@ -5288,6 +5403,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
         self._search_worker = None
+        self._search_running = False
         self._set_search_button_state(False)
         try:
             if self._search_mode and self._search_proxy and self.view.model() is self._search_proxy:
@@ -5301,6 +5417,11 @@ class ExplorerPane(QWidget):
             pass
 
         self._request_visible_stats(0)
+        try:
+            rows = self._search_model.rowCount() if self._search_model is not None else 0
+        except Exception:
+            rows = 0
+        self.host.statusBar().showMessage(f"Search complete: {rows} result(s)", 4000)
 
     def _start_next_search_stat_worker(self, batch_limit: int = 220):
         cur = getattr(self, "_search_stat_worker", None)
@@ -5449,22 +5570,30 @@ class ExplorerPane(QWidget):
             if icon.isNull():
                 return
             self._icon_cache[key] = icon
-            self._icon_failed.discard(key)
+            GLOBAL_SHELL_ICON_CACHE[key] = icon
+            self._icon_failed.pop(key, None)
             self._apply_icon_to_models(key, icon)
         except Exception:
             pass
 
     def _queue_async_icons(self, jobs):
         added = False
+        now = time.monotonic()
         for key, path, is_dir in jobs:
             key = str(key or "")
             if not key:
                 continue
-            cached = self._icon_cache.get(key)
+            cached = self._icon_cache.get(key) or GLOBAL_SHELL_ICON_CACHE.get(key)
             if cached is not None:
+                self._icon_cache[key] = cached
                 self._apply_icon_to_models(key, cached)
                 continue
-            if key in self._icon_failed or key in self._icon_pending:
+            failed_at = self._icon_failed.get(key)
+            if failed_at is not None and (now - float(failed_at)) < SHELL_ICON_FAILURE_TTL_S:
+                continue
+            if failed_at is not None:
+                self._icon_failed.pop(key, None)
+            if key in self._icon_pending:
                 continue
             self._icon_pending.add(key)
             self._icon_queue.append((key, str(path or ""), bool(is_dir)))
@@ -5492,7 +5621,7 @@ class ExplorerPane(QWidget):
         for key, _path, _is_dir in list(jobs or []):
             self._icon_pending.discard(key)
             if key not in self._icon_cache:
-                self._icon_failed.add(key)
+                self._icon_failed[key] = time.monotonic()
         self._icon_worker = None
         self._start_next_icon_worker()
 
@@ -5514,12 +5643,7 @@ class ExplorerPane(QWidget):
         worker = getattr(self, "_file_worker", None)
         manager = getattr(getattr(self, "host", None), "file_ops", None)
         if worker and manager and manager.owns(worker):
-            try:
-                if worker.isRunning():
-                    worker.cancel()
-                    worker.wait(max(0, int(wait_ms)))
-            except Exception:
-                pass
+            manager.cancel_worker(worker, wait_ms)
         else:
             self._stop_worker_thread(worker, wait_ms, "file-op")
         self._file_worker = None
@@ -6150,12 +6274,12 @@ class ExplorerPane(QWidget):
         sort_col, sort_order = self._get_sort_state(search_mode=False)
         preload_size = (sort_col == 1)
         preload_mtime = (sort_col == 3)
-        live_sort_during_enum = preload_size or preload_mtime
+        live_sort_during_enum = False
         was_sorting = self.view.isSortingEnabled()
-        if was_sorting and not live_sort_during_enum:
+        old_dynamic_sort = self._fast_proxy.dynamicSortFilter()
+        self._fast_proxy.setDynamicSortFilter(False)
+        if was_sorting:
             self.view.setSortingEnabled(False)
-        if live_sort_during_enum:
-            self._apply_saved_sort(search_mode=False)
 
         self._fast_batch_counter = 0
         worker = DirEnumWorker(path, self, preload_size=preload_size, preload_mtime=preload_mtime)
@@ -6169,8 +6293,6 @@ class ExplorerPane(QWidget):
             if self._fast_enum_count >= LARGE_FOLDER_THRESHOLD:
                 self._set_large_folder_mode(True, count=self._fast_enum_count, complete=False)
             self._fast_batch_counter += 1
-            if live_sort_during_enum and (self._fast_batch_counter % 3) == 0:
-                self._fast_proxy.sort(sort_col, sort_order)
             if (self._fast_batch_counter % 4) == 0:
                 self._request_visible_stats(0)
 
@@ -6187,6 +6309,7 @@ class ExplorerPane(QWidget):
                 count=self._fast_enum_count,
                 complete=True,
             )
+            self._fast_proxy.setDynamicSortFilter(old_dynamic_sort)
             self.view.setSortingEnabled(True)
             self._apply_saved_sort(search_mode=False)
             if not was_sorting:
@@ -6359,8 +6482,11 @@ class ExplorerPane(QWidget):
             if getattr(self, "_search_mode", False):
                 pattern = self.filter_edit.text().strip()
                 if pattern:
-
-                    self._apply_filter()
+                    self._search_results_stale = True
+                    self.host.statusBar().showMessage(
+                        "Folder changed; search results may be stale. Press Search to refresh.",
+                        6000,
+                    )
                 else:
 
                     self._enter_browse_mode()
@@ -6632,9 +6758,6 @@ class ExplorerPane(QWidget):
 
     def _start_bg_op(self, op, srcs, dst_dir, clipboard_payload=None):
         manager = getattr(self.host, "file_ops", None)
-        if manager and manager.is_busy():
-            self.host.flash_status("Another file operation is already running")
-            return False
 
         valid_srcs = []
         skipped_same = []
@@ -6697,20 +6820,27 @@ class ExplorerPane(QWidget):
         worker = FileOpWorker(op, valid_srcs, dst_dir, conflict_map=conflict_map, parent=None)
         worker.clipboard_payload = _normalize_file_clipboard_payload(clipboard_payload)
         worker._ui_op = op
-        if manager and not manager.register(worker):
-            self.host.flash_status("Another file operation is already running")
-            return False
 
         self._show_pane_progress(op.title(), busy=False)
         worker.progress.connect(self._set_pane_progress_value)
         worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(self.host.show_operation_status)
+        worker.started.connect(lambda label=op.title(): self._show_pane_progress(label, busy=False))
         worker.error.connect(self._on_file_worker_error)
         worker.finished_ok.connect(self._on_file_worker_finished_ok)
         worker.finished.connect(self._on_file_worker_thread_finished)
         self._file_worker = worker
         self._op_progress_dialog = None
-        worker.start()
+        if manager:
+            state = manager.submit(worker)
+            if state == "queued":
+                self._show_pane_progress(f"{op.title()} queued", busy=True)
+                self.host.flash_status(f"{op.title()} queued")
+            elif state != "started":
+                self.host.flash_status(f"Could not start {op}")
+                return False
+        else:
+            worker.start()
         return True
 
     @QtCore.pyqtSlot(str)
@@ -6768,9 +6898,6 @@ class ExplorerPane(QWidget):
 
     def _start_delete_op(self, paths, permanent: bool = False):
         manager = getattr(self.host, "file_ops", None)
-        if manager and manager.is_busy():
-            self.host.flash_status("Another file operation is already running")
-            return False
 
         valid_paths = [p for p in paths if p]
         if not valid_paths:
@@ -6779,20 +6906,27 @@ class ExplorerPane(QWidget):
         hwnd = int(self.window().winId()) if (not permanent and sys.platform == "win32") else 0
         worker = DeleteWorker(valid_paths, permanent=permanent, hwnd=hwnd, parent=None)
         worker._ui_permanent = permanent
-        if manager and not manager.register(worker):
-            self.host.flash_status("Another file operation is already running")
-            return False
 
         self._show_pane_progress("Delete" if permanent else "Recycle", busy=False)
         worker.progress.connect(self._set_pane_progress_value)
         worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(self.host.show_operation_status)
+        worker.started.connect(lambda label=("Delete" if permanent else "Recycle"): self._show_pane_progress(label, busy=False))
         worker.error.connect(self._on_delete_worker_error)
         worker.finished_ok.connect(self._on_delete_worker_finished_ok)
         worker.finished.connect(self._on_delete_worker_thread_finished)
         self._file_worker = worker
         self._op_progress_dialog = None
-        worker.start()
+        if manager:
+            state = manager.submit(worker)
+            if state == "queued":
+                self._show_pane_progress("Delete queued" if permanent else "Recycle queued", busy=True)
+                self.host.flash_status("Delete queued")
+            elif state != "started":
+                self.host.flash_status("Could not start delete")
+                return False
+        else:
+            worker.start()
         return True
 
 
@@ -7012,11 +7146,13 @@ class ExplorerPane(QWidget):
         self._search_stat_worker = None
         self._search_stat_queue = []
         self._search_stat_pending = set()
+        self._search_results_stale = False
 
 
         w = SearchWorker(base, pattern, self, max_results=SEARCH_RESULT_LIMIT)
         self._search_worker = w
         w.batchReady.connect(self._on_search_batch, Qt.QueuedConnection)
+        w.progress.connect(self._on_search_progress, Qt.QueuedConnection)
         w.error.connect(lambda msg: self.host.statusBar().showMessage(f"Search error: {msg}", 4000))
         w.truncated.connect(lambda n: self.host.statusBar().showMessage(
             f"Search capped at {n} results. Refine filter to narrow results.", 6000
@@ -7024,6 +7160,7 @@ class ExplorerPane(QWidget):
         w.finished.connect(self._on_search_finished, Qt.QueuedConnection)
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._search_running = True
         self._set_search_button_state(True)
         self.host.flash_status("Searching...")
         w.start()
@@ -8140,4 +8277,3 @@ def main():
     sys.exit(app.exec_())
 if __name__=="__main__":
     main()
-
