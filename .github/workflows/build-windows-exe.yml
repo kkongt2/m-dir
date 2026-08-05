@@ -1,0 +1,37 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-windows-exe:
+    name: Build MultiPaneExplorer.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Build one-file executable
+        run: python -m PyInstaller --onefile --windowed --name MultiPaneExplorer multipane_explorer.py
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiPaneExplorer-windows-exe
+          path: dist/MultiPaneExplorer.exe
+          if-no-files-found: error
