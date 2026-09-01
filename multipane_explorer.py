@@ -2406,14 +2406,14 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
         return False
 
     try:
-        pici_int=(0,int(owner_hwnd),int(idx),None,None,win32con.SW_SHOWNORMAL,0,0)
+        pici_int=(0,int(owner_hwnd),int(idx),None,work_dir,win32con.SW_SHOWNORMAL,0,0)
         cm.InvokeCommand(pici_int); _post_null(owner_hwnd); return True
     except Exception as e:
         if DEBUG: print("[ctx] InvokeCommand(int) failed:", e)
 
     if verb:
         try:
-            pici_str=(0,int(owner_hwnd),str(verb),None,None,win32con.SW_SHOWNORMAL,0,0)
+            pici_str=(0,int(owner_hwnd),str(verb),None,work_dir,win32con.SW_SHOWNORMAL,0,0)
             cm.InvokeCommand(pici_str); _post_null(owner_hwnd); return True
         except Exception as e:
             if DEBUG: print(f"[ctx] InvokeCommand verb='{verb}' failed:", e)
@@ -2485,11 +2485,15 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
         if not cm: return False
         app=QApplication.instance(); evf=_ensure_event_filter(app); evf.set_context(cm)
         hMenu=win32gui.CreatePopupMenu()
-        flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE|shellcon.CMF_INCLUDESTATIC
+        # A background IContextMenu already supplies the commands registered for the
+        # folder background.  CMF_INCLUDESTATIC additionally pulls in static verbs
+        # for the folder item itself; some shell extensions (notably Bandizip) then
+        # expose a duplicate command whose target is the folder's parent.
+        flags=shellcon.CMF_NORMAL|shellcon.CMF_EXPLORE
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
         id_first=1
         id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
-        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=[folder_path],id_first=id_first,id_last=id_last)
+        ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=None,id_first=id_first,id_last=id_last)
         evf.clear(); return ok
     finally:
         pythoncom.CoUninitialize()
