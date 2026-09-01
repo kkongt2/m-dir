@@ -2748,6 +2748,12 @@ class FsSortProxy(QSortFilterProxyModel):
 
 
 def _icon_cache_key(path: str, is_dir: bool) -> str:
+    # Shell icon overlays (for example TortoiseGit's green/red status badges)
+    # are selected per path.  Sharing one icon between every folder or every
+    # file extension consequently makes those badges disappear or leak onto
+    # unrelated items.
+    if sys.platform == "win32" and path:
+        return "shell-path:" + _path_key(path)
     if is_dir:
         return "folder"
     try:
@@ -2828,15 +2834,17 @@ def _load_windows_shell_icon_bgra(path: str, is_dir: bool, size: int = 24):
         SHGFI_ICON = 0x000000100
         SHGFI_SMALLICON = 0x000000001
         SHGFI_USEFILEATTRIBUTES = 0x000000010
+        SHGFI_ADDOVERLAYS = 0x000000020
         FILE_ATTRIBUTE_DIRECTORY = 0x00000010
         FILE_ATTRIBUTE_NORMAL = 0x00000080
 
         p = str(path or "")
-        ext = os.path.splitext(p)[1].lower()
-        path_specific = (not is_dir) and ext in {".exe", ".ico", ".lnk", ".url"}
         attrs = FILE_ATTRIBUTE_DIRECTORY if is_dir else FILE_ATTRIBUTE_NORMAL
-        flags = SHGFI_ICON | SHGFI_SMALLICON
-        if not path_specific:
+        # ADDOVERLAYS asks the Windows Shell to compose registered icon-overlay
+        # handlers into the returned HICON, matching Explorer.  It only works
+        # for a real path, not when USEFILEATTRIBUTES requests a generic icon.
+        flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_ADDOVERLAYS
+        if not os.path.lexists(p):
             flags |= SHGFI_USEFILEATTRIBUTES
 
         info = SHFILEINFOW()
@@ -2898,7 +2906,14 @@ class ShellIconWorker(QtCore.QThread):
         self._cancel = True
 
     def run(self):
+        com_initialized = False
         try:
+            if sys.platform == "win32" and HAS_PYWIN32:
+                try:
+                    pythoncom.CoInitialize()
+                    com_initialized = True
+                except Exception:
+                    pass
             for key, path, is_dir in self._jobs:
                 if self._cancel:
                     break
@@ -2906,6 +2921,11 @@ class ShellIconWorker(QtCore.QThread):
                 if raw:
                     self.iconReady.emit(str(key), raw, int(w), int(h))
         finally:
+            if com_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
             self.finishedCycle.emit(self._jobs)
 
 
@@ -3306,6 +3326,20 @@ class StatOverlayProxy(QIdentityProxyModel):
         self._worker = None
         self._batch_limit = 256
         self._refresh_after_pending = set()
+        self._icons = {}
+
+    def apply_icon_key(self, key: str, icon):
+        if not key or not isinstance(icon, QIcon) or icon.isNull():
+            return
+        self._icons[str(key)] = icon
+        if str(key).startswith("shell-path:"):
+            try:
+                src_index = self.sourceModel().index(str(key)[len("shell-path:"):])
+                proxy_index = self.mapFromSource(src_index)
+                if proxy_index.isValid():
+                    self.dataChanged.emit(proxy_index, proxy_index, [Qt.DecorationRole])
+            except Exception:
+                pass
 
     def filePath(self, index):
         src = self.sourceModel()
@@ -3325,6 +3359,7 @@ class StatOverlayProxy(QIdentityProxyModel):
 
     def clear_cache(self):
         self._cache.clear()
+        self._icons.clear()
         self._pending.clear()
         self._queue.clear()
         self._refresh_after_pending.clear()
@@ -3347,6 +3382,18 @@ class StatOverlayProxy(QIdentityProxyModel):
             return None
 
         col = index.column()
+        if col == 0 and role == Qt.DecorationRole:
+            src = self.sourceModel()
+            sidx = self.mapToSource(index)
+            try:
+                path = src.filePath(sidx)
+                key = _icon_cache_key(path, src.isDir(sidx))
+                icon = self._icons.get(key)
+                if icon is not None:
+                    return icon
+            except Exception:
+                pass
+            return super().data(index, role)
         if col not in (1, 2, 3):
             return super().data(index, role)
 
@@ -5570,6 +5617,10 @@ class ExplorerPane(QWidget):
 
     def _apply_icon_to_models(self, key: str, icon: QIcon):
         try:
+            self.stat_proxy.apply_icon_key(key, icon)
+        except Exception:
+            pass
+        try:
             self._fast_model.apply_icon_key(key, icon)
         except Exception:
             pass
@@ -5770,6 +5821,16 @@ class ExplorerPane(QWidget):
         paths = self._visible_browse_stat_paths()
         if paths:
             self.stat_proxy.request_paths(paths, force=force)
+            if sys.platform == "win32" and not ALWAYS_GENERIC_ICONS:
+                if force:
+                    for path in paths:
+                        key = _icon_cache_key(path, os.path.isdir(path))
+                        self._icon_cache.pop(key, None)
+                        GLOBAL_SHELL_ICON_CACHE.pop(key, None)
+                self._queue_async_icons([
+                    (_icon_cache_key(path, os.path.isdir(path)), path, os.path.isdir(path))
+                    for path in paths
+                ])
 
     def _ensure_selection_update_timer(self):
         if self._selection_update_timer is not None:

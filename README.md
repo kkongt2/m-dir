@@ -25,6 +25,7 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise
+- Native Windows Shell icon overlays, including Git status badges registered by tools such as TortoiseGit
 - Open Command Prompt in the current folder
 
 ## Install
