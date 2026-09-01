@@ -2156,6 +2156,39 @@ def _menu_item_text(hmenu, cmd_id: int) -> str:
     except Exception:
         return ""
 
+def _menu_text_key(text: str) -> str:
+    # Ignore mnemonic markers, shortcut hints, and cosmetic trailing ellipses when
+    # comparing commands contributed by shell extensions.
+    label = (text or "").split("\t", 1)[0].replace("&", "").strip().lower()
+    return label.rstrip(".\u2026").strip()
+
+def _remove_duplicate_menu_commands(hmenu) -> int:
+    """Remove duplicate leaf commands within each native menu/submenu."""
+    removed = 0
+    seen = set()
+    pos = 0
+    while pos < win32gui.GetMenuItemCount(hmenu):
+        submenu = win32gui.GetSubMenu(hmenu, pos)
+        if submenu:
+            removed += _remove_duplicate_menu_commands(submenu)
+            pos += 1
+            continue
+
+        state = win32gui.GetMenuState(hmenu, pos, win32con.MF_BYPOSITION)
+        if state == -1 or state & win32con.MF_SEPARATOR:
+            pos += 1
+            continue
+        text = win32gui.GetMenuString(hmenu, pos, win32con.MF_BYPOSITION)
+        key = _menu_text_key(text)
+        if key and key in seen:
+            win32gui.DeleteMenu(hmenu, pos, win32con.MF_BYPOSITION)
+            removed += 1
+            continue
+        if key:
+            seen.add(key)
+        pos += 1
+    return removed
+
 def _context_target_dir(work_dir: str, paths=None) -> str:
     target = work_dir
     if paths:
@@ -2493,6 +2526,9 @@ def show_explorer_background_menu(owner_hwnd, folder_path, screen_pt):
         if win32api.GetKeyState(win32con.VK_SHIFT)<0: flags|=shellcon.CMF_EXTENDEDVERBS
         id_first=1
         id_last = _query_ctx_menu_id_last(cm, hMenu, id_first, flags)
+        removed = _remove_duplicate_menu_commands(hMenu)
+        if DEBUG and removed:
+            print(f"[ctx] removed {removed} duplicate background menu command(s)")
         ok = _invoke_menu(owner_hwnd,cm,hMenu,screen_pt,folder_path,paths=None,id_first=id_first,id_last=id_last)
         evf.clear(); return ok
     finally:
