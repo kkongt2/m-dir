@@ -29,6 +29,31 @@ class FileOperationSafetyTests(unittest.TestCase):
         Path(src, "second.txt").write_text("second", encoding="utf-8")
         return src
 
+    def test_normal_copy_does_not_force_per_file_fsync(self):
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "source.txt")
+            dst = os.path.join(root, "destination.txt")
+            Path(src).write_bytes(b"payload")
+            worker = explorer.FileOpWorker("copy", [src], root, durable_copies=False)
+
+            with mock.patch.object(explorer.os, "fsync") as fsync:
+                self.assertTrue(worker._copy_file(src, dst))
+
+            fsync.assert_not_called()
+            self.assertEqual(Path(dst).read_bytes(), b"payload")
+
+    def test_durable_copy_keeps_explicit_fsync_option(self):
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "source.txt")
+            dst = os.path.join(root, "destination.txt")
+            Path(src).write_bytes(b"payload")
+            worker = explorer.FileOpWorker("copy", [src], root, durable_copies=True)
+
+            with mock.patch.object(explorer.os, "fsync") as fsync:
+                self.assertTrue(worker._copy_file(src, dst))
+
+            fsync.assert_called_once()
+
     def test_cross_filesystem_cleanup_failure_keeps_complete_destination(self):
         with tempfile.TemporaryDirectory() as root:
             src = self._make_source_tree(root)

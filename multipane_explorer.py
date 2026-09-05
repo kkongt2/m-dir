@@ -83,6 +83,8 @@ DEFAULT_SEARCH_EXCLUDE_DIRS = {
 FILEOP_ERROR_DETAIL_LIMIT = 50
 LARGE_FOLDER_THRESHOLD = 3000
 FILEOP_FAST_PROGRESS_SCAN_LIMIT = 4000
+FILE_COPY_BUFFER_SIZE = 4 * 1024 * 1024
+DURABLE_FILE_COPIES = _env_flag("MULTIPANE_DURABLE_COPIES")
 GENERIC_ICON_THRESHOLD = 1200
 SHELL_ICON_FAILURE_TTL_S = 300
 PATH_HISTORY_LIMIT = 30
@@ -1177,7 +1179,15 @@ class FileOpWorker(QtCore.QThread):
     finished_ok = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, op: str, srcs: list, dst_dir: str, conflict_map: dict | None = None, parent=None):
+    def __init__(
+        self,
+        op: str,
+        srcs: list,
+        dst_dir: str,
+        conflict_map: dict | None = None,
+        parent=None,
+        durable_copies: bool | None = None,
+    ):
         super().__init__(parent)
         self.op = op
         self.srcs = list(srcs)
@@ -1199,6 +1209,8 @@ class FileOpWorker(QtCore.QThread):
         self.successful_source_keys = set()
         self.clipboard_payload = None
         self._ui_op = op
+        self.durable_copies = DURABLE_FILE_COPIES if durable_copies is None else bool(durable_copies)
+        self._copy_buffer = None
 
     def cancel(self):
         self._cancel = True
@@ -1396,17 +1408,22 @@ class FileOpWorker(QtCore.QThread):
             os.makedirs(os.path.dirname(dst) or os.curdir, exist_ok=True)
             temp_path = self._new_sibling_work_path(dst, "partial")
             with open(src, "rb") as fsrc, open(temp_path, "xb") as fdst:
+                if self._copy_buffer is None:
+                    self._copy_buffer = bytearray(FILE_COPY_BUFFER_SIZE)
+                buf = self._copy_buffer
+                view = memoryview(buf)
                 while True:
                     if self._cancel:
                         return False
-                    buf = fsrc.read(1024 * 1024)
-                    if not buf:
+                    count = fsrc.readinto(buf)
+                    if not count:
                         break
-                    fdst.write(buf)
-                    copied += len(buf)
-                    self._tick_progress(delta_bytes=len(buf))
-                fdst.flush()
-                os.fsync(fdst.fileno())
+                    fdst.write(view[:count])
+                    copied += count
+                    self._tick_progress(delta_bytes=count)
+                if self.durable_copies:
+                    fdst.flush()
+                    os.fsync(fdst.fileno())
             try:
                 shutil.copystat(src, temp_path, follow_symlinks=True)
             except Exception:

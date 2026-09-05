@@ -54,6 +54,12 @@ Enable debug logs with environment variable:
 $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
 ```
 
+Normal copies rely on the operating system's buffered writeback for throughput.
+To force every copied file to stable storage before it is promoted into place:
+```powershell
+$env:MULTIPANE_DURABLE_COPIES=1; python multipane_explorer.py
+```
+
 ## Test
 ```powershell
 python -m unittest discover -s tests -v
