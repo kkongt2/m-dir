@@ -203,7 +203,7 @@ class FileOperationSafetyTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows junction fallback")
     def test_junction_detection_falls_back_to_reparse_tag(self):
         fake_stat = types.SimpleNamespace(st_reparse_tag=0xA0000003)
-        with mock.patch.object(explorer.os.path, "isjunction", return_value=False), mock.patch.object(
+        with mock.patch.object(explorer.os.path, "isjunction", return_value=False, create=True), mock.patch.object(
             explorer.os, "lstat", return_value=fake_stat
         ):
             self.assertTrue(explorer._is_junction(r"C:\\junction"))
@@ -248,7 +248,7 @@ class FileOperationSafetyTests(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertTrue(os.path.islink(dst))
-            self.assertEqual(os.readlink(dst), target)
+            self.assertTrue(os.path.samefile(os.readlink(dst), target))
 
 
 class PaneRestoreTests(unittest.TestCase):
