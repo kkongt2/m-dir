@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 
 
 BASE_FONT_PT = 9.5
@@ -6163,7 +6163,18 @@ class ExplorerPane(QWidget):
         paths=self._selected_paths()
         if len(paths)!=1: return
         src=paths[0]; base=os.path.basename(src)
-        new_name,ok=QInputDialog.getText(self,"Rename","New name:", text=base)
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Rename")
+        dialog.setLabelText("New name:")
+        dialog.setTextValue(base)
+        stem = base if os.path.isdir(src) else os.path.splitext(base)[0]
+        # Qt cursor positions count UTF-16 code units, including non-BMP names.
+        cursor_position = len(stem.encode("utf-16-le")) // 2
+        editor = dialog.findChild(QLineEdit)
+        # Apply after the dialog opens, since QInputDialog initially selects all.
+        QTimer.singleShot(0, lambda: editor.setCursorPosition(cursor_position))
+        ok = dialog.exec_() == QDialog.Accepted
+        new_name = dialog.textValue()
         if not ok or not new_name or new_name==base: return
         dst=os.path.join(os.path.dirname(src), new_name)
         if os.path.exists(dst):
