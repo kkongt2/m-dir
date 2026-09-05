@@ -62,6 +62,41 @@ class MoveSourceProtectionTests(unittest.TestCase):
             self.assertEqual((source / "new.txt").read_text(), "keep")
 
 
+class BulkRenameRecoveryTests(unittest.TestCase):
+    def test_failure_restores_chains_and_cycles(self):
+        for cycle in (False, True):
+            with self.subTest(cycle=cycle), tempfile.TemporaryDirectory() as root:
+                paths = [Path(root, f"{i}.txt") for i in range(1, 5)]
+                for p in paths[:3]:
+                    p.write_text(p.stem)
+                targets = [paths[1], paths[0] if cycle else paths[2], paths[3]]
+                operations = [(str(src), str(dst)) for src, dst in zip(paths, targets)]
+                rename = explorer._rename_no_replace
+                calls = 0
+
+                def fail_last_commit(src, dst):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 6:
+                        raise OSError("commit failed")
+                    rename(src, dst)
+
+                with mock.patch.object(explorer, "_rename_no_replace", side_effect=fail_last_commit):
+                    with self.assertRaisesRegex(OSError, "commit failed"):
+                        explorer.execute_bulk_rename_transaction(operations)
+                self.assertEqual({p.name: p.read_text() for p in Path(root).iterdir()},
+                                 {f"{i}.txt": str(i) for i in range(1, 4)})
+
+    def test_successful_cycle_swaps_contents_without_temporary_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            a, b = Path(root, "a.txt"), Path(root, "b.txt")
+            a.write_text("a")
+            b.write_text("b")
+            explorer.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(a))])
+            self.assertEqual((a.read_text(), b.read_text()), ("b", "a"))
+            self.assertEqual(len(list(Path(root).iterdir())), 2)
+
+
 class DestinationProtectionTests(unittest.TestCase):
     def test_failed_copy_does_not_remove_unowned_destination(self):
         with tempfile.TemporaryDirectory() as root:

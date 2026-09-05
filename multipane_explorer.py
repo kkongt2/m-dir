@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.5"
+APP_VERSION = "2.7.6"
 
 
 BASE_FONT_PT = 9.5
@@ -234,7 +234,12 @@ def _clipboard_payload_matches(left, right) -> bool:
 
 
 def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
-    """Rename all items atomically as a group, rolling back every completed step on failure."""
+    """Stage a rename group and restore original names on recoverable failures."""
+    operations = list(operations)
+    for column in (0, 1):
+        keys = [_path_key(pair[column]) for pair in operations]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Duplicate source or destination in rename plan")
     temp_pairs = []
     committed = []
     try:
@@ -243,31 +248,32 @@ def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
             temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
             while os.path.lexists(temp):
                 temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
-            os.rename(src, temp)
+            _rename_no_replace(src, temp)
             temp_pairs.append((src, temp, dst))
 
         for src, temp, dst in temp_pairs:
-            os.rename(temp, dst)
+            _rename_no_replace(temp, dst)
             committed.append((dst, src))
         return committed
     except Exception as original_error:
         rollback_errors = []
 
-        # Final names must be restored first because original names are still free.
+        # Clear every committed name before restoring originals: final names can
+        # occupy another item's original name in chains and cycles.
+        temporary_names = {_path_key(src): temp for src, temp, _dst in temp_pairs}
         for dst, src in reversed(committed):
             if not os.path.lexists(dst):
                 continue
             try:
-                os.rename(dst, src)
+                _rename_no_replace(dst, temporary_names[_path_key(src)])
             except Exception as exc:
                 rollback_errors.append(f"{dst} -> {src}: {exc}")
 
-        committed_sources = {_path_key(src) for _dst, src in committed}
         for src, temp, _dst in reversed(temp_pairs):
-            if _path_key(src) in committed_sources or not os.path.lexists(temp):
+            if not os.path.lexists(temp):
                 continue
             try:
-                os.rename(temp, src)
+                _rename_no_replace(temp, src)
             except Exception as exc:
                 rollback_errors.append(f"{temp} -> {src}: {exc}")
 
