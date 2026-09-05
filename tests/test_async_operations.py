@@ -1,0 +1,114 @@
+import os
+import subprocess
+import sys
+import textwrap
+import unittest
+from pathlib import Path
+
+
+class AsyncOperationTests(unittest.TestCase):
+    def run_gui_check(self, code):
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code)],
+            cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_slow_suggestions_keep_ui_responsive_and_discard_old_results(self):
+        self.run_gui_check('''
+            import threading, time
+            from unittest import mock
+            from PyQt5 import QtCore, QtWidgets
+            import multipane_explorer as e
+            app = QtWidgets.QApplication([])
+            e.PathBar._shared_recent_paths = []
+            entered, release = threading.Event(), threading.Event()
+            ticks = []
+            def collect(worker, typed, limit):
+                if typed == 'old':
+                    entered.set()
+                    release.wait(3)
+                return [typed + '-result']
+            def pump_until(check):
+                deadline = time.monotonic() + 4
+                while not check() and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(.001)
+                assert check(), 'timed out'
+            with mock.patch.object(e.PathSuggestionWorker, '_collect_filesystem_suggestions', collect):
+                bar = e.PathBar()
+                try:
+                    bar._edit.setText('old')
+                    bar._refresh_edit_completer()
+                    pump_until(entered.is_set)
+                    QtCore.QTimer.singleShot(0, lambda: ticks.append(True))
+                    bar._edit.setText('new')
+                    bar._refresh_edit_completer()
+                    pump_until(lambda: bool(ticks))
+                    assert not release.is_set(), 'UI did not run independently'
+                    release.set()
+                    pump_until(lambda: 'new-result' in bar._edit_model.stringList())
+                    assert 'old-result' not in bar._edit_model.stringList()
+                finally:
+                    release.set()
+                    bar.shutdown_suggestions()
+                    assert e._cancel_and_wait_child_threads(bar, 4000)
+                    app.processEvents()
+        ''')
+
+    def test_undo_runs_in_background_and_preserves_cancelled_remainder(self):
+        self.run_gui_check('''
+            import tempfile, threading, time, types
+            from pathlib import Path
+            from unittest import mock
+            from PyQt5 import QtCore, QtWidgets
+            import multipane_explorer as e
+            app = QtWidgets.QApplication([])
+            entered, release = threading.Event(), threading.Event()
+            class Pane(QtCore.QObject):
+                undo_last = e.ExplorerPane.undo_last
+                _on_undo_worker_finished = e.ExplorerPane._on_undo_worker_finished
+                def window(self): return types.SimpleNamespace(winId=lambda: 0)
+                def _show_pane_progress(self, *args, **kwargs): pass
+                def _set_pane_progress_value(self, *args): pass
+                def _set_pane_progress_status(self, *args): pass
+                def _hide_pane_progress(self): pass
+                def refresh(self): pass
+            def recycle(path, hwnd):
+                entered.set()
+                release.wait(3)
+                return True
+            def pump_until(check):
+                deadline = time.monotonic() + 4
+                while not check() and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(.001)
+                assert check(), 'timed out'
+            with tempfile.TemporaryDirectory() as root, mock.patch.object(e, 'recycle_path_to_trash', recycle):
+                paths = [str(Path(root, name)) for name in ('first', 'second')]
+                for path in paths: Path(path).write_text('payload')
+                pane = Pane()
+                pane.host = types.SimpleNamespace(file_ops=e.FileOperationManager(),
+                    flash_status=lambda *a: None, show_operation_status=lambda *a: None)
+                pane._undo_stack = [{'type': 'remove_created', 'paths': list(paths)}]
+                pane._undo_worker = pane._file_worker = None
+                pane.undo_last()
+                worker = pane._undo_worker
+                try:
+                    pump_until(entered.is_set)
+                    QtCore.QTimer.singleShot(0, worker.cancel)
+                    pump_until(lambda: worker._cancel)
+                    release.set()
+                    pump_until(lambda: pane._undo_worker is None)
+                    assert pane._undo_stack[0]['paths'] == [paths[0]]
+                finally:
+                    release.set()
+                    assert pane.host.file_ops.cancel_all(4000)
+                    app.processEvents()
+        ''')
+
+
+if __name__ == "__main__":
+    unittest.main()

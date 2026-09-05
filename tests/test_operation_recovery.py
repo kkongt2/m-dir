@@ -95,16 +95,13 @@ class UndoRecoveryTests(unittest.TestCase):
             for path in paths:
                 Path(path).write_text("payload")
             action = {"type": "remove_created", "paths": list(paths)}
-            pane = types.SimpleNamespace(_undo_stack=[action], host=mock.Mock(), refresh=mock.Mock(),
-                                         window=lambda: types.SimpleNamespace(winId=lambda: 0))
-            pane._undo_remove_created = lambda items: explorer.ExplorerPane._undo_remove_created(pane, items)
-            pane._apply_undo_action = lambda act: explorer.ExplorerPane._apply_undo_action(pane, act)
-            with mock.patch.object(explorer, "recycle_path_to_trash", side_effect=lambda p, _h: p == paths[1]), mock.patch.object(
-                explorer.QMessageBox, "critical"
-            ):
-                explorer.ExplorerPane.undo_last(pane)
-            self.assertEqual(pane._undo_stack, [{"type": "remove_created", "paths": [paths[0]]}])
-            pane.refresh.assert_called_once()
+            worker = explorer.UndoWorker(action)
+            with mock.patch.object(explorer, "recycle_path_to_trash", side_effect=lambda p, _h: p == paths[1]):
+                worker.run()
+            self.assertFalse(worker.completed)
+            self.assertEqual(worker.remaining_action, {"type": "remove_created", "paths": [paths[0]]})
+            self.assertEqual(action["paths"], paths, "worker must not mutate the UI-owned record")
+
 
 
 class BulkRenameRecoveryTests(unittest.TestCase):

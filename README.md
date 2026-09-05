@@ -12,7 +12,7 @@ This README reflects the current behavior of `multipane_explorer.py`.
 ## Features
 - 4/6/8 pane layout switching (top toolbar + `--panes`), with last layout/path restore
 - Per-pane back/forward/up navigation history
-- Path-bar edit mode with recent-path dropdown and folder path autocomplete
+- Path-bar edit mode with recent-path dropdown and background folder path autocomplete; stale suggestions are discarded when input changes
 - Folders-first sorting, with proper size/date sorting for files
 - Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff, with a visible large-folder mode badge
 - Auto-refresh on file system changes via `QFileSystemWatcher`
@@ -21,6 +21,7 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Safe cross-filesystem moves use a completed staging copy before source cleanup; symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - Per-pane file operation progress bar with cancellation
+- Background undo with progress and cancellation; completed portions of cancelled operations remain undoable, and unfinished undo items can be retried
 - Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
 - Roomier two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with drag-to-reorder bookmark editing
 - Session save/load/delete (pane count + pane paths)
@@ -64,6 +65,9 @@ $env:MULTIPANE_DURABLE_COPIES=1; python multipane_explorer.py
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+The suite includes temporary-directory recovery checks and isolated, offscreen Qt
+checks for responsive autocomplete and cancellable undo.
 
 ## Search/Filter Behavior
 - Type a filter and press `Enter` (or click `Search`) to run recursive search from the current folder

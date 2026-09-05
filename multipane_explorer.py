@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading, tempfile
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading, tempfile, copy
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.7"
+APP_VERSION = "2.8.0"
 
 
 BASE_FONT_PT = 9.5
@@ -233,7 +233,7 @@ def _clipboard_payload_matches(left, right) -> bool:
     return [_path_key(p) for p in left["paths"]] == [_path_key(p) for p in right["paths"]]
 
 
-def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
+def execute_bulk_rename_transaction(operations, should_cancel=lambda: False) -> list[tuple[str, str]]:
     """Stage a rename group and restore original names on recoverable failures."""
     operations = list(operations)
     for column in (0, 1):
@@ -244,6 +244,8 @@ def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
     committed = []
     try:
         for src, dst in operations:
+            if should_cancel():
+                raise DeleteCancelled("Operation cancelled.")
             parent = os.path.dirname(src) or os.curdir
             temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
             while os.path.lexists(temp):
@@ -252,6 +254,8 @@ def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
             temp_pairs.append((src, temp, dst))
 
         for src, temp, dst in temp_pairs:
+            if should_cancel():
+                raise DeleteCancelled("Operation cancelled.")
             _rename_no_replace(temp, dst)
             committed.append((dst, src))
         return committed
@@ -1832,6 +1836,94 @@ class FileOpWorker(QtCore.QThread):
             self.finished_ok.emit()
         except Exception as exc:
             self.error.emit(str(exc))
+
+class UndoWorker(FileOpWorker):
+    """Execute a private undo plan; the UI applies the remaining plan on finish."""
+    def __init__(self, action, hwnd=0, parent=None):
+        super().__init__("undo", [], "", parent=parent)
+        self.remaining_action = copy.deepcopy(action)
+        self.hwnd = hwnd
+        self.failure_message = ""
+        self.completed = False
+        self._undo_done = 0
+        self._undo_total = max(1, self._count_actions(action))
+
+    @staticmethod
+    def _count_actions(action):
+        if action.get("type") == "compound":
+            return sum(UndoWorker._count_actions(sub) for sub in action.get("actions", []))
+        return len(action.get("pairs", action.get("paths", [None])))
+
+    def _emit_progress(self, force=False):
+        self.progress.emit(min(100, int(100 * self._undo_done / self._undo_total)))
+
+    def _check_cancel(self):
+        if self._cancel:
+            raise DeleteCancelled("Operation cancelled.")
+
+    def _apply_action(self, action):
+        self._check_cancel()
+        kind = action.get("type")
+        if kind == "compound":
+            while action.get("actions"):
+                self._apply_action(action["actions"][-1])
+                action["actions"].pop()
+            return
+        if kind == "mkdir":
+            path = action["path"]
+            if os.path.lexists(path):
+                os.rmdir(path)
+        elif kind in {"remove_created", "delete"}:
+            # Older undo records must also use the Recycle Bin, never permanent deletion.
+            while action.get("paths"):
+                self._check_cancel()
+                path = action["paths"][-1]
+                self.status.emit(f"Undo: {path}")
+                if os.path.lexists(path) and not recycle_path_to_trash(path, self.hwnd):
+                    raise OSError(f"Could not move {path} to Recycle Bin; item was left in place.")
+                action["paths"].pop()
+                self._undo_done += 1
+                self._emit_progress()
+            return
+        elif kind == "move_back":
+            if action.get("rename_group"):
+                pairs = action.get("pairs", [])
+                execute_bulk_rename_transaction(pairs, lambda: self._cancel)
+                self._undo_done += len(pairs)
+                action["pairs"] = []
+                self._emit_progress()
+                return
+            while action.get("pairs"):
+                self._check_cancel()
+                current, original = action["pairs"][-1]
+                target_dir = os.path.dirname(original) or os.curdir
+                os.makedirs(target_dir, exist_ok=True)
+                if os.path.lexists(original):
+                    original = unique_dest_path(target_dir, os.path.basename(original))
+                self.status.emit(f"Undo: {current}")
+                if not self._move_source_transactional(current, original, None, False):
+                    self._check_cancel()
+                    raise OSError("\n".join(self.errors) or f"Could not move {current} back to {original}")
+                action["pairs"].pop()
+                self._undo_done += 1
+                self._emit_progress()
+            return
+        else:
+            raise ValueError(f"Unsupported undo action: {kind}")
+        self._undo_done += 1
+        self._emit_progress()
+
+    def run(self):
+        try:
+            self._apply_action(self.remaining_action)
+            self.completed = True
+            self.progress.emit(100)
+            self.finished_ok.emit()
+        except DeleteCancelled:
+            self.failure_message = "Operation cancelled."
+        except Exception as exc:
+            self.failure_message = str(exc)
+
 
 class DeleteWorker(QtCore.QThread):
     progress = pyqtSignal(int)
@@ -4161,6 +4253,104 @@ class StatOverlayProxy(QIdentityProxyModel):
             self._queue.append(p)
         self._start_next_batch()
 
+class PathSuggestionWorker(QtCore.QThread):
+    resultReady = pyqtSignal(int, str, list)
+
+    def __init__(self, generation, typed, recent, parent=None):
+        super().__init__(parent)
+        self.generation = generation
+        self.typed = typed
+        self.recent = list(recent)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        items = list(self.recent)
+        try:
+            if not self._cancel:
+                items.extend(self._collect_filesystem_suggestions(self.typed, 50))
+        except Exception:
+            pass
+        if not self._cancel:
+            self.resultReady.emit(self.generation, self.typed, list(dict.fromkeys(items))[:80])
+
+    def _list_root_paths(self) -> list[str]:
+        out = []
+        try:
+            for fi in QDir.drives():
+                try:
+                    p = fi.absoluteFilePath()
+                except Exception:
+                    p = ""
+                if p:
+                    out.append(_normalize_fs_path(p))
+        except Exception:
+            pass
+        if not out:
+            out.append(_normalize_fs_path(QDir.rootPath()))
+        seen = set()
+        uniq = []
+        for p in out:
+            k = os.path.normcase(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(p)
+        return uniq
+
+    def _collect_filesystem_suggestions(self, typed: str, max_items: int = 45) -> list[str]:
+        t = (typed or "").strip().strip('"')
+        if not t:
+            return self._list_root_paths()[:max_items]
+
+        t = t.replace("/", os.sep)
+        if os.name == "nt" and len(t) == 2 and t[1] == ":":
+            t = t + os.sep
+
+        if t.endswith(("\\", "/")):
+            parent = _normalize_fs_path(t)
+            prefix = ""
+        else:
+            parent = _normalize_fs_path(os.path.dirname(t))
+            prefix = os.path.basename(t)
+
+        if not parent:
+            roots = self._list_root_paths()
+            tl = t.lower()
+            if not tl:
+                return roots[:max_items]
+            return [r for r in roots if r.lower().startswith(tl)][:max_items]
+
+        if not os.path.isdir(parent):
+            return []
+
+        out = []
+        pref_l = prefix.lower()
+        try:
+            with os.scandir(parent) as it:
+                for entry in it:
+                    if self._cancel:
+                        break
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except Exception:
+                        continue
+                    name = entry.name
+                    if pref_l and not name.lower().startswith(pref_l):
+                        continue
+                    out.append(_normalize_fs_path(os.path.join(parent, name)))
+                    if len(out) >= max_items:
+                        break
+        except Exception:
+            return []
+        if not pref_l and os.path.isdir(parent):
+            out.insert(0, _normalize_fs_path(parent))
+        return out[:max_items]
+
+
 class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
     _shared_recent_paths: list[str] | None = None
@@ -4200,6 +4390,10 @@ class PathBar(QWidget):
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
+        self._suggest_generation = 0
+        self._suggest_worker = None
+        self._suggest_pending = None
+        self._suggest_shutdown = False
         self._suggest_timer = QTimer(self)
         self._suggest_timer.setSingleShot(True)
         self._suggest_timer.setInterval(110)
@@ -4208,7 +4402,7 @@ class PathBar(QWidget):
         self._edit_completer = QCompleter(self._edit_model, self)
         self._edit_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._edit_completer.setCompletionMode(QCompleter.PopupCompletion)
-        self._edit_completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
+        self._edit_completer.setModelSorting(QCompleter.UnsortedModel)
         self._edit.setCompleter(self._edit_completer)
         self._edit.textEdited.connect(lambda _t: self._queue_suggestions_update(False))
 
@@ -4283,30 +4477,6 @@ class PathBar(QWidget):
                 merged.append(_normalize_fs_path(p))
         self._set_recent_paths(merged)
 
-    def _list_root_paths(self) -> list[str]:
-        out = []
-        try:
-            for fi in QDir.drives():
-                try:
-                    p = fi.absoluteFilePath()
-                except Exception:
-                    p = ""
-                if p:
-                    out.append(_normalize_fs_path(p))
-        except Exception:
-            pass
-        if not out:
-            out.append(_normalize_fs_path(QDir.rootPath()))
-        seen = set()
-        uniq = []
-        for p in out:
-            k = os.path.normcase(p)
-            if k in seen:
-                continue
-            seen.add(k)
-            uniq.append(p)
-        return uniq
-
     def _collect_recent_suggestions(self, typed: str, max_items: int = 30) -> list[str]:
         self._reload_recent_paths()
         t = (typed or "").strip().lower()
@@ -4316,92 +4486,65 @@ class PathBar(QWidget):
         contains = [p for p in self._recent_paths if t in p.lower() and not p.lower().startswith(t)]
         return (starts + contains)[:max_items]
 
-    def _collect_filesystem_suggestions(self, typed: str, max_items: int = 45) -> list[str]:
-        t = (typed or "").strip().strip('"')
-        if not t:
-            return self._list_root_paths()[:max_items]
-
-        t = t.replace("/", os.sep)
-        if os.name == "nt" and len(t) == 2 and t[1] == ":":
-            t = t + os.sep
-
-        if t.endswith(("\\", "/")):
-            parent = _normalize_fs_path(t)
-            prefix = ""
-        else:
-            parent = _normalize_fs_path(os.path.dirname(t))
-            prefix = os.path.basename(t)
-
-        if not parent:
-            roots = self._list_root_paths()
-            tl = t.lower()
-            if not tl:
-                return roots[:max_items]
-            return [r for r in roots if r.lower().startswith(tl)][:max_items]
-
-        if not os.path.isdir(parent):
-            return []
-
-        out = []
-        pref_l = prefix.lower()
-        try:
-            with os.scandir(parent) as it:
-                for entry in it:
-                    try:
-                        if not entry.is_dir(follow_symlinks=False):
-                            continue
-                    except Exception:
-                        continue
-                    name = entry.name
-                    if pref_l and not name.lower().startswith(pref_l):
-                        continue
-                    out.append(_normalize_fs_path(os.path.join(parent, name)))
-                    if len(out) >= max_items:
-                        break
-        except Exception:
-            return []
-        if not pref_l and os.path.isdir(parent):
-            out.insert(0, _normalize_fs_path(parent))
-        return out[:max_items]
-
-    def _collect_edit_suggestions(self, typed: str) -> list[str]:
-        out = []
-        seen = set()
-        def add_path(p):
-            if not p:
-                return
-            np = _normalize_fs_path(str(p))
-            key = os.path.normcase(np)
-            if key in seen:
-                return
-            seen.add(key)
-            out.append(np)
-
-        raw = (typed or "").strip().strip('"')
-        if raw and os.path.isdir(_normalize_fs_path(raw)):
-            add_path(_normalize_fs_path(raw))
-
-        for p in self._collect_recent_suggestions(raw, 35):
-            add_path(p)
-        for p in self._collect_filesystem_suggestions(raw, 50):
-            add_path(p)
-        return out[:80]
-
     def _queue_suggestions_update(self, immediate: bool = False):
+        self._suggest_generation += 1
+        self._suggest_pending = None
+        if self._suggest_worker:
+            self._suggest_worker.cancel()
+        self._suggest_timer.stop()
         if immediate:
             self._refresh_edit_completer()
-            return
-        if self._suggest_timer.isActive():
-            self._suggest_timer.stop()
-        self._suggest_timer.start()
+        else:
+            self._suggest_timer.start()
 
     def _refresh_edit_completer(self):
+        if self._suggest_shutdown:
+            return
+        self._suggest_generation += 1
         typed = self._edit.text().strip()
-        items = self._collect_edit_suggestions(typed)
+        recent = self._collect_recent_suggestions(typed, 35)
+        self._apply_suggestions(self._suggest_generation, typed, recent)
+        self._suggest_pending = (self._suggest_generation, typed, recent)
+        if self._suggest_worker is not None:
+            self._suggest_worker.cancel()
+        else:
+            self._start_suggestion_worker()
+
+    def _start_suggestion_worker(self):
+        if self._suggest_shutdown or self._suggest_pending is None:
+            return
+        generation, typed, recent = self._suggest_pending
+        self._suggest_pending = None
+        worker = PathSuggestionWorker(generation, typed, recent, self)
+        self._suggest_worker = worker
+        worker.resultReady.connect(self._apply_suggestions)
+        worker.finished.connect(self._suggestion_worker_finished)
+        worker.start()
+
+    @QtCore.pyqtSlot(int, str, list)
+    def _apply_suggestions(self, generation, typed, items):
+        if self._suggest_shutdown or generation != self._suggest_generation or typed != self._edit.text().strip():
+            return
         self._edit_model.setStringList(items)
         self._edit_completer.setCompletionPrefix(typed)
         if self._edit.isVisible() and self._edit.hasFocus() and items:
             self._edit_completer.complete()
+
+    @QtCore.pyqtSlot()
+    def _suggestion_worker_finished(self):
+        worker = self.sender()
+        if self._suggest_worker is worker:
+            self._suggest_worker = None
+        worker.deleteLater()
+        self._start_suggestion_worker()
+
+    def shutdown_suggestions(self):
+        self._suggest_shutdown = True
+        self._suggest_generation += 1
+        self._suggest_pending = None
+        self._suggest_timer.stop()
+        if self._suggest_worker:
+            self._suggest_worker.cancel()
 
     def _show_recent_paths_menu(self):
         self._reload_recent_paths()
@@ -5321,6 +5464,7 @@ class ExplorerPane(QWidget):
         self._fast_enum_done = False
         self._large_folder_mode = False
         self._file_worker=None
+        self._undo_worker=None
         self._icon_cache = {}
         self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
         self._op_progress_dialog=None
@@ -6319,6 +6463,8 @@ class ExplorerPane(QWidget):
         return stopped
 
     def shutdown(self, wait_ms: int = 300):
+        for pathbar in self.findChildren(PathBar):
+            pathbar.shutdown_suggestions()
         self._flush_pending_ui_settings()
         try:
             self._cancel_search_worker()
@@ -7551,7 +7697,7 @@ class ExplorerPane(QWidget):
             QMessageBox.warning(self,"Rename","A file or folder with that name already exists."); return
         try:
             os.rename(src, dst)
-            self._undo_stack.append({"type":"move_back","pairs":[(dst,src)]}); self.refresh(); self.host.flash_status("Renamed")
+            self._undo_stack.append({"type":"move_back","pairs":[(dst,src)],"rename_group":True}); self.refresh(); self.host.flash_status("Renamed")
         except Exception as e:
             QMessageBox.critical(self,"Rename failed",str(e))
 
@@ -7578,77 +7724,56 @@ class ExplorerPane(QWidget):
             return
 
         if committed:
-            self._undo_stack.append({"type": "move_back", "pairs": committed})
+            self._undo_stack.append({"type": "move_back", "pairs": committed, "rename_group": True})
         self.refresh()
         self.host.flash_status(f"Renamed {len(committed)} item(s)")
 
-    def _undo_remove_created(self, paths: list[str]) -> bool:
-        failed = []
-        hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
-        for p in reversed(list(paths or [])):
-            if not p or not os.path.lexists(p):
-                paths.remove(p)
-                continue
-            if not recycle_path_to_trash(p, hwnd):
-                failed.append(p)
-            else:
-                paths.remove(p)
-        if failed:
-            sample = "\n".join(failed[:8])
-            more = "\n..." if len(failed) > 8 else ""
-            raise RuntimeError(
-                "Could not move copied item(s) to Recycle Bin, so they were left in place:\n"
-                f"{sample}{more}"
-            )
-        return True
-
-    def _apply_undo_action(self, act: dict) -> bool:
-        t = act.get("type")
-        if t=="mkdir":
-            path=act["path"]
-            try: os.rmdir(path)
-            except OSError:
-                QMessageBox.information(self,"Undo New Folder","Folder is not empty; cannot undo safely.")
-                return False
-        elif t=="delete":
-            for p in list(act.get("paths", [])):
-                remove_any(p)
-                act["paths"].remove(p)
-        elif t=="remove_created":
-            return self._undo_remove_created(act.get("paths", []))
-        elif t=="move_back":
-            for dst,src in reversed(list(act.get("pairs",[]))):
-                target_dir=os.path.dirname(src)
-                if target_dir:
-                    os.makedirs(target_dir, exist_ok=True)
-                if os.path.exists(src):
-                    base=os.path.basename(src); src=unique_dest_path(target_dir, base)
-                worker = FileOpWorker("move", [dst], target_dir or os.curdir)
-                if not worker._move_source_transactional(dst, src, None, False):
-                    details = "\n".join(worker.errors) or f"Could not safely move {dst} back to {src}."
-                    raise RuntimeError(details)
-                act["pairs"].pop()
-        else:
-            return False
-        return True
-
     def undo_last(self):
-        if not self._undo_stack: self.host.flash_status("Nothing to undo"); return
-        act=self._undo_stack[-1]
-        try:
-            if act.get("type") == "compound":
-                for sub in reversed(list(act.get("actions", []))):
-                    if not self._apply_undo_action(sub):
-                        return
-                    act["actions"].pop()
-            elif not self._apply_undo_action(act):
-                return
-            self._undo_stack.pop()
+        if getattr(self, "_undo_worker", None) is not None:
+            self.host.flash_status("Undo is already running or queued")
+            return
+        if not self._undo_stack:
+            self.host.flash_status("Nothing to undo")
+            return
+        action = self._undo_stack[-1]
+        hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
+        worker = UndoWorker(action, hwnd)
+        worker.original_action = action
+        self._undo_worker = worker
+        self._file_worker = worker
+        self._show_pane_progress("Undo", busy=True)
+        worker.progress.connect(self._set_pane_progress_value)
+        worker.status.connect(self._set_pane_progress_status)
+        worker.status.connect(self.host.show_operation_status)
+        worker.finished.connect(self._on_undo_worker_finished)
+        manager = getattr(self.host, "file_ops", None)
+        if manager:
+            state = manager.submit(worker)
+            if state == "queued":
+                self._set_pane_progress_status("Undo queued")
+        else:
+            worker.start()
+
+    @QtCore.pyqtSlot()
+    def _on_undo_worker_finished(self):
+        worker = self.sender()
+        action = worker.original_action
+        action.clear()
+        action.update(worker.remaining_action)
+        if worker.completed:
+            self._undo_stack[:] = [item for item in self._undo_stack if item is not action]
+        if self._undo_worker is worker:
+            self._undo_worker = None
+        if self._file_worker is worker:
+            self._file_worker = None
+            self._hide_pane_progress()
+        self.refresh()
+        if worker.completed:
             self.host.flash_status("Undone")
-        except Exception as e:
-            QMessageBox.critical(self,"Undo failed",str(e))
-        finally:
-            self.refresh()
+        elif worker.failure_message == "Operation cancelled.":
+            self.host.flash_status("Undo cancelled; unfinished items can be retried")
+        else:
+            QMessageBox.warning(self, "Undo incomplete", worker.failure_message)
 
 
     def _dispose_search_models(self, model, proxy):
