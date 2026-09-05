@@ -2826,6 +2826,22 @@ def _sorted_record_rows(rows: list[dict], column: int, order) -> list[dict]:
     return dirs + files
 
 
+def _contiguous_ranges(rows) -> list[tuple[int, int]]:
+    values = sorted({int(row) for row in rows if int(row) >= 0})
+    if not values:
+        return []
+    ranges = []
+    start = previous = values[0]
+    for row in values[1:]:
+        if row == previous + 1:
+            previous = row
+            continue
+        ranges.append((start, previous))
+        start = previous = row
+    ranges.append((start, previous))
+    return ranges
+
+
 class RecordSortProxy(QIdentityProxyModel):
     """Identity proxy that delegates sorting to list-backed source models.
 
@@ -3205,6 +3221,7 @@ class FastDirModel(QAbstractTableModel):
         super().__init__(parent)
         self._root = ""
         self._rows = []
+        self._row_by_path = {}
         self._icon_cache = {}
         self._icon_rows = {}
         self._icon_file = None
@@ -3218,6 +3235,7 @@ class FastDirModel(QAbstractTableModel):
         self.beginResetModel()
         self._root = path
         self._rows = []
+        self._row_by_path.clear()
         self._icon_cache.clear()
         self._icon_rows.clear()
         self._last_sort = None
@@ -3237,13 +3255,17 @@ class FastDirModel(QAbstractTableModel):
         self.beginInsertRows(QtCore.QModelIndex(), start, start + len(prepared) - 1)
         self._rows.extend(prepared)
         for offset, rec in enumerate(prepared):
-            self._icon_rows.setdefault(rec["icon_key"], []).append(start + offset)
+            row = start + offset
+            self._row_by_path[str(rec.get("path", ""))] = row
+            self._icon_rows.setdefault(rec["icon_key"], []).append(row)
         self._last_sort = None
         self.endInsertRows()
 
-    def _rebuild_icon_rows(self):
+    def _rebuild_row_maps(self):
+        self._row_by_path = {}
         self._icon_rows = {}
         for row, rec in enumerate(self._rows):
+            self._row_by_path[str(rec.get("path", ""))] = row
             self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
 
     def sort_records(self, column: int, order=Qt.AscendingOrder):
@@ -3259,11 +3281,10 @@ class FastDirModel(QAbstractTableModel):
             return
         self.layoutAboutToBeChanged.emit()
         self._rows = sorted_rows
-        self._rebuild_icon_rows()
-        row_by_path = {str(rec.get("path", "")): row for row, rec in enumerate(self._rows)}
+        self._rebuild_row_maps()
         remapped = [
-            self.index(row_by_path.get(path, -1), ix.column())
-            if path in row_by_path else QtCore.QModelIndex()
+            self.index(self._row_by_path.get(path, -1), ix.column())
+            if path in self._row_by_path else QtCore.QModelIndex()
             for ix, path in zip(persistent, persistent_paths)
         ]
         self.changePersistentIndexList(persistent, remapped)
@@ -3291,19 +3312,32 @@ class FastDirModel(QAbstractTableModel):
 
     @QtCore.pyqtSlot(int, object, object)
     def apply_stat(self, row: int, size_val, mtime_val):
-        if not (0 <= row < len(self._rows)):
+        path = self.row_path(row)
+        if not path:
             return
-        changed = []
-        if self._rows[row].get("size") is None and size_val is not None:
-            self._rows[row]["size"] = int(size_val)
-            changed.append(1)
-        if self._rows[row].get("mtime") is None and mtime_val is not None:
-            self._rows[row]["mtime"] = float(mtime_val)
-            changed.append(3)
-        for col in changed:
-            ix = self.index(row, col)
-            self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
-        if changed:
+        self.apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def apply_stat_batch(self, updates: list):
+        size_rows = []
+        mtime_rows = []
+        for path, size_val, mtime_val in updates:
+            row = self._row_by_path.get(str(path))
+            if row is None or not (0 <= row < len(self._rows)):
+                continue
+            rec = self._rows[row]
+            if rec.get("size") is None and size_val is not None:
+                rec["size"] = int(size_val)
+                size_rows.append(row)
+            if rec.get("mtime") is None and mtime_val is not None:
+                rec["mtime"] = float(mtime_val)
+                mtime_rows.append(row)
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(size_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 1), roles)
+        for start, end in _contiguous_ranges(mtime_rows):
+            self.dataChanged.emit(self.index(start, 3), self.index(end, 3), roles)
+        if size_rows or mtime_rows:
             self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
@@ -3414,24 +3448,27 @@ class FastDirModel(QAbstractTableModel):
         return None
 
 class FastStatWorker(QtCore.QThread):
-    statReady=pyqtSignal(int, object, object); finishedCycle=pyqtSignal()
-    def __init__(self, model:FastDirModel, root:str, rows:list[int], parent=None):
-        super().__init__(parent); self._model=model; self._root=root; self._rows=list(rows); self._cancel=False
+    statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
+    def __init__(self, root:str, paths:list[str], parent=None):
+        super().__init__(parent); self._root=root; self._paths=list(paths); self._cancel=False
     def cancel(self): self._cancel=True
     def run(self):
+        batch = []
         try:
-            for row in self._rows:
+            for p in self._paths:
                 if self._cancel: break
-                if self._model.rootPath()!=self._root: break
-                if self._model.has_stat(row): continue
-                p=self._model.row_path(row)
                 try:
                     st=os.stat(p, follow_symlinks=False)
                     size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
                     mtime_val=float(st.st_mtime)
                 except Exception:
                     size_val=0; mtime_val=None
-                self.statReady.emit(row,size_val,mtime_val)
+                batch.append((p, size_val, mtime_val))
+                if len(batch) >= 64:
+                    self.statBatchReady.emit(batch)
+                    batch = []
+            if batch:
+                self.statBatchReady.emit(batch)
         finally:
             self.finishedCycle.emit()
 
@@ -3599,11 +3636,12 @@ class DirEnumWorker(QtCore.QThread):
             self.finished.emit()
 
 class NormalStatWorker(QtCore.QThread):
-    statReady=pyqtSignal(str, object, object); finishedCycle=pyqtSignal()
+    statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
     def __init__(self, paths:list[str], parent=None):
         super().__init__(parent); self._paths=list(paths); self._cancel=False
     def cancel(self): self._cancel=True
     def run(self):
+        batch = []
         try:
             for p in self._paths:
                 if self._cancel: break
@@ -3613,7 +3651,12 @@ class NormalStatWorker(QtCore.QThread):
                     mtime_val=float(st.st_mtime)
                 except Exception:
                     size_val=0; mtime_val=None
-                self.statReady.emit(p,size_val,mtime_val)
+                batch.append((p, size_val, mtime_val))
+                if len(batch) >= 64:
+                    self.statBatchReady.emit(batch)
+                    batch = []
+            if batch:
+                self.statBatchReady.emit(batch)
         finally:
             self.finishedCycle.emit()
 
@@ -3916,24 +3959,32 @@ class StatOverlayProxy(QIdentityProxyModel):
         del self._queue[:batch_size]
 
         w = NormalStatWorker(batch, self)
-        w.statReady.connect(self._apply_stat, Qt.QueuedConnection)
+        w.statBatchReady.connect(self._apply_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch: self._on_cycle_finished(b), Qt.QueuedConnection)
         self._worker = w
         w.start()
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_stat(self, path: str, size_val, mtime_val):
-        self._cache[path] = (int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
-        try:
-            src = self.sourceModel()
-            sidx0 = src.index(path)
-            if sidx0.isValid():
-                for col in (1, 3):
-                    sidx = sidx0.sibling(sidx0.row(), col)
+        self._apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def _apply_stat_batch(self, updates: list):
+        changed_rows = []
+        src = self.sourceModel()
+        for path, size_val, mtime_val in updates:
+            self._cache[path] = (int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
+            try:
+                sidx = src.index(path)
+                if sidx.isValid():
                     pidx = self.mapFromSource(sidx)
-                    self.dataChanged.emit(pidx, pidx, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
-        except Exception:
-            pass
+                    if pidx.isValid():
+                        changed_rows.append(pidx.row())
+            except Exception:
+                pass
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(changed_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 3), roles)
 
     def _on_cycle_finished(self, batch):
         retry = []
@@ -4472,21 +4523,29 @@ class SearchResultModel(QAbstractTableModel):
 
     @QtCore.pyqtSlot(str, object, object)
     def apply_stat(self, path: str, size_val, mtime_val):
-        row = self._row_by_path.get(path)
-        if row is None or not (0 <= row < len(self._rows)):
-            return
-        rec = self._rows[row]
-        changed = []
-        if rec.get("size") is None and size_val is not None:
-            rec["size"] = int(size_val)
-            changed.append(1)
-        if rec.get("mtime") is None and mtime_val is not None:
-            rec["mtime"] = float(mtime_val)
-            changed.append(3)
-        for col in changed:
-            ix = self.index(row, col)
-            self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
-        if changed:
+        self.apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def apply_stat_batch(self, updates: list):
+        size_rows = []
+        mtime_rows = []
+        for path, size_val, mtime_val in updates:
+            row = self._row_by_path.get(path)
+            if row is None or not (0 <= row < len(self._rows)):
+                continue
+            rec = self._rows[row]
+            if rec.get("size") is None and size_val is not None:
+                rec["size"] = int(size_val)
+                size_rows.append(row)
+            if rec.get("mtime") is None and mtime_val is not None:
+                rec["mtime"] = float(mtime_val)
+                mtime_rows.append(row)
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(size_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 1), roles)
+        for start, end in _contiguous_ranges(mtime_rows):
+            self.dataChanged.emit(self.index(start, 3), self.index(end, 3), roles)
+        if size_rows or mtime_rows:
             self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
@@ -5928,7 +5987,7 @@ class ExplorerPane(QWidget):
         del self._search_stat_queue[:size]
 
         w = NormalStatWorker(batch, self)
-        w.statReady.connect(self._apply_search_stat, Qt.QueuedConnection)
+        w.statBatchReady.connect(self._apply_search_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch, worker=w: self._on_search_stat_cycle_finished(worker, b), Qt.QueuedConnection)
         self._search_stat_worker = w
         w.start()
@@ -5962,11 +6021,15 @@ class ExplorerPane(QWidget):
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_search_stat(self, path: str, size_val, mtime_val):
+        self._apply_search_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def _apply_search_stat_batch(self, updates: list):
         if self.sender() is not getattr(self, "_search_stat_worker", None):
             return
         model = getattr(self, "_search_model", None)
         if isinstance(model, SearchResultModel):
-            model.apply_stat(path, size_val, mtime_val)
+            model.apply_stat_batch(updates)
 
 
 
@@ -6335,7 +6398,7 @@ class ExplorerPane(QWidget):
             proxy_start = max(0, proxy_start - 30)
             proxy_end   = min(rc - 1, proxy_end + 50)
 
-            to_rows = []
+            stat_paths = []
             icon_jobs = []
             for r in range(proxy_start, proxy_end + 1):
                 prx_ix = self._fast_proxy.index(r, 0, root_ix)
@@ -6344,8 +6407,10 @@ class ExplorerPane(QWidget):
                 if row is None or row < 0:
                     continue
                 if not self._fast_model.has_stat(row):
-                    to_rows.append(row)
-                    if len(to_rows) >= 220:
+                    path = self._fast_model.row_path(row)
+                    if path:
+                        stat_paths.append(path)
+                    if len(stat_paths) >= 220:
                         break
 
 
@@ -6357,13 +6422,13 @@ class ExplorerPane(QWidget):
 
             if icon_jobs:
                 self._queue_async_icons(icon_jobs)
-            if not to_rows:
+            if not stat_paths:
                 return
             if self._fast_stat_worker and self._fast_stat_worker.isRunning():
                 return
             root = self._fast_model.rootPath()
-            w = FastStatWorker(self._fast_model, root, to_rows, self)
-            w.statReady.connect(self._fast_model.apply_stat, Qt.QueuedConnection)
+            w = FastStatWorker(root, stat_paths, self)
+            w.statBatchReady.connect(self._fast_model.apply_stat_batch, Qt.QueuedConnection)
             def _on_fast_cycle_finished():
                 if self._fast_stat_worker is w:
                     self._fast_stat_worker = None

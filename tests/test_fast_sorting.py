@@ -1,4 +1,7 @@
 import unittest
+import os
+import tempfile
+from pathlib import Path
 
 from PyQt5 import QtCore
 
@@ -44,6 +47,45 @@ class FastRecordSortingTests(unittest.TestCase):
         proxy.sort(0, QtCore.Qt.AscendingOrder)
         self.assertTrue(persistent.isValid())
         self.assertEqual(persistent.data(QtCore.Qt.UserRole), "C:/z-dir")
+
+    def test_stat_updates_are_applied_in_consolidated_ranges(self):
+        model = explorer.FastDirModel()
+        rows = [
+            {
+                "name": f"{i}.txt",
+                "name_l": f"{i}.txt",
+                "path": f"C:/{i}.txt",
+                "is_dir": False,
+                "ext": "txt",
+                "size": None,
+                "mtime": None,
+                "icon_key": "ext:.txt",
+            }
+            for i in range(100)
+        ]
+        model.append_rows(rows)
+        emissions = []
+        model.dataChanged.connect(lambda top, bottom, _roles: emissions.append((top.column(), top.row(), bottom.row())))
+
+        model.apply_stat_batch([(f"C:/{i}.txt", i, 1000 + i) for i in range(100)])
+
+        self.assertEqual(emissions, [(1, 0, 99), (3, 0, 99)])
+        self.assertEqual(model.index(99, 1).data(QtCore.Qt.EditRole), 99)
+
+    def test_fast_stat_worker_emits_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = []
+            for i in range(130):
+                path = os.path.join(root, f"{i}.txt")
+                Path(path).write_text("x", encoding="utf-8")
+                paths.append(path)
+            worker = explorer.FastStatWorker(root, paths)
+            batches = []
+            worker.statBatchReady.connect(lambda batch: batches.append(batch))
+
+            worker.run()
+
+        self.assertEqual([len(batch) for batch in batches], [64, 64, 2])
 
 
 if __name__ == "__main__":
