@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 
 
 BASE_FONT_PT = 9.5
@@ -91,7 +91,7 @@ DIR_SNAPSHOT_CACHE_LIMIT = 8
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 QUICK_BOOKMARK_MIN_W = 42
-QUICK_BOOKMARK_MAX_W = 78
+QUICK_BOOKMARK_MAX_W = 160
 QUICK_BOOKMARK_MORE_W = 30
 BOOKMARK_TOOLBAR_ROWS = 2
 VALID_THEMES = ("dark", "light")
@@ -1933,20 +1933,28 @@ def _empty_bookmark_item():
 def _two_row_bookmark_fit(widths, available: int, spacing: int, more_width: int):
     widths = list(widths or [])
     total = len(widths)
+    top_count = 0
+    top_width = 0
+    for width in widths:
+        next_width = top_width + (spacing if top_count else 0) + width
+        if next_width > available:
+            break
+        top_width = next_width
+        top_count += 1
+    if top_count == total:
+        return total, top_count
 
-    def required_width(values):
-        return sum(values) + max(0, len(values) - 1) * spacing
-
-    for visible_count in range(total, -1, -1):
-        top_count = (visible_count + 1) // 2
-        top_width = required_width(widths[:top_count])
-        bottom_widths = widths[top_count:visible_count]
-        bottom_width = required_width(bottom_widths)
-        if visible_count < total:
-            bottom_width += (spacing if bottom_widths else 0) + more_width
-        if top_width <= available and bottom_width <= available:
-            return visible_count, top_count
-    return 0, 0
+    bottom_count = 0
+    bottom_width = 0
+    for index, width in enumerate(widths[top_count:]):
+        spacing_before = spacing if bottom_count else 0
+        remaining_after = total - (top_count + index + 1)
+        more_reserve = (spacing + more_width) if remaining_after else 0
+        if bottom_width + spacing_before + width + more_reserve > available:
+            break
+        bottom_width += spacing_before + width
+        bottom_count += 1
+    return top_count + bottom_count, top_count
 
 def _apply_palette_colors(widget, colors):
     pal = widget.palette()
