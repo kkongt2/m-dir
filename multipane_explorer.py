@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -87,6 +87,8 @@ FILE_COPY_BUFFER_SIZE = 4 * 1024 * 1024
 DURABLE_FILE_COPIES = _env_flag("MULTIPANE_DURABLE_COPIES")
 GENERIC_ICON_THRESHOLD = 1200
 SHELL_ICON_FAILURE_TTL_S = 300
+DIR_SNAPSHOT_TTL_S = 5.0
+DIR_SNAPSHOT_CACHE_LIMIT = 8
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 QUICK_BOOKMARK_MIN_W = 42
@@ -3112,6 +3114,90 @@ class ShellIconWorker(QtCore.QThread):
             self.finishedCycle.emit(self._jobs)
 
 
+class ShellIconBroker(QtCore.QObject):
+    """Deduplicate shell icon work across every pane in the window."""
+    iconReady = pyqtSignal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pending = set()
+        self._queue = []
+        self._worker = None
+
+    def request(self, jobs):
+        now = time.monotonic()
+        added = False
+        for key, path, is_dir in jobs:
+            key = str(key or "")
+            if not key or key in GLOBAL_SHELL_ICON_CACHE or key in self._pending:
+                continue
+            failed_at = GLOBAL_SHELL_ICON_FAILURES.get(key)
+            if failed_at is not None and (now - float(failed_at)) < SHELL_ICON_FAILURE_TTL_S:
+                continue
+            GLOBAL_SHELL_ICON_FAILURES.pop(key, None)
+            self._pending.add(key)
+            self._queue.append((key, str(path or ""), bool(is_dir)))
+            added = True
+        if added:
+            self._start_next()
+
+    def _start_next(self, batch_limit: int = 64):
+        if self._worker and self._worker.isRunning():
+            return
+        if not self._queue:
+            self._worker = None
+            return
+        batch = self._queue[:max(1, int(batch_limit))]
+        del self._queue[:len(batch)]
+        worker = ShellIconWorker(batch, self)
+        worker.iconReady.connect(self._apply_raw, Qt.QueuedConnection)
+        worker.finishedCycle.connect(
+            lambda jobs=batch, w=worker: self._on_cycle_finished(w, jobs),
+            Qt.QueuedConnection,
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    @QtCore.pyqtSlot(str, bytes, int, int)
+    def _apply_raw(self, key: str, raw: bytes, width: int, height: int):
+        if not raw or width <= 0 or height <= 0:
+            return
+        try:
+            image = QImage(raw, int(width), int(height), int(width) * 4, QImage.Format_ARGB32).copy()
+            icon = QIcon(QPixmap.fromImage(image))
+            if icon.isNull():
+                return
+            GLOBAL_SHELL_ICON_CACHE[key] = icon
+            GLOBAL_SHELL_ICON_FAILURES.pop(key, None)
+            self.iconReady.emit(key, icon)
+        except Exception:
+            pass
+
+    def _on_cycle_finished(self, worker, jobs):
+        if worker is not self._worker:
+            return
+        for key, _path, _is_dir in list(jobs or []):
+            self._pending.discard(key)
+            if key not in GLOBAL_SHELL_ICON_CACHE:
+                GLOBAL_SHELL_ICON_FAILURES[key] = time.monotonic()
+        self._worker = None
+        self._start_next()
+
+    def shutdown(self, wait_ms: int = 3000) -> bool:
+        self._queue = []
+        self._pending.clear()
+        worker = self._worker
+        if not worker or not worker.isRunning():
+            self._worker = None
+            return True
+        worker.cancel()
+        stopped = bool(worker.wait(max(0, int(wait_ms))))
+        if stopped:
+            self._worker = None
+        return stopped
+
+
 class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Ext", "Date Modified"]
 
@@ -3349,6 +3435,74 @@ class FastStatWorker(QtCore.QThread):
         finally:
             self.finishedCycle.emit()
 
+
+class DirectorySnapshotCache:
+    """Thread-safe short-lived cache with one active scan per path/options key."""
+    def __init__(self, ttl_s: float = DIR_SNAPSHOT_TTL_S, max_entries: int = DIR_SNAPSHOT_CACHE_LIMIT):
+        self._ttl_s = max(0.0, float(ttl_s))
+        self._max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._cache = {}
+        self._flights = {}
+        self._generations = {}
+
+    @staticmethod
+    def _root_key(path: str) -> str:
+        return _path_key(path)
+
+    def acquire(self, path: str, preload_size: bool, preload_mtime: bool):
+        root_key = self._root_key(path)
+        key = (root_key, bool(preload_size), bool(preload_mtime))
+        now = time.monotonic()
+        with self._lock:
+            generation = int(self._generations.get(root_key, 0))
+            expired = [
+                cache_key for cache_key, item in self._cache.items()
+                if (now - float(item[0])) > self._ttl_s
+            ]
+            for cache_key in expired:
+                self._cache.pop(cache_key, None)
+            cached = self._cache.get(key)
+            if cached is not None and int(cached[1]) == generation:
+                return "cached", key, generation, None, cached[2], cached[3]
+            flight = self._flights.get(key)
+            if flight is not None and int(flight[0]) == generation:
+                return "wait", key, generation, flight[1], None, None
+            event = threading.Event()
+            self._flights[key] = (generation, event)
+            return "leader", key, generation, event, None, None
+
+    def publish(self, key, generation: int, event, rows, error: str | None = None):
+        with self._lock:
+            root_key = key[0]
+            if int(self._generations.get(root_key, 0)) == int(generation):
+                self._cache[key] = (time.monotonic(), int(generation), tuple(rows or ()), error)
+                while len(self._cache) > self._max_entries:
+                    oldest_key = next(iter(self._cache))
+                    self._cache.pop(oldest_key, None)
+            current = self._flights.get(key)
+            if current is not None and current[1] is event:
+                self._flights.pop(key, None)
+            event.set()
+
+    def abandon(self, key, event):
+        with self._lock:
+            current = self._flights.get(key)
+            if current is not None and current[1] is event:
+                self._flights.pop(key, None)
+            event.set()
+
+    def invalidate(self, path: str):
+        root_key = self._root_key(path)
+        with self._lock:
+            self._generations[root_key] = int(self._generations.get(root_key, 0)) + 1
+            for key in [key for key in self._cache if key[0] == root_key]:
+                self._cache.pop(key, None)
+
+
+GLOBAL_DIR_SNAPSHOTS = DirectorySnapshotCache()
+
+
 class DirEnumWorker(QtCore.QThread):
     batchReady=QtCore.pyqtSignal(list); finished=QtCore.pyqtSignal(); error=QtCore.pyqtSignal(str)
     def __init__(self, root:str, parent=None, preload_size: bool = False, preload_mtime: bool = False):
@@ -3358,44 +3512,89 @@ class DirEnumWorker(QtCore.QThread):
         self._preload_size = bool(preload_size)
         self._preload_mtime = bool(preload_mtime)
     def cancel(self): self._cancel=True
+
+    def _emit_snapshot(self, rows):
+        batch_size = 400
+        for start in range(0, len(rows), batch_size):
+            if self._cancel:
+                return
+            self.batchReady.emit(list(rows[start:start + batch_size]))
+
+    def _scan_as_leader(self):
+        all_rows = []
+        batch, batch_size = [], 400
+        with os.scandir(self.root) as it:
+            for entry in it:
+                if self._cancel:
+                    break
+                name=entry.name; p=os.path.join(self.root,name)
+                try: is_dir=entry.is_dir(follow_symlinks=False)
+                except Exception: is_dir=os.path.isdir(p)
+                ext = file_extension_label(name, is_dir)
+                size_val = None
+                mtime_val = None
+                if self._preload_size or self._preload_mtime:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if self._preload_size:
+                            size_val = 0 if is_dir else int(st.st_size)
+                        if self._preload_mtime:
+                            mtime_val = float(st.st_mtime)
+                    except Exception:
+                        if self._preload_size:
+                            size_val = 0 if is_dir else None
+                        if self._preload_mtime:
+                            mtime_val = None
+                rec = {
+                    "name": name,
+                    "name_l": name.lower(),
+                    "path": p,
+                    "is_dir": is_dir,
+                    "ext": ext,
+                    "size": size_val,
+                    "mtime": mtime_val,
+                    "icon_key": _icon_cache_key(p, is_dir),
+                }
+                batch.append(rec)
+                all_rows.append(rec)
+                if len(batch)>=batch_size:
+                    self.batchReady.emit(batch)
+                    batch=[]
+            if batch:
+                self.batchReady.emit(batch)
+        return all_rows
+
     def run(self):
-        batch, BATCH=[], 400
         try:
-            with os.scandir(self.root) as it:
-                for entry in it:
-                    if self._cancel: break
-                    name=entry.name; p=os.path.join(self.root,name)
-                    try: is_dir=entry.is_dir(follow_symlinks=False)
-                    except Exception: is_dir=os.path.isdir(p)
-                    ext = file_extension_label(name, is_dir)
-                    size_val = None
-                    mtime_val = None
-                    if self._preload_size or self._preload_mtime:
-                        try:
-                            st = entry.stat(follow_symlinks=False)
-                            if self._preload_size:
-                                size_val = 0 if is_dir else int(st.st_size)
-                            if self._preload_mtime:
-                                mtime_val = float(st.st_mtime)
-                        except Exception:
-                            if self._preload_size:
-                                size_val = 0 if is_dir else None
-                            if self._preload_mtime:
-                                mtime_val = None
-                    batch.append({
-                        "name": name,
-                        "name_l": name.lower(),
-                        "path": p,
-                        "is_dir": is_dir,
-                        "ext": ext,
-                        "size": size_val,
-                        "mtime": mtime_val,
-                        "icon_key": _icon_cache_key(p, is_dir),
-                    })
-                    if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
-                if batch: self.batchReady.emit(batch)
-        except Exception as e:
-            self.error.emit(str(e))
+            while not self._cancel:
+                state, key, generation, event, rows, error = GLOBAL_DIR_SNAPSHOTS.acquire(
+                    self.root, self._preload_size, self._preload_mtime
+                )
+                if state == "cached":
+                    if error:
+                        self.error.emit(str(error))
+                    else:
+                        self._emit_snapshot(rows)
+                    return
+                if state == "wait":
+                    while not self._cancel and not event.wait(0.05):
+                        pass
+                    continue
+
+                try:
+                    rows = self._scan_as_leader()
+                    if self._cancel:
+                        GLOBAL_DIR_SNAPSHOTS.abandon(key, event)
+                    else:
+                        GLOBAL_DIR_SNAPSHOTS.publish(key, generation, event, rows)
+                    return
+                except Exception as exc:
+                    if self._cancel:
+                        GLOBAL_DIR_SNAPSHOTS.abandon(key, event)
+                    else:
+                        GLOBAL_DIR_SNAPSHOTS.publish(key, generation, event, (), str(exc))
+                        self.error.emit(str(exc))
+                    return
         finally:
             self.finished.emit()
 
@@ -4907,9 +5106,6 @@ class ExplorerPane(QWidget):
         self._file_worker=None
         self._icon_cache = {}
         self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
-        self._icon_pending = set()
-        self._icon_queue = []
-        self._icon_worker = None
         self._op_progress_dialog=None
         self._dirload_timer={}
         self._sort_column = 0
@@ -5238,6 +5434,8 @@ class ExplorerPane(QWidget):
 
     def _connect_signals(self):
         self.host.namedBookmarksChanged.connect(self._on_bookmarks_changed)
+        if getattr(self.host, "icon_broker", None):
+            self.host.icon_broker.iconReady.connect(self._apply_shared_icon, Qt.QueuedConnection)
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
         self.btn_star.clicked.connect(self._on_star_toggle)
         self.btn_cmd.clicked.connect(self._open_cmd_here)
@@ -5854,25 +6052,16 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-    @QtCore.pyqtSlot(str, bytes, int, int)
-    def _apply_async_icon_raw(self, key: str, raw: bytes, width: int, height: int):
-        if not raw or width <= 0 or height <= 0:
+    @QtCore.pyqtSlot(str, object)
+    def _apply_shared_icon(self, key: str, icon):
+        if not key or not isinstance(icon, QIcon) or icon.isNull():
             return
-        try:
-            image = QImage(raw, int(width), int(height), int(width) * 4, QImage.Format_ARGB32).copy()
-            icon = QIcon(QPixmap.fromImage(image))
-            if icon.isNull():
-                return
-            self._icon_cache[key] = icon
-            GLOBAL_SHELL_ICON_CACHE[key] = icon
-            self._icon_failed.pop(key, None)
-            self._apply_icon_to_models(key, icon)
-        except Exception:
-            pass
+        self._icon_cache[key] = icon
+        self._icon_failed.pop(key, None)
+        self._apply_icon_to_models(key, icon)
 
     def _queue_async_icons(self, jobs):
-        added = False
-        now = time.monotonic()
+        pending = []
         for key, path, is_dir in jobs:
             key = str(key or "")
             if not key:
@@ -5883,49 +6072,15 @@ class ExplorerPane(QWidget):
                 self._icon_failed.pop(key, None)
                 self._apply_icon_to_models(key, cached)
                 continue
-            failed_at = self._icon_failed.get(key)
-            if failed_at is not None and (now - float(failed_at)) < SHELL_ICON_FAILURE_TTL_S:
-                continue
-            if failed_at is not None:
-                self._icon_failed.pop(key, None)
-            if key in self._icon_pending:
-                continue
-            self._icon_pending.add(key)
-            self._icon_queue.append((key, str(path or ""), bool(is_dir)))
-            added = True
-        if added:
-            self._start_next_icon_worker()
-
-    def _start_next_icon_worker(self, batch_limit: int = 64):
-        cur = getattr(self, "_icon_worker", None)
-        if cur and cur.isRunning():
-            return
-        if not self._icon_queue:
-            self._icon_worker = None
-            return
-        batch = self._icon_queue[:max(1, int(batch_limit))]
-        del self._icon_queue[:len(batch)]
-        worker = ShellIconWorker(batch, self)
-        worker.iconReady.connect(self._apply_async_icon_raw, Qt.QueuedConnection)
-        worker.finishedCycle.connect(self._on_icon_cycle_finished, Qt.QueuedConnection)
-        self._icon_worker = worker
-        worker.start()
-
-    @QtCore.pyqtSlot(object)
-    def _on_icon_cycle_finished(self, jobs):
-        for key, _path, _is_dir in list(jobs or []):
-            self._icon_pending.discard(key)
-            if key not in self._icon_cache:
-                self._icon_failed[key] = time.monotonic()
-        self._icon_worker = None
-        self._start_next_icon_worker()
+            pending.append((key, str(path or ""), bool(is_dir)))
+        broker = getattr(self.host, "icon_broker", None)
+        if pending and broker is not None:
+            broker.request(pending)
 
     def _cancel_icon_worker(self):
-        self._icon_queue = []
-        self._icon_pending.clear()
-        stopped = self._stop_worker_thread(getattr(self, "_icon_worker", None), 150, "shell-icon")
-        self._icon_worker = None
-        return stopped
+        # Icon work belongs to the window-wide broker and may still be needed by
+        # another pane, so navigating or closing one pane must not cancel it.
+        return True
 
     def _cancel_fast_stat_worker(self):
         stopped = self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
@@ -6799,6 +6954,7 @@ class ExplorerPane(QWidget):
 
             if getattr(self, "_using_fast", False):
                 self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
+                GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path())
                 self._use_fast_model(self.current_path())
                 return
 
@@ -6845,6 +7001,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
             return
+        GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path())
         try: self._cancel_fast_stat_worker()
         except Exception: pass
         try: self._cancel_enum_worker(wait_ms=100)
@@ -7671,6 +7828,7 @@ class MultiExplorer(QMainWindow):
         self.named_bookmarks=migrate_legacy_favorites_into_named(load_named_bookmarks()); save_named_bookmarks(self.named_bookmarks)
         self._clipboard=None; self._bm_dlg=None
         self.file_ops = FileOperationManager(self)
+        self.icon_broker = ShellIconBroker(self)
         self._update_layout_icon(); self._update_theme_icon()
         self._help_shortcut = QShortcut(QKeySequence("F1"), self)
         self._help_shortcut.setContext(Qt.ApplicationShortcut)
@@ -8360,6 +8518,16 @@ class MultiExplorer(QMainWindow):
                 "Could not exit safely",
                 "A background folder, search, or icon task has not stopped yet. "
                 "The window will remain open to prevent a thread-lifecycle crash.",
+            )
+            e.ignore()
+            return
+
+        icon_broker = getattr(self, "icon_broker", None)
+        if icon_broker and not icon_broker.shutdown(wait_ms=3000):
+            QMessageBox.warning(
+                self,
+                "Could not exit safely",
+                "The shared icon task has not stopped yet. The window will remain open.",
             )
             e.ignore()
             return
