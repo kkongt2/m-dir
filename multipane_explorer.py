@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading, tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.4"
+APP_VERSION = "2.7.5"
 
 
 BASE_FONT_PT = 9.5
@@ -1175,6 +1175,24 @@ def _cancel_and_wait_child_threads(owner: QtCore.QObject, wait_ms: int) -> bool:
     return all_stopped
 
 
+def _rename_no_replace(src, dst):
+    """Atomically claim a destination, refusing a concurrent occupant."""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = getattr(libc, "renameat2", None)
+        if rename is not None:
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            if rename(-100, os.fsencode(src), -100, os.fsencode(dst), 1) == 0:
+                return
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), dst)
+    raise OSError("Atomic non-overwriting rename is unavailable on this platform")
+
+
 def _source_signature(path):
     info = os.lstat(path)
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
@@ -1411,11 +1429,14 @@ class FileOpWorker(QtCore.QThread):
             candidate = os.path.join(parent, f".__mprn_{kind}_{uuid.uuid4().hex}")
         return candidate
 
-    def _backup_destination(self, dst: str) -> str | None:
-        if not os.path.lexists(dst):
-            return None
+    def _backup_destination(self, dst: str, expected=None) -> str:
+        if expected is not None and _source_signature(dst) != expected:
+            raise OSError("Destination changed while the operation was running")
         backup = self._new_sibling_work_path(dst, "backup")
-        os.replace(dst, backup)
+        _rename_no_replace(dst, backup)
+        if expected is not None and _source_signature(backup)[:5] != expected[:5]:
+            self._restore_backup(dst, backup)
+            raise OSError("Destination was replaced while preparing overwrite")
         return backup
 
     def _cleanup_path(self, path: str):
@@ -1424,20 +1445,14 @@ class FileOpWorker(QtCore.QThread):
         remove_any(path)
 
     def _restore_backup(self, dst: str, backup: str | None):
-        if not backup:
+        if not backup or not os.path.lexists(backup):
             return
-        restore_errors = []
         try:
-            self._cleanup_path(dst)
+            _rename_no_replace(backup, dst)
         except Exception as exc:
-            restore_errors.append(f"Could not remove partial destination {dst}: {exc}")
-        try:
-            if os.path.lexists(backup):
-                os.replace(backup, dst)
-        except Exception as exc:
-            restore_errors.append(f"Could not restore original destination {dst}: {exc}")
-        if restore_errors:
-            raise RuntimeError("; ".join(restore_errors))
+            raise RuntimeError(
+                f"Original destination is preserved at {backup}; could not restore {dst}: {exc}"
+            ) from exc
 
     def _discard_backup(self, backup: str | None, dst: str):
         if not backup or not os.path.lexists(backup):
@@ -1451,8 +1466,6 @@ class FileOpWorker(QtCore.QThread):
         try:
             if backup:
                 self._restore_backup(dst, backup)
-            else:
-                self._cleanup_path(dst)
         except Exception as exc:
             self._record_copy_error(dst, dst, f"Rollback failed: {exc}")
 
@@ -1485,7 +1498,7 @@ class FileOpWorker(QtCore.QThread):
                 pass
             if self._cancel:
                 return False
-            os.replace(temp_path, dst)
+            _rename_no_replace(temp_path, dst)
             temp_path = None
             self._tick_progress(delta_items=1)
             return True
@@ -1513,7 +1526,7 @@ class FileOpWorker(QtCore.QThread):
                 pass
             if self._cancel:
                 return False
-            os.replace(temp_path, dst)
+            _rename_no_replace(temp_path, dst)
             temp_path = None
             self._tick_progress(delta_items=1)
             return True
@@ -1533,8 +1546,6 @@ class FileOpWorker(QtCore.QThread):
         self._tick_progress(delta_bytes=remaining, delta_items=1)
 
     def _record_copy_error(self, src, dst, exc):
-        if self._cancel:
-            return
         self.error_count += 1
         if len(self.errors) < FILEOP_ERROR_DETAIL_LIMIT:
             self.errors.append(f"{src} -> {dst}: {exc}")
@@ -1603,6 +1614,7 @@ class FileOpWorker(QtCore.QThread):
 
     def _copy_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
         backup = None
+        staging_dir = None
         if existed and action not in {"skip", "copy", "overwrite"}:
             self._record_copy_error(src, dst, "No conflict resolution was selected; destination was left unchanged.")
             self._skip_source_progress(src)
@@ -1613,27 +1625,29 @@ class FileOpWorker(QtCore.QThread):
         if existed and action == "copy":
             dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
             existed = False
-        if existed and action == "overwrite":
-            try:
-                backup = self._backup_destination(dst)
-            except Exception as exc:
-                self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
-                self._skip_source_progress(src)
-                return False
-
-        created_for_undo = self._can_undo_new_destination(existed, action)
-        copied_ok = False
         try:
-            copied_ok = self._copy_to_new_path(src, dst)
-            if copied_ok and not self._cancel:
-                self._discard_backup(backup, dst)
-                if created_for_undo:
-                    self._remember_created_for_undo(dst)
-                return True
+            expected = _source_signature(dst) if existed else None
+            staging_dir = tempfile.mkdtemp(prefix=".__mprn_copy_", dir=os.path.dirname(dst) or os.curdir)
+            staging = os.path.join(staging_dir, "payload")
+            if not self._copy_to_new_path(src, staging) or self._cancel:
+                return False
+            if existed and action == "overwrite":
+                backup = self._backup_destination(dst, expected)
+            _rename_no_replace(staging, dst)
+            self._discard_backup(backup, dst)
+            if self._can_undo_new_destination(existed, action):
+                self._remember_created_for_undo(dst)
+            return True
         except Exception as exc:
             self._record_copy_error(src, dst, exc)
-        self._rollback_destination(dst, backup)
-        return False
+            self._rollback_destination(dst, backup)
+            return False
+        finally:
+            if staging_dir:
+                try:
+                    self._cleanup_path(staging_dir)
+                except Exception as exc:
+                    self._record_copy_error(staging_dir, dst, f"Could not remove staging copy: {exc}")
 
     def _move_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
         if existed and action not in {"skip", "copy", "overwrite"}:
@@ -1647,6 +1661,11 @@ class FileOpWorker(QtCore.QThread):
             dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
             existed = False
 
+        try:
+            expected = _source_signature(dst) if existed else None
+        except Exception as exc:
+            self._record_copy_error(src, dst, exc)
+            return False
         can_undo_move = self._can_undo_new_destination(existed, action)
         src_progress = self._source_progress(src)
         same_filesystem = _same_filesystem(src, os.path.dirname(dst) or self.dst_dir)
@@ -1655,13 +1674,13 @@ class FileOpWorker(QtCore.QThread):
             backup = None
             if existed and action == "overwrite":
                 try:
-                    backup = self._backup_destination(dst)
+                    backup = self._backup_destination(dst, expected)
                 except Exception as exc:
                     self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
                     self._skip_source_progress(src)
                     return False
             try:
-                os.replace(src, dst)
+                _rename_no_replace(src, dst)
                 self._tick_progress(src_progress[0], src_progress[1])
                 self._discard_backup(backup, dst)
                 self._mark_source_success(src)
@@ -1687,7 +1706,8 @@ class FileOpWorker(QtCore.QThread):
 
         # Cross-filesystem moves are deliberately copy-first.  shutil.move() cannot
         # be cancelled and may partially delete the source before reporting an error.
-        staging = self._new_sibling_work_path(dst, "move")
+        staging_dir = tempfile.mkdtemp(prefix=".__mprn_move_", dir=os.path.dirname(dst) or os.curdir)
+        staging = os.path.join(staging_dir, "payload")
         try:
             source_snapshot = _snapshot_move_source(src, lambda: self._cancel)
             copied_ok = self._copy_to_new_path(src, staging)
@@ -1697,7 +1717,7 @@ class FileOpWorker(QtCore.QThread):
 
         if not copied_ok or self._cancel:
             try:
-                self._cleanup_path(staging)
+                self._cleanup_path(staging_dir)
             except Exception as exc:
                 self._record_copy_error(staging, dst, f"Could not remove incomplete staging copy: {exc}")
             return False
@@ -1705,18 +1725,23 @@ class FileOpWorker(QtCore.QThread):
         backup = None
         try:
             if existed and action == "overwrite":
-                backup = self._backup_destination(dst)
-            os.replace(staging, dst)
+                backup = self._backup_destination(dst, expected)
+            _rename_no_replace(staging, dst)
             staging = None
         except Exception as exc:
             self._record_copy_error(src, dst, f"Could not promote the completed staging copy: {exc}")
             try:
                 if staging and os.path.lexists(staging):
-                    self._cleanup_path(staging)
+                    self._cleanup_path(staging_dir)
             except Exception as cleanup_exc:
                 self._record_copy_error(staging, dst, f"Could not remove staging copy: {cleanup_exc}")
             self._rollback_destination(dst, backup)
             return False
+
+        try:
+            os.rmdir(staging_dir)
+        except OSError as exc:
+            self._record_copy_error(staging_dir, dst, f"Could not remove staging directory: {exc}")
 
         # The destination is now a complete copy.  Never roll it back if source
         # cleanup is cancelled or fails: it may be the only complete copy left.

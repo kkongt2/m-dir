@@ -120,7 +120,7 @@ class FileOperationSafetyTests(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(dst)), ["first.txt", "second.txt"])
             self.assertEqual(worker.error_count, 0)
 
-    def test_same_filesystem_move_uses_atomic_replace(self):
+    def test_same_filesystem_move_uses_atomic_rename(self):
         with tempfile.TemporaryDirectory() as root:
             src = os.path.join(root, "source.txt")
             Path(src).write_text("payload", encoding="utf-8")
@@ -146,7 +146,7 @@ class FileOperationSafetyTests(unittest.TestCase):
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source.txt")
             worker = explorer.FileOpWorker("move", [src], dst_dir)
-            real_replace = os.replace
+            real_replace = explorer._rename_no_replace
 
             def replace_with_cross_device_detection(source, destination):
                 if source == src and destination == dst:
@@ -154,7 +154,7 @@ class FileOperationSafetyTests(unittest.TestCase):
                 return real_replace(source, destination)
 
             with mock.patch.object(explorer, "_same_filesystem", return_value=True), mock.patch.object(
-                explorer.os, "replace", side_effect=replace_with_cross_device_detection
+                explorer, "_rename_no_replace", side_effect=replace_with_cross_device_detection
             ):
                 result = worker._move_source_transactional(src, dst, None, False)
 
