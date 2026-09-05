@@ -67,11 +67,12 @@ class AsyncOperationTests(unittest.TestCase):
             import multipane_explorer as e
             app = QtWidgets.QApplication([])
             entered, release = threading.Event(), threading.Event()
+            shown = []
             class Pane(QtCore.QObject):
                 undo_last = e.ExplorerPane.undo_last
                 _on_undo_worker_finished = e.ExplorerPane._on_undo_worker_finished
                 def window(self): return types.SimpleNamespace(winId=lambda: 0)
-                def _show_pane_progress(self, *args, **kwargs): pass
+                def _show_pane_progress(self, *args, **kwargs): shown.append(kwargs.get('busy'))
                 def _set_pane_progress_value(self, *args): pass
                 def _set_pane_progress_status(self, *args): pass
                 def _hide_pane_progress(self): pass
@@ -98,6 +99,7 @@ class AsyncOperationTests(unittest.TestCase):
                 worker = pane._undo_worker
                 try:
                     pump_until(entered.is_set)
+                    pump_until(lambda: False in shown)
                     QtCore.QTimer.singleShot(0, worker.cancel)
                     pump_until(lambda: worker._cancel)
                     release.set()

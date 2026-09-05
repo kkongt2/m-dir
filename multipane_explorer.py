@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 
 
 BASE_FONT_PT = 9.5
@@ -5708,7 +5708,7 @@ class ExplorerPane(QWidget):
 
     def _request_file_op_cancel(self):
         worker = getattr(self, "_file_worker", None)
-        if worker and worker.isRunning():
+        if worker:
             try:
                 worker.cancel()
             except Exception:
@@ -7742,6 +7742,7 @@ class ExplorerPane(QWidget):
         self._undo_worker = worker
         self._file_worker = worker
         self._show_pane_progress("Undo", busy=True)
+        worker.started.connect(lambda: self._show_pane_progress("Undo", busy=False))
         worker.progress.connect(self._set_pane_progress_value)
         worker.status.connect(self._set_pane_progress_status)
         worker.status.connect(self.host.show_operation_status)

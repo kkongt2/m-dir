@@ -64,6 +64,30 @@ class MoveSourceProtectionTests(unittest.TestCase):
 
 
 class UndoRecoveryTests(unittest.TestCase):
+    def test_queued_undo_cancellation_does_not_touch_files(self):
+        action = {"type": "remove_created", "paths": ["untouched"]}
+        worker = explorer.UndoWorker(action)
+        pane = types.SimpleNamespace(_file_worker=worker, btn_op_cancel=mock.Mock(),
+                                     _set_pane_progress_status=mock.Mock())
+        explorer.ExplorerPane._request_file_op_cancel(pane)
+        with mock.patch.object(explorer, "recycle_path_to_trash") as recycle:
+            worker.run()
+        recycle.assert_not_called()
+        self.assertEqual(worker.remaining_action, action)
+        self.assertEqual(worker.failure_message, "Operation cancelled.")
+
+    def test_rename_group_undo_restores_overlapping_names(self):
+        with tempfile.TemporaryDirectory() as root:
+            a, b, c = [Path(root, n) for n in ("a", "b", "c")]
+            a.write_text("a")
+            b.write_text("b")
+            pairs = explorer.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(c))])
+            worker = explorer.UndoWorker({"type": "move_back", "pairs": pairs, "rename_group": True})
+            worker.run()
+            self.assertTrue(worker.completed, worker.failure_message)
+            self.assertEqual((a.read_text(), b.read_text()), ("a", "b"))
+            self.assertFalse(c.exists())
+
     def test_cancelled_copy_registers_completed_items_once(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root, "source.txt")
@@ -140,6 +164,102 @@ class BulkRenameRecoveryTests(unittest.TestCase):
 
 
 class DestinationProtectionTests(unittest.TestCase):
+    def test_successful_overwrite_removes_only_the_previous_destination(self):
+        for operation in ("copy", "move"):
+            for directory in (False, True):
+                with self.subTest(operation=operation, directory=directory), tempfile.TemporaryDirectory() as root:
+                    source, destination = Path(root, "source"), Path(root, "destination")
+                    if directory:
+                        source.mkdir()
+                        destination.mkdir()
+                        (source / "new.txt").write_text("new")
+                        (destination / "old.txt").write_text("old")
+                    else:
+                        source.write_text("new")
+                        destination.write_text("old")
+                    worker = explorer.FileOpWorker(operation, [str(source)], root)
+                    method = getattr(worker, f"_{operation}_source_transactional")
+                    with mock.patch.object(explorer, "_same_filesystem", return_value=False):
+                        self.assertTrue(method(str(source), str(destination), "overwrite", True), worker.errors)
+                    self.assertEqual((destination / "new.txt" if directory else destination).read_text(), "new")
+                    self.assertEqual(source.exists(), operation == "copy")
+                    self.assertFalse(list(Path(root).glob(".__mprn_*")))
+
+    def test_overwrite_cancellation_preserves_both_originals(self):
+        for operation in ("copy", "move"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as root:
+                source = Path(root, "source.txt")
+                source.write_text("source")
+                destination = Path(root, "destination.txt")
+                destination.write_text("destination")
+                worker = explorer.FileOpWorker(operation, [str(source)], root)
+                copy = worker._copy_to_new_path
+
+                def copy_then_cancel(*args):
+                    ok = copy(*args)
+                    worker.cancel()
+                    return ok
+
+                method = getattr(worker, f"_{operation}_source_transactional")
+                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
+                    worker, "_copy_to_new_path", side_effect=copy_then_cancel
+                ):
+                    self.assertFalse(method(str(source), str(destination), "overwrite", True))
+                self.assertEqual(source.read_text(), "source")
+                self.assertEqual(destination.read_text(), "destination")
+                self.assertFalse(list(Path(root).glob(".__mprn_*")))
+
+    def test_destination_change_during_overwrite_is_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root, "source"), Path(root, "destination")
+            source.write_text("source")
+            destination.write_text("original")
+            worker = explorer.FileOpWorker("copy", [str(source)], root)
+            copy = worker._copy_to_new_path
+
+            def copy_then_modify(*args):
+                result = copy(*args)
+                destination.write_text("updated by another program")
+                return result
+
+            with mock.patch.object(worker, "_copy_to_new_path", side_effect=copy_then_modify):
+                self.assertFalse(worker._copy_source_transactional(str(source), str(destination), "overwrite", True))
+            self.assertEqual(destination.read_text(), "updated by another program")
+            self.assertFalse(list(Path(root).glob(".__mprn_*")))
+
+    def test_failed_atomic_move_never_removes_existing_destination(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root, "source"), Path(root, "destination")
+            source.write_text("source")
+            destination.write_text("concurrent file")
+            worker = explorer.FileOpWorker("move", [str(source)], root)
+            self.assertFalse(worker._move_source_transactional(str(source), str(destination), None, False))
+            self.assertEqual(source.read_text(), "source")
+            self.assertEqual(destination.read_text(), "concurrent file")
+
+    def test_overwrite_promotion_failure_restores_original(self):
+        for operation in ("copy", "move"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as root:
+                source, destination = Path(root, "source"), Path(root, "destination")
+                source.write_text("source")
+                destination.write_text("original")
+                worker = explorer.FileOpWorker(operation, [str(source)], root)
+                rename = explorer._rename_no_replace
+
+                def fail_promotion(src, dst):
+                    if Path(src).name == "payload" and dst == str(destination):
+                        raise PermissionError("destination locked")
+                    return rename(src, dst)
+
+                method = getattr(worker, f"_{operation}_source_transactional")
+                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
+                    explorer, "_rename_no_replace", side_effect=fail_promotion
+                ):
+                    self.assertFalse(method(str(source), str(destination), "overwrite", True))
+                self.assertEqual(source.read_text(), "source")
+                self.assertEqual(destination.read_text(), "original")
+                self.assertFalse(list(Path(root).glob(".__mprn_*")))
+
     def test_failed_copy_does_not_remove_unowned_destination(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root, "source.txt")
