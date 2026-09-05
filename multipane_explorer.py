@@ -475,21 +475,6 @@ def human_size(n: int) -> str:
     if i == 0: return f"{int(size)} B"
     return f"{size:.1f} {units[i]}" if size < 10 else f"{size:.0f} {units[i]}"
 
-def unique_dest_path(dst_dir: str, name: str) -> str:
-    base, ext = os.path.splitext(name); candidate = name; i = 1
-    while os.path.exists(os.path.join(dst_dir, candidate)):
-        suffix = " - Copy" if i == 1 else f" - Copy ({i})"
-        candidate = f"{base}{suffix}{ext}"; i += 1
-    return os.path.join(dst_dir, candidate)
-
-def remove_any(path: str):
-    if not os.path.exists(path): return
-    if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
-    else: os.remove(path)
-
-class DeleteCancelled(Exception):
-    pass
-
 def _path_exists_for_delete(path: str) -> bool:
     try:
         return os.path.lexists(path)
@@ -498,18 +483,81 @@ def _path_exists_for_delete(path: str) -> bool:
 
 def _is_junction(path: str) -> bool:
     isjunction = getattr(os.path, "isjunction", None)
-    if not isjunction:
-        return False
-    try:
-        return bool(isjunction(path))
-    except Exception:
-        return False
+    if isjunction:
+        try:
+            if isjunction(path):
+                return True
+        except Exception:
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+            tag = getattr(st, "st_reparse_tag", 0)
+            junction_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+            return bool(tag == junction_tag)
+        except Exception:
+            pass
+    return False
 
 def _is_dir_link(path: str) -> bool:
     try:
         return bool(os.path.islink(path) or _is_junction(path))
     except Exception:
         return False
+
+def _link_target_is_directory(path: str) -> bool:
+    if os.path.isdir(path):
+        return True
+    if os.name == "nt":
+        try:
+            attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+            directory_attr = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+            return bool(attrs & directory_attr)
+        except Exception:
+            pass
+    return False
+
+def _same_filesystem(src: str, dst_parent: str) -> bool:
+    """Return whether an atomic rename can stay on one filesystem."""
+    try:
+        src_dev = os.stat(src, follow_symlinks=False).st_dev
+        dst_dev = os.stat(dst_parent, follow_symlinks=False).st_dev
+        return src_dev == dst_dev
+    except Exception:
+        if os.name == "nt":
+            try:
+                src_drive = os.path.splitdrive(os.path.abspath(src))[0]
+                dst_drive = os.path.splitdrive(os.path.abspath(dst_parent))[0]
+                return bool(src_drive and dst_drive and src_drive.casefold() == dst_drive.casefold())
+            except Exception:
+                pass
+        return False
+
+def _is_cross_device_error(exc: BaseException) -> bool:
+    return (
+        getattr(exc, "errno", None) == errno.EXDEV
+        or getattr(exc, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
+    )
+
+def unique_dest_path(dst_dir: str, name: str) -> str:
+    base, ext = os.path.splitext(name); candidate = name; i = 1
+    while os.path.lexists(os.path.join(dst_dir, candidate)):
+        suffix = " - Copy" if i == 1 else f" - Copy ({i})"
+        candidate = f"{base}{suffix}{ext}"; i += 1
+    return os.path.join(dst_dir, candidate)
+
+def remove_any(path: str):
+    if not _path_exists_for_delete(path):
+        return
+    if os.path.isdir(path) and not _is_dir_link(path):
+        shutil.rmtree(path)
+    elif os.path.isdir(path) and _is_dir_link(path):
+        os.rmdir(path)
+    else:
+        os.remove(path)
+
+class DeleteCancelled(Exception):
+    pass
 
 def _entry_is_junction(entry) -> bool:
     fn = getattr(entry, "is_junction", None)
@@ -904,11 +952,6 @@ def recycle_any_best_effort(
         mark_done(1)
     return deleted, errors
 
-def move_with_collision(src: str, dst_dir: str) -> str:
-    name = os.path.basename(src); dst = os.path.join(dst_dir, name)
-    if os.path.exists(dst): dst = unique_dest_path(dst_dir, name)
-    return shutil.move(src, dst)
-
 def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
     if not paths: return True
     ok = True
@@ -1019,7 +1062,7 @@ class FileOperationManager(QtCore.QObject):
         try:
             if worker.isRunning() and hasattr(worker, "cancel"):
                 worker.cancel()
-                worker.wait(max(0, int(wait_ms)))
+                return bool(worker.wait(max(0, int(wait_ms))))
             return True
         except Exception:
             return False
@@ -1104,6 +1147,30 @@ class FileOperationManager(QtCore.QObject):
         return all_stopped
 
 
+def _cancel_and_wait_child_threads(owner: QtCore.QObject, wait_ms: int) -> bool:
+    """Cancel and audit child QThreads before their QObject owner is destroyed."""
+    workers = list(owner.findChildren(QtCore.QThread))
+    for worker in workers:
+        try:
+            if worker.isRunning() and hasattr(worker, "cancel"):
+                worker.cancel()
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
+    all_stopped = True
+    for worker in workers:
+        try:
+            if not worker.isRunning():
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0 or not worker.wait(remaining_ms):
+                all_stopped = False
+        except Exception:
+            all_stopped = False
+    return all_stopped
+
+
 class FileOpWorker(QtCore.QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
@@ -1151,14 +1218,22 @@ class FileOpWorker(QtCore.QThread):
     def _scan_source_progress(self, path: str) -> tuple[int, int]:
         total_bytes = 0
         total_items = 0
-        if os.path.isdir(path) and not os.path.islink(path):
-            for root, _dirs, files in os.walk(path):
+        if os.path.isdir(path) and not _is_dir_link(path):
+            for root, dirs, files in os.walk(path):
                 if self._cancel:
                     break
                 total_items += 1
                 if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
                     self._progress_estimated = True
                     break
+                traversable_dirs = []
+                for dirname in dirs:
+                    child_dir = os.path.join(root, dirname)
+                    if _is_dir_link(child_dir):
+                        total_items += 1
+                    else:
+                        traversable_dirs.append(dirname)
+                dirs[:] = traversable_dirs
                 for filename in files:
                     if self._cancel:
                         break
@@ -1167,10 +1242,11 @@ class FileOpWorker(QtCore.QThread):
                     if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
                         self._progress_estimated = True
                         break
-                    try:
-                        total_bytes += max(0, int(os.path.getsize(fp)))
-                    except Exception:
-                        pass
+                    if not os.path.islink(fp):
+                        try:
+                            total_bytes += max(0, int(os.path.getsize(fp)))
+                        except Exception:
+                            pass
         else:
             total_items = 1
             try:
@@ -1330,6 +1406,7 @@ class FileOpWorker(QtCore.QThread):
                     copied += len(buf)
                     self._tick_progress(delta_bytes=len(buf))
                 fdst.flush()
+                os.fsync(fdst.fileno())
             try:
                 shutil.copystat(src, temp_path, follow_symlinks=True)
             except Exception:
@@ -1347,6 +1424,31 @@ class FileOpWorker(QtCore.QThread):
             if temp_path and os.path.lexists(temp_path):
                 try:
                     self._cleanup_path(temp_path)
+                except Exception:
+                    pass
+
+    def _copy_link(self, src: str, dst: str) -> bool:
+        temp_path = None
+        try:
+            if _is_junction(src):
+                raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+            target = os.readlink(src)
+            temp_path = self._new_sibling_work_path(dst, "link")
+            os.symlink(target, temp_path, target_is_directory=_link_target_is_directory(src))
+            try:
+                shutil.copystat(src, temp_path, follow_symlinks=False)
+            except Exception:
+                pass
+            if self._cancel:
+                return False
+            os.replace(temp_path, dst)
+            temp_path = None
+            self._tick_progress(delta_items=1)
+            return True
+        finally:
+            if temp_path and os.path.lexists(temp_path):
+                try:
+                    remove_any(temp_path)
                 except Exception:
                     pass
 
@@ -1384,34 +1486,48 @@ class FileOpWorker(QtCore.QThread):
         self.undo_move_pairs.append((final_path, original_path))
 
     def _copy_dir_recursive(self, src_dir, dst_dir):
+        if self._cancel:
+            return False
+        self._tick_progress(delta_items=1)
         ok = True
-        for root, _dirs, files in os.walk(src_dir):
+        try:
+            entries = list(os.scandir(src_dir))
+        except Exception as exc:
+            self._record_copy_error(src_dir, dst_dir, exc)
+            return False
+
+        for entry in entries:
             if self._cancel:
                 return False
-            rel = os.path.relpath(root, src_dir)
-            target_root = os.path.join(dst_dir, "" if rel == "." else rel)
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
             try:
-                os.makedirs(target_root, exist_ok=True)
-                self._tick_progress(delta_items=1)
-            except Exception as exc:
-                self._record_copy_error(root, target_root, exc)
-                self._tick_progress(delta_items=1)
-                for filename in files:
-                    self._skip_file_progress(os.path.join(root, filename))
-                ok = False
-                continue
-            for filename in files:
-                if self._cancel:
-                    return False
-                sfile = os.path.join(root, filename)
-                dfile = os.path.join(target_root, filename)
-                try:
-                    if not self._copy_file(sfile, dfile):
+                if _is_junction(src_path):
+                    raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+                if entry.is_symlink():
+                    if not self._copy_link(src_path, dst_path):
                         return False
-                except Exception as exc:
-                    self._record_copy_error(sfile, dfile, exc)
-                    ok = False
+                elif entry.is_dir(follow_symlinks=False):
+                    os.makedirs(dst_path, exist_ok=False)
+                    if not self._copy_dir_recursive(src_path, dst_path):
+                        ok = False
+                elif not self._copy_file(src_path, dst_path):
+                    return False
+            except Exception as exc:
+                self._record_copy_error(src_path, dst_path, exc)
+                self._skip_source_progress(src_path)
+                ok = False
         return ok
+
+    def _copy_to_new_path(self, src: str, dst: str) -> bool:
+        if _is_junction(src):
+            raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+        if os.path.islink(src):
+            return self._copy_link(src, dst)
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=False)
+            return self._copy_dir_recursive(src, dst)
+        return self._copy_file(src, dst)
 
     def _copy_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
         backup = None
@@ -1436,11 +1552,7 @@ class FileOpWorker(QtCore.QThread):
         created_for_undo = self._can_undo_new_destination(existed, action)
         copied_ok = False
         try:
-            if os.path.isdir(src) and not os.path.islink(src):
-                os.makedirs(dst, exist_ok=False)
-                copied_ok = self._copy_dir_recursive(src, dst)
-            else:
-                copied_ok = self._copy_file(src, dst)
+            copied_ok = self._copy_to_new_path(src, dst)
             if copied_ok and not self._cancel:
                 self._discard_backup(backup, dst)
                 if created_for_undo:
@@ -1463,77 +1575,108 @@ class FileOpWorker(QtCore.QThread):
             dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
             existed = False
 
-        backup = None
-        if existed and action == "overwrite":
-            try:
-                backup = self._backup_destination(dst)
-            except Exception as exc:
-                self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
-                self._skip_source_progress(src)
-                return False
-
         can_undo_move = self._can_undo_new_destination(existed, action)
         src_progress = self._source_progress(src)
+        same_filesystem = _same_filesystem(src, os.path.dirname(dst) or self.dst_dir)
 
-        try:
-            final = shutil.move(src, dst)
-            if not os.path.lexists(src) and os.path.lexists(final):
+        if same_filesystem:
+            backup = None
+            if existed and action == "overwrite":
+                try:
+                    backup = self._backup_destination(dst)
+                except Exception as exc:
+                    self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
+                    self._skip_source_progress(src)
+                    return False
+            try:
+                os.replace(src, dst)
                 self._tick_progress(src_progress[0], src_progress[1])
                 self._discard_backup(backup, dst)
                 self._mark_source_success(src)
                 if can_undo_move:
-                    self._remember_move_for_undo(final, src)
+                    self._remember_move_for_undo(dst, src)
                 return True
-        except Exception:
-            pass
+            except Exception as exc:
+                self._rollback_destination(dst, backup)
+                if not _is_cross_device_error(exc):
+                    self._record_copy_error(src, dst, exc)
+                    self._skip_source_progress(src)
+                    return False
+                self.status.emit("Filesystem boundary detected; switching to safe copy-and-cleanup move ...")
 
-        # Some move implementations may report an error after completing the rename.
-        if not os.path.lexists(src) and os.path.lexists(dst):
-            self._tick_progress(src_progress[0], src_progress[1])
-            self._discard_backup(backup, dst)
-            self._mark_source_success(src)
-            if can_undo_move:
-                self._remember_move_for_undo(dst, src)
-            return True
-
-        # Remove any partial fallback destination before a controlled copy-and-delete move.
-        try:
-            if os.path.lexists(dst):
-                self._cleanup_path(dst)
-        except Exception as exc:
-            self._record_copy_error(src, dst, f"Could not clean partial move destination: {exc}")
-            self._rollback_destination(dst, backup)
+        if _is_junction(src):
+            self._record_copy_error(
+                src,
+                dst,
+                "Moving a Windows directory junction across filesystems is not supported; the junction was left unchanged.",
+            )
             self._skip_source_progress(src)
             return False
 
-        copied_ok = False
+        # Cross-filesystem moves are deliberately copy-first.  shutil.move() cannot
+        # be cancelled and may partially delete the source before reporting an error.
+        staging = self._new_sibling_work_path(dst, "move")
         try:
-            if os.path.isdir(src) and not os.path.islink(src):
-                os.makedirs(dst, exist_ok=False)
-                copied_ok = self._copy_dir_recursive(src, dst)
-            else:
-                copied_ok = self._copy_file(src, dst)
+            copied_ok = self._copy_to_new_path(src, staging)
         except Exception as exc:
-            self._record_copy_error(src, dst, exc)
+            copied_ok = False
+            self._record_copy_error(src, staging, exc)
 
-        if copied_ok and not self._cancel:
+        if not copied_ok or self._cancel:
             try:
-                if os.path.isdir(src) and not os.path.islink(src):
-                    shutil.rmtree(src)
-                else:
-                    os.remove(src)
+                self._cleanup_path(staging)
             except Exception as exc:
-                self._record_copy_error(src, dst, f"Copied, but source removal failed: {exc}")
-                copied_ok = False
+                self._record_copy_error(staging, dst, f"Could not remove incomplete staging copy: {exc}")
+            return False
 
-        if copied_ok and not self._cancel:
-            self._discard_backup(backup, dst)
+        backup = None
+        try:
+            if existed and action == "overwrite":
+                backup = self._backup_destination(dst)
+            os.replace(staging, dst)
+            staging = None
+        except Exception as exc:
+            self._record_copy_error(src, dst, f"Could not promote the completed staging copy: {exc}")
+            try:
+                if staging and os.path.lexists(staging):
+                    self._cleanup_path(staging)
+            except Exception as cleanup_exc:
+                self._record_copy_error(staging, dst, f"Could not remove staging copy: {cleanup_exc}")
+            self._rollback_destination(dst, backup)
+            return False
+
+        # The destination is now a complete copy.  Never roll it back if source
+        # cleanup is cancelled or fails: it may be the only complete copy left.
+        self._discard_backup(backup, dst)
+        if self._cancel:
+            return False
+
+        cleanup_errors = []
+        try:
+            if os.path.isdir(src) and not _is_dir_link(src):
+                _deleted, cleanup_errors = delete_any_permanent_best_effort(
+                    src,
+                    should_cancel=lambda: self._cancel,
+                )
+            else:
+                remove_any(src)
+        except DeleteCancelled:
+            return False
+        except Exception as exc:
+            cleanup_errors = [str(exc)]
+
+        if not _path_exists_for_delete(src):
             self._mark_source_success(src)
             if can_undo_move:
                 self._remember_move_for_undo(dst, src)
             return True
 
-        self._rollback_destination(dst, backup)
+        detail = cleanup_errors[0] if cleanup_errors else "source still exists after cleanup"
+        self._record_copy_error(
+            src,
+            dst,
+            f"Destination copy is complete, but source cleanup was incomplete: {detail}",
+        )
         return False
 
     def run(self):
@@ -1566,7 +1709,7 @@ class FileOpWorker(QtCore.QThread):
                         self._emit_source_done()
                         continue
 
-                if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+                if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
                     self.status.emit(f"Skipped nested destination: {base}")
                     self._skip_source_progress(src)
                     self._emit_source_done()
@@ -5369,10 +5512,11 @@ class ExplorerPane(QWidget):
             return False
 
     def _cancel_search_worker(self):
-
-        self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
+        stopped = self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
         self._search_worker = None
-        self._stop_worker_thread(getattr(self, "_search_stat_worker", None), 80, "search-stat")
+        stopped = self._stop_worker_thread(
+            getattr(self, "_search_stat_worker", None), 80, "search-stat"
+        ) and stopped
         self._search_stat_worker = None
         self._search_pending_items = {}
         self._search_stats_done = set()
@@ -5384,6 +5528,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
         self._set_search_button_state(False)
+        return stopped
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
@@ -5645,24 +5790,27 @@ class ExplorerPane(QWidget):
     def _cancel_icon_worker(self):
         self._icon_queue = []
         self._icon_pending.clear()
-        self._stop_worker_thread(getattr(self, "_icon_worker", None), 150, "shell-icon")
+        stopped = self._stop_worker_thread(getattr(self, "_icon_worker", None), 150, "shell-icon")
         self._icon_worker = None
+        return stopped
 
     def _cancel_fast_stat_worker(self):
-        self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
+        stopped = self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
         self._fast_stat_worker=None
+        return stopped
 
     def _cancel_enum_worker(self, wait_ms: int = 150):
-        self._stop_worker_thread(self._enum_worker, wait_ms, "dir-enum")
+        stopped = self._stop_worker_thread(self._enum_worker, wait_ms, "dir-enum")
         self._enum_worker = None
+        return stopped
 
     def _cancel_file_worker(self, wait_ms: int = 300):
         worker = getattr(self, "_file_worker", None)
         manager = getattr(getattr(self, "host", None), "file_ops", None)
         if worker and manager and manager.owns(worker):
-            manager.cancel_worker(worker, wait_ms)
+            stopped = manager.cancel_worker(worker, wait_ms)
         else:
-            self._stop_worker_thread(worker, wait_ms, "file-op")
+            stopped = self._stop_worker_thread(worker, wait_ms, "file-op")
         self._file_worker = None
         try:
             self._hide_pane_progress()
@@ -5676,6 +5824,7 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
             self._op_progress_dialog = None
+        return stopped
 
     def shutdown(self, wait_ms: int = 300):
         try:
@@ -5698,6 +5847,11 @@ class ExplorerPane(QWidget):
             self._cancel_file_worker(wait_ms)
         except Exception:
             pass
+
+        # References may have been cleared after a timed-out cancellation.  The
+        # workers remain QObject children, so audit every child thread before the
+        # pane is allowed to be destroyed.
+        return _cancel_and_wait_child_threads(self, wait_ms)
 
     def _ensure_visible_stats_timer(self):
         if self._visible_stats_timer is not None:
@@ -6800,7 +6954,7 @@ class ExplorerPane(QWidget):
                 else:
                     skipped_same.append(src)
                 continue
-            if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+            if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
                 blocked_nested.append(src)
                 continue
             valid_srcs.append(src)
@@ -7036,7 +7190,10 @@ class ExplorerPane(QWidget):
                     os.makedirs(target_dir, exist_ok=True)
                 if os.path.exists(src):
                     base=os.path.basename(src); src=unique_dest_path(target_dir, base)
-                shutil.move(dst, src)
+                worker = FileOpWorker("move", [dst], target_dir or os.curdir)
+                if not worker._move_source_transactional(dst, src, None, False):
+                    details = "\n".join(worker.errors) or f"Could not safely move {dst} back to {src}."
+                    raise RuntimeError(details)
         else:
             return False
         return True
@@ -7348,7 +7505,9 @@ class ExplorerPane(QWidget):
         self._render_selection_status(update_statusbar=False, update_label=True, update_free=True)
 
     def closeEvent(self, e):
-        self.shutdown(wait_ms=1000)
+        if not self.shutdown(wait_ms=2000):
+            e.ignore()
+            return
         super().closeEvent(e)
 
 
@@ -7531,7 +7690,7 @@ class MultiExplorer(QMainWindow):
         self._apply_theme("light" if self.theme == "dark" else "dark", persist=True)
 
     def build_panes(self, n:int, start_paths):
-        if getattr(self, "panes", None) and getattr(self, "file_ops", None) and self.file_ops.is_busy():
+        if getattr(self, "panes", None) and getattr(self, "file_ops", None) and self.file_ops.has_pending():
             self.flash_status("Finish or cancel the file operation before rebuilding panes")
             return False
         was_max = self.isMaximized()
@@ -7568,11 +7727,21 @@ class MultiExplorer(QMainWindow):
 
 
         old_panes = list(getattr(self, "panes", []))
+        shutdown_failed = False
         for p in old_panes:
             try:
-                p.shutdown(wait_ms=600)
+                if not p.shutdown(wait_ms=2000):
+                    shutdown_failed = True
             except Exception:
-                pass
+                shutdown_failed = True
+        if shutdown_failed:
+            QMessageBox.warning(
+                self,
+                "Could not change layout safely",
+                "A background folder, search, or icon task has not stopped yet. "
+                "The existing panes were kept to prevent a thread-lifecycle crash.",
+            )
+            return False
 
         vmain = self.centralWidget().layout() if self.centralWidget() else None
         if hasattr(self, "grid") and isinstance(self.grid, QGridLayout):
@@ -8045,11 +8214,22 @@ class MultiExplorer(QMainWindow):
         except Exception:
             paths = []
 
+        pane_shutdown_failed = False
         for pane in list(getattr(self, "panes", [])):
             try:
-                pane.shutdown(wait_ms=1000)
+                if not pane.shutdown(wait_ms=3000):
+                    pane_shutdown_failed = True
             except Exception:
-                pass
+                pane_shutdown_failed = True
+        if pane_shutdown_failed:
+            QMessageBox.warning(
+                self,
+                "Could not exit safely",
+                "A background folder, search, or icon task has not stopped yet. "
+                "The window will remain open to prevent a thread-lifecycle crash.",
+            )
+            e.ignore()
+            return
 
         settings = QSettings(ORG_NAME, APP_NAME)
         settings.setValue("window/geometry", self.saveGeometry())
@@ -8294,12 +8474,25 @@ def _load_start_paths(desired_panes:int, cli_paths):
         paths.append(p if p and os.path.exists(p) else QDir.homePath())
     return paths
 
-def parse_args():
+def _resolve_pane_count(cli_panes, settings=None) -> int:
+    if cli_panes in (4, 6, 8):
+        return int(cli_panes)
+    settings = settings or QSettings(ORG_NAME, APP_NAME)
+    try:
+        saved = int(settings.value("layout/pane_count", 6))
+    except (TypeError, ValueError):
+        saved = 6
+    return saved if saved in (4, 6, 8) else 6
+
+def parse_args(argv=None):
     ap=argparse.ArgumentParser(description="Multi-Pane File Explorer (PyQt5)")
     ap.add_argument("paths", nargs="*", help="Optional start paths per pane")
-    ap.add_argument("--panes", type=int, choices=[4,6,8], default=6, help="Number of panes: 4, 6 or 8")
+    ap.add_argument(
+        "--panes", type=int, choices=[4,6,8], default=None,
+        help="Number of panes: 4, 6 or 8 (default: restore the last layout)",
+    )
     ap.add_argument("--debug", action="store_true", help="Enable debug logs (or set MULTIPANE_DEBUG=1)")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 def main():
     global DEBUG
@@ -8324,8 +8517,9 @@ def main():
     settings=QSettings(ORG_NAME, APP_NAME); theme=settings.value("ui/theme","dark")
     if theme not in VALID_THEMES: theme="dark"
     apply_theme_by_name(app, theme)
-    start_paths=_load_start_paths(args.panes, args.paths)
-    w=MultiExplorer(pane_count=args.panes, start_paths=start_paths, initial_theme=theme); w.show()
+    pane_count=_resolve_pane_count(args.panes, settings)
+    start_paths=_load_start_paths(pane_count, args.paths)
+    w=MultiExplorer(pane_count=pane_count, start_paths=start_paths, initial_theme=theme); w.show()
     sys.exit(app.exec_())
 if __name__=="__main__":
     main()
