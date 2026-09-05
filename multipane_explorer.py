@@ -3482,6 +3482,7 @@ class DirectorySnapshotCache:
         self._cache = {}
         self._flights = {}
         self._generations = {}
+        self._last_invalidations = {}
 
     @staticmethod
     def _root_key(path: str) -> str:
@@ -3529,15 +3530,42 @@ class DirectorySnapshotCache:
                 self._flights.pop(key, None)
             event.set()
 
-    def invalidate(self, path: str):
+    def invalidate(self, path: str, coalesce_s: float = 0.0) -> bool:
         root_key = self._root_key(path)
         with self._lock:
+            now = time.monotonic()
+            last = self._last_invalidations.get(root_key)
+            if coalesce_s > 0 and last is not None and (now - float(last)) < float(coalesce_s):
+                return False
+            self._last_invalidations[root_key] = now
             self._generations[root_key] = int(self._generations.get(root_key, 0)) + 1
             for key in [key for key in self._cache if key[0] == root_key]:
                 self._cache.pop(key, None)
+            return True
 
 
 GLOBAL_DIR_SNAPSHOTS = DirectorySnapshotCache()
+
+
+class FileChangeRefreshState:
+    """Coalesce watcher events while a managed file operation is active."""
+    def __init__(self):
+        self.pending = False
+
+    def note_change(self, operation_pending: bool) -> bool:
+        if operation_pending:
+            self.pending = True
+            return False
+        return True
+
+    def operation_state_changed(self, busy: bool) -> bool:
+        if busy or not self.pending:
+            return False
+        self.pending = False
+        return True
+
+    def reset(self):
+        self.pending = False
 
 
 class DirEnumWorker(QtCore.QThread):
@@ -5185,6 +5213,7 @@ class ExplorerPane(QWidget):
         self._disk_free_cache_ts = 0.0
         self._disk_free_ttl_s = 2.0
         self._fs_change_generation = 0
+        self._fs_refresh_state = FileChangeRefreshState()
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -5493,6 +5522,8 @@ class ExplorerPane(QWidget):
 
     def _connect_signals(self):
         self.host.namedBookmarksChanged.connect(self._on_bookmarks_changed)
+        if getattr(self.host, "file_ops", None):
+            self.host.file_ops.busyChanged.connect(self._on_file_ops_busy_changed)
         if getattr(self.host, "icon_broker", None):
             self.host.icon_broker.iconReady.connect(self._apply_shared_icon, Qt.QueuedConnection)
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
@@ -6976,6 +7007,10 @@ class ExplorerPane(QWidget):
             self._fswatch_debounce.setInterval(600)
             self._fswatch_debounce.timeout.connect(self._apply_fs_change)
 
+        self._fs_refresh_state.reset()
+        if self._fswatch_debounce.isActive():
+            self._fswatch_debounce.stop()
+
 
         try:
             dirs = list(self._fswatch.directories())
@@ -6994,14 +7029,32 @@ class ExplorerPane(QWidget):
 
     def _on_fs_changed(self, _path: str):
         try:
+            manager = getattr(self.host, "file_ops", None)
+            operation_pending = bool(manager and manager.has_pending())
+            if not self._fs_refresh_state.note_change(operation_pending):
+                if self._fswatch_debounce.isActive():
+                    self._fswatch_debounce.stop()
+                return
             if self._fswatch_debounce.isActive():
                 self._fswatch_debounce.stop()
             self._fswatch_debounce.start()
         except Exception:
             pass
 
+    @QtCore.pyqtSlot(bool)
+    def _on_file_ops_busy_changed(self, busy: bool):
+        try:
+            if not self._fs_refresh_state.operation_state_changed(bool(busy)):
+                return
+            if self._fswatch_debounce.isActive():
+                self._fswatch_debounce.stop()
+            self._fswatch_debounce.start(150)
+        except Exception:
+            pass
+
     def _apply_fs_change(self):
         try:
+            self._fs_refresh_state.pending = False
 
             if getattr(self, "_search_mode", False):
                 pattern = self.filter_edit.text().strip()
@@ -7019,7 +7072,9 @@ class ExplorerPane(QWidget):
 
             if getattr(self, "_using_fast", False):
                 self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
-                GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path())
+                # Several panes may watch the same folder and receive the same
+                # native event. Invalidate once, then let all panes join one scan.
+                GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
                 self._use_fast_model(self.current_path())
                 return
 
@@ -7066,6 +7121,12 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
             return
+        self._fs_refresh_state.reset()
+        try:
+            if self._fswatch_debounce.isActive():
+                self._fswatch_debounce.stop()
+        except Exception:
+            pass
         GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path())
         try: self._cancel_fast_stat_worker()
         except Exception: pass

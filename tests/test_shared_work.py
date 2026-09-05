@@ -67,6 +67,19 @@ class SharedWorkTests(unittest.TestCase):
         self.assertEqual(broker._pending, {job[0]})
         start_next.assert_called_once()
 
+    def test_duplicate_watcher_invalidations_are_coalesced(self):
+        cache = explorer.DirectorySnapshotCache(ttl_s=10, max_entries=4)
+        self.assertTrue(cache.invalidate("C:/same", coalesce_s=1.0))
+        self.assertFalse(cache.invalidate("C:/same", coalesce_s=1.0))
+
+    def test_file_changes_wait_for_managed_operations(self):
+        state = explorer.FileChangeRefreshState()
+        self.assertFalse(state.note_change(operation_pending=True))
+        self.assertTrue(state.pending)
+        self.assertFalse(state.operation_state_changed(busy=True))
+        self.assertTrue(state.operation_state_changed(busy=False))
+        self.assertFalse(state.pending)
+
 
 if __name__ == "__main__":
     unittest.main()
