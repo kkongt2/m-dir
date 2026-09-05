@@ -16,12 +16,49 @@ class AsyncOperationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_file_operations_imports_without_explorer_widgets(self):
+        self.run_gui_check('''
+            import sys
+            import file_operations
+            assert 'multipane_explorer' not in sys.modules
+            assert 'PyQt5.QtWidgets' not in sys.modules
+        ''')
+
+    def test_application_starts_and_closes_with_isolated_settings(self):
+        self.run_gui_check('''
+            import tempfile, time
+            from pathlib import Path
+            from PyQt5 import QtCore, QtWidgets
+            import multipane_explorer as e
+            app = QtWidgets.QApplication([])
+            with tempfile.TemporaryDirectory() as root:
+                QtCore.QSettings.setDefaultFormat(QtCore.QSettings.IniFormat)
+                QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope, root)
+                QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.SystemScope, root)
+                data = Path(root, 'data')
+                data.mkdir()
+                (data / 'sample.txt').write_text('sample')
+                window = e.MultiExplorer(pane_count=4, start_paths=[str(data)] * 4)
+                window.show()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    app.processEvents()
+                    if all(p._fast_enum_done for p in window.panes):
+                        break
+                    time.sleep(.005)
+                assert len(window.panes) == 4
+                assert all(p._fast_enum_done for p in window.panes), 'folder listing did not complete'
+                assert window.close(), 'application did not shut down cleanly'
+                app.processEvents()
+        ''')
+
     def test_slow_suggestions_keep_ui_responsive_and_discard_old_results(self):
         self.run_gui_check('''
             import threading, time
             from unittest import mock
             from PyQt5 import QtCore, QtWidgets
             import multipane_explorer as e
+            import file_operations as operations
             app = QtWidgets.QApplication([])
             e.PathBar._shared_recent_paths = []
             entered, release = threading.Event(), threading.Event()
@@ -65,6 +102,7 @@ class AsyncOperationTests(unittest.TestCase):
             from unittest import mock
             from PyQt5 import QtCore, QtWidgets
             import multipane_explorer as e
+            import file_operations as operations
             app = QtWidgets.QApplication([])
             entered, release = threading.Event(), threading.Event()
             shown = []
@@ -87,7 +125,7 @@ class AsyncOperationTests(unittest.TestCase):
                     app.processEvents()
                     time.sleep(.001)
                 assert check(), 'timed out'
-            with tempfile.TemporaryDirectory() as root, mock.patch.object(e, 'recycle_path_to_trash', recycle):
+            with tempfile.TemporaryDirectory() as root, mock.patch.object(operations, 'recycle_path_to_trash', recycle):
                 paths = [str(Path(root, name)) for name in ('first', 'second')]
                 for path in paths: Path(path).write_text('payload')
                 pane = Pane()

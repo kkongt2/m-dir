@@ -18,7 +18,9 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Auto-refresh on file system changes via `QFileSystemWatcher`
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
-- Safe cross-filesystem moves use a completed staging copy before source cleanup; symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
+- Safe cross-filesystem moves use a completed staging copy before source cleanup; source changes detected during copying are preserved and reported, and cleanup never recursively removes newly added entries
+- Copy/move promotion refuses concurrent destination conflicts; if restoring an overwritten destination is blocked, its backup is retained and its recovery path is reported
+- Symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - Per-pane file operation progress bar with cancellation
 - Background undo with progress and cancellation; completed portions of cancelled operations remain undoable, and unfinished undo items can be retried
@@ -68,6 +70,12 @@ python -m unittest discover -s tests -v
 
 The suite includes temporary-directory recovery checks and isolated, offscreen Qt
 checks for responsive autocomplete and cancellable undo.
+
+## Code layout
+- `multipane_explorer.py`: application entry point, panes, models, search, path suggestions, settings, and dialogs
+- `file_operations.py`: file transactions, source validation, rollback, bulk rename, Recycle Bin handling, operation queue, and copy/move/delete/undo workers; no explorer-widget dependency
+- `tests/test_operation_recovery.py`: source changes, destination conflicts, cancellation, rename rollback, and partial undo
+- `tests/test_async_operations.py`: Qt responsiveness and application startup checks in isolated subprocesses
 
 ## Search/Filter Behavior
 - Type a filter and press `Enter` (or click `Search`) to run recursive search from the current folder

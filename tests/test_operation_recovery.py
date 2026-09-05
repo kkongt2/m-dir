@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import multipane_explorer as explorer
+import file_operations as file_ops
 
 
 class MoveSourceProtectionTests(unittest.TestCase):
@@ -18,7 +19,7 @@ class MoveSourceProtectionTests(unittest.TestCase):
                 original.write_text("original")
                 destination = Path(root, "destination")
                 destination.mkdir()
-                worker = explorer.FileOpWorker("move", [str(source)], str(destination))
+                worker = file_ops.FileOpWorker("move", [str(source)], str(destination))
                 copy = worker._copy_to_new_path
 
                 def copy_then_change(src, dst):
@@ -32,7 +33,7 @@ class MoveSourceProtectionTests(unittest.TestCase):
                         original.write_text("replacement data")
                     return ok
 
-                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
+                with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
                     worker, "_copy_to_new_path", side_effect=copy_then_change
                 ):
                     self.assertFalse(worker._move_source_transactional(
@@ -50,15 +51,15 @@ class MoveSourceProtectionTests(unittest.TestCase):
             source.mkdir()
             original = source / "old.txt"
             original.write_text("copied")
-            snapshot = explorer._snapshot_move_source(str(source))
-            remove = explorer.remove_any
+            snapshot = file_ops._snapshot_move_source(str(source))
+            remove = file_ops.remove_any
 
             def remove_then_add(path):
                 remove(path)
                 (source / "new.txt").write_text("keep")
 
-            with mock.patch.object(explorer, "remove_any", side_effect=remove_then_add):
-                errors = explorer._cleanup_copied_source(str(source), snapshot)
+            with mock.patch.object(file_ops, "remove_any", side_effect=remove_then_add):
+                errors = file_ops._cleanup_copied_source(str(source), snapshot)
             self.assertTrue(errors)
             self.assertEqual((source / "new.txt").read_text(), "keep")
 
@@ -66,11 +67,11 @@ class MoveSourceProtectionTests(unittest.TestCase):
 class UndoRecoveryTests(unittest.TestCase):
     def test_queued_undo_cancellation_does_not_touch_files(self):
         action = {"type": "remove_created", "paths": ["untouched"]}
-        worker = explorer.UndoWorker(action)
+        worker = file_ops.UndoWorker(action)
         pane = types.SimpleNamespace(_file_worker=worker, btn_op_cancel=mock.Mock(),
                                      _set_pane_progress_status=mock.Mock())
         explorer.ExplorerPane._request_file_op_cancel(pane)
-        with mock.patch.object(explorer, "recycle_path_to_trash") as recycle:
+        with mock.patch.object(file_ops, "recycle_path_to_trash") as recycle:
             worker.run()
         recycle.assert_not_called()
         self.assertEqual(worker.remaining_action, action)
@@ -81,8 +82,8 @@ class UndoRecoveryTests(unittest.TestCase):
             a, b, c = [Path(root, n) for n in ("a", "b", "c")]
             a.write_text("a")
             b.write_text("b")
-            pairs = explorer.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(c))])
-            worker = explorer.UndoWorker({"type": "move_back", "pairs": pairs, "rename_group": True})
+            pairs = file_ops.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(c))])
+            worker = file_ops.UndoWorker({"type": "move_back", "pairs": pairs, "rename_group": True})
             worker.run()
             self.assertTrue(worker.completed, worker.failure_message)
             self.assertEqual((a.read_text(), b.read_text()), ("a", "b"))
@@ -94,7 +95,7 @@ class UndoRecoveryTests(unittest.TestCase):
             source.write_text("source")
             target = Path(root, "target")
             target.mkdir()
-            worker = explorer.FileOpWorker("copy", [str(source)], str(target))
+            worker = file_ops.FileOpWorker("copy", [str(source)], str(target))
             copy = worker._copy_source_transactional
             errors = []
             worker.error.connect(errors.append)
@@ -119,8 +120,8 @@ class UndoRecoveryTests(unittest.TestCase):
             for path in paths:
                 Path(path).write_text("payload")
             action = {"type": "remove_created", "paths": list(paths)}
-            worker = explorer.UndoWorker(action)
-            with mock.patch.object(explorer, "recycle_path_to_trash", side_effect=lambda p, _h: p == paths[1]):
+            worker = file_ops.UndoWorker(action)
+            with mock.patch.object(file_ops, "recycle_path_to_trash", side_effect=lambda p, _h: p == paths[1]):
                 worker.run()
             self.assertFalse(worker.completed)
             self.assertEqual(worker.remaining_action, {"type": "remove_created", "paths": [paths[0]]})
@@ -137,7 +138,7 @@ class BulkRenameRecoveryTests(unittest.TestCase):
                     p.write_text(p.stem)
                 targets = [paths[1], paths[0] if cycle else paths[2], paths[3]]
                 operations = [(str(src), str(dst)) for src, dst in zip(paths, targets)]
-                rename = explorer._rename_no_replace
+                rename = file_ops._rename_no_replace
                 calls = 0
 
                 def fail_last_commit(src, dst):
@@ -147,9 +148,9 @@ class BulkRenameRecoveryTests(unittest.TestCase):
                         raise OSError("commit failed")
                     rename(src, dst)
 
-                with mock.patch.object(explorer, "_rename_no_replace", side_effect=fail_last_commit):
+                with mock.patch.object(file_ops, "_rename_no_replace", side_effect=fail_last_commit):
                     with self.assertRaisesRegex(OSError, "commit failed"):
-                        explorer.execute_bulk_rename_transaction(operations)
+                        file_ops.execute_bulk_rename_transaction(operations)
                 self.assertEqual({p.name: p.read_text() for p in Path(root).iterdir()},
                                  {f"{i}.txt": str(i) for i in range(1, 4)})
 
@@ -158,7 +159,7 @@ class BulkRenameRecoveryTests(unittest.TestCase):
             a, b = Path(root, "a.txt"), Path(root, "b.txt")
             a.write_text("a")
             b.write_text("b")
-            explorer.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(a))])
+            file_ops.execute_bulk_rename_transaction([(str(a), str(b)), (str(b), str(a))])
             self.assertEqual((a.read_text(), b.read_text()), ("b", "a"))
             self.assertEqual(len(list(Path(root).iterdir())), 2)
 
@@ -177,9 +178,9 @@ class DestinationProtectionTests(unittest.TestCase):
                     else:
                         source.write_text("new")
                         destination.write_text("old")
-                    worker = explorer.FileOpWorker(operation, [str(source)], root)
+                    worker = file_ops.FileOpWorker(operation, [str(source)], root)
                     method = getattr(worker, f"_{operation}_source_transactional")
-                    with mock.patch.object(explorer, "_same_filesystem", return_value=False):
+                    with mock.patch.object(file_ops, "_same_filesystem", return_value=False):
                         self.assertTrue(method(str(source), str(destination), "overwrite", True), worker.errors)
                     self.assertEqual((destination / "new.txt" if directory else destination).read_text(), "new")
                     self.assertEqual(source.exists(), operation == "copy")
@@ -192,7 +193,7 @@ class DestinationProtectionTests(unittest.TestCase):
                 source.write_text("source")
                 destination = Path(root, "destination.txt")
                 destination.write_text("destination")
-                worker = explorer.FileOpWorker(operation, [str(source)], root)
+                worker = file_ops.FileOpWorker(operation, [str(source)], root)
                 copy = worker._copy_to_new_path
 
                 def copy_then_cancel(*args):
@@ -201,7 +202,7 @@ class DestinationProtectionTests(unittest.TestCase):
                     return ok
 
                 method = getattr(worker, f"_{operation}_source_transactional")
-                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
+                with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
                     worker, "_copy_to_new_path", side_effect=copy_then_cancel
                 ):
                     self.assertFalse(method(str(source), str(destination), "overwrite", True))
@@ -214,7 +215,7 @@ class DestinationProtectionTests(unittest.TestCase):
             source, destination = Path(root, "source"), Path(root, "destination")
             source.write_text("source")
             destination.write_text("original")
-            worker = explorer.FileOpWorker("copy", [str(source)], root)
+            worker = file_ops.FileOpWorker("copy", [str(source)], root)
             copy = worker._copy_to_new_path
 
             def copy_then_modify(*args):
@@ -232,7 +233,7 @@ class DestinationProtectionTests(unittest.TestCase):
             source, destination = Path(root, "source"), Path(root, "destination")
             source.write_text("source")
             destination.write_text("concurrent file")
-            worker = explorer.FileOpWorker("move", [str(source)], root)
+            worker = file_ops.FileOpWorker("move", [str(source)], root)
             self.assertFalse(worker._move_source_transactional(str(source), str(destination), None, False))
             self.assertEqual(source.read_text(), "source")
             self.assertEqual(destination.read_text(), "concurrent file")
@@ -243,8 +244,8 @@ class DestinationProtectionTests(unittest.TestCase):
                 source, destination = Path(root, "source"), Path(root, "destination")
                 source.write_text("source")
                 destination.write_text("original")
-                worker = explorer.FileOpWorker(operation, [str(source)], root)
-                rename = explorer._rename_no_replace
+                worker = file_ops.FileOpWorker(operation, [str(source)], root)
+                rename = file_ops._rename_no_replace
 
                 def fail_promotion(src, dst):
                     if Path(src).name == "payload" and dst == str(destination):
@@ -252,8 +253,8 @@ class DestinationProtectionTests(unittest.TestCase):
                     return rename(src, dst)
 
                 method = getattr(worker, f"_{operation}_source_transactional")
-                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
-                    explorer, "_rename_no_replace", side_effect=fail_promotion
+                with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
+                    file_ops, "_rename_no_replace", side_effect=fail_promotion
                 ):
                     self.assertFalse(method(str(source), str(destination), "overwrite", True))
                 self.assertEqual(source.read_text(), "source")
@@ -266,7 +267,7 @@ class DestinationProtectionTests(unittest.TestCase):
             source.write_text("source")
             destination = Path(root, "destination.txt")
             destination.write_text("other process")
-            worker = explorer.FileOpWorker("copy", [str(source)], root)
+            worker = file_ops.FileOpWorker("copy", [str(source)], root)
             with mock.patch.object(worker, "_copy_to_new_path", side_effect=OSError("copy failed")):
                 self.assertFalse(worker._copy_source_transactional(str(source), str(destination), None, False))
             self.assertEqual(destination.read_text(), "other process")
@@ -277,7 +278,7 @@ class DestinationProtectionTests(unittest.TestCase):
                 source = Path(root, "source.txt")
                 source.write_text("source")
                 destination = Path(root, "destination.txt")
-                worker = explorer.FileOpWorker(operation, [str(source)], root)
+                worker = file_ops.FileOpWorker(operation, [str(source)], root)
                 copy = worker._copy_to_new_path
 
                 def copy_then_create(src, dst):
@@ -286,7 +287,7 @@ class DestinationProtectionTests(unittest.TestCase):
                     return result
 
                 method = getattr(worker, f"_{operation}_source_transactional")
-                with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
+                with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
                     worker, "_copy_to_new_path", side_effect=copy_then_create
                 ):
                     self.assertFalse(method(str(source), str(destination), None, False))
@@ -300,7 +301,7 @@ class DestinationProtectionTests(unittest.TestCase):
             source.write_text("source")
             destination = Path(root, "destination.txt")
             destination.write_text("original")
-            worker = explorer.FileOpWorker("copy", [str(source)], root)
+            worker = file_ops.FileOpWorker("copy", [str(source)], root)
             backup = worker._backup_destination
 
             def backup_then_create(*args):
