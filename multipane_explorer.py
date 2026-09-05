@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.7.0"
 
 
 BASE_FONT_PT = 9.5
@@ -93,6 +93,7 @@ BOOKMARK_LIMIT = 30
 QUICK_BOOKMARK_MIN_W = 42
 QUICK_BOOKMARK_MAX_W = 78
 QUICK_BOOKMARK_MORE_W = 30
+BOOKMARK_TOOLBAR_ROWS = 2
 VALID_THEMES = ("dark", "light")
 SIZE_COL_WIDTH = 60
 DATE_COL_WIDTH = 122
@@ -1929,6 +1930,24 @@ def _add_dialog_button_box(layout, parent, buttons, accept_slot, reject_slot=Non
 def _empty_bookmark_item():
     return {"enabled": False, "name": "", "path": ""}
 
+def _two_row_bookmark_fit(widths, available: int, spacing: int, more_width: int):
+    widths = list(widths or [])
+    total = len(widths)
+
+    def required_width(values):
+        return sum(values) + max(0, len(values) - 1) * spacing
+
+    for visible_count in range(total, -1, -1):
+        top_count = (visible_count + 1) // 2
+        top_width = required_width(widths[:top_count])
+        bottom_widths = widths[top_count:visible_count]
+        bottom_width = required_width(bottom_widths)
+        if visible_count < total:
+            bottom_width += (spacing if bottom_widths else 0) + more_width
+        if top_width <= available and bottom_width <= available:
+            return visible_count, top_count
+    return 0, 0
+
 def _apply_palette_colors(widget, colors):
     pal = widget.palette()
     for role, rgb in colors.items(): pal.setColor(role, QColor(*rgb))
@@ -2121,7 +2140,7 @@ def icon_star(checked: bool, theme: str):
         else:
             p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor(200,200,210) if theme=="dark" else QColor(90,90,100), 1.8))
         p.drawPolygon(poly)
-    return _make_icon(20, 20, paint)
+    return _make_icon(40, 40, paint)
 
 def icon_edit(theme: str):
     def paint(p: QPainter, w, h):
@@ -5240,13 +5259,28 @@ class ExplorerPane(QWidget):
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
-        self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
-        self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
-        self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
+        self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder")
+        base_star_width = max(UI_H, self.btn_star.sizeHint().width())
+        self.btn_star.setFixedSize(base_star_width * 2, UI_H * 2)
+        self.btn_star.setIconSize(QSize(36, 36))
+        self._bm_btn_container=QWidget(self)
+        self._bm_btn_layout=QVBoxLayout(self._bm_btn_container)
+        self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(max(0, ROW_SPACING-2))
+        self._bm_btn_row_widgets = []
+        self._bm_btn_row_layouts = []
+        for _ in range(BOOKMARK_TOOLBAR_ROWS):
+            row_widget = QWidget(self._bm_btn_container)
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0,0,0,0)
+            row_layout.setSpacing(ROW_SPACING)
+            self._bm_btn_layout.addWidget(row_widget)
+            self._bm_btn_row_widgets.append(row_widget)
+            self._bm_btn_row_layouts.append(row_layout)
         self._quick_bm_buttons = []
         self._quick_bm_more_btn = QToolButton(self._bm_btn_container)
         self._quick_bm_more_btn.setObjectName("quickBookmarkMoreBtn")
         self._quick_bm_more_btn.setText("...")
+        self._quick_bm_more_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._quick_bm_more_btn.setToolTip("More bookmarks")
         self._quick_bm_more_btn.setFixedHeight(UI_H)
         self._quick_bm_more_btn.setFixedWidth(QUICK_BOOKMARK_MORE_W)
@@ -5266,18 +5300,21 @@ class ExplorerPane(QWidget):
 
         self.btn_refresh=QToolButton(self); self.btn_refresh.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload)); self.btn_refresh.setToolTip("Refresh"); self.btn_refresh.setFixedHeight(UI_H)
 
+        tool_grid_widget = QWidget(self)
+        tool_grid = QGridLayout(tool_grid_widget)
+        tool_grid.setContentsMargins(0,0,0,0)
+        tool_grid.setHorizontalSpacing(max(0, ROW_SPACING-2))
+        tool_grid.setVerticalSpacing(max(0, ROW_SPACING-2))
+
         row_toolbar=QHBoxLayout()
         row_toolbar.setContentsMargins(0,0,0,0)
 
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
-        row_toolbar.addWidget(self.btn_star)
+        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignVCenter)
         row_toolbar.addWidget(self._bm_btn_container,1)
-        row_toolbar.addWidget(self.btn_cmd)
-        row_toolbar.addWidget(self.btn_explorer)
-        row_toolbar.addWidget(self.btn_up)
-        row_toolbar.addWidget(self.btn_new)
-        row_toolbar.addWidget(self.btn_new_file)
-        row_toolbar.addWidget(self.btn_refresh)
+        for index, button in enumerate((self.btn_cmd, self.btn_explorer, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh)):
+            tool_grid.addWidget(button, index // 3, index % 3)
+        row_toolbar.addWidget(tool_grid_widget, 0, Qt.AlignVCenter)
         self._row_toolbar=row_toolbar
 
 
@@ -6622,15 +6659,19 @@ class ExplorerPane(QWidget):
         more_btn.setToolTip(f"More bookmarks ({len(overflow_buttons)})")
 
     def _rebuild_quick_bookmark_buttons(self):
-        while self._bm_btn_layout.count():
-            it=self._bm_btn_layout.takeAt(0); w=it.widget()
-            if w and w is not getattr(self, "_quick_bm_more_btn", None): w.deleteLater()
+        for row_layout in self._bm_btn_row_layouts:
+            while row_layout.count():
+                row_layout.takeAt(0)
+        for button in getattr(self, "_quick_bm_buttons", []):
+            button.hide()
+            button.deleteLater()
         self._quick_bm_buttons = []
         for it in self.host.get_enabled_bookmarks():
             name=it.get("name") or _derive_name_from_path(it.get("path","")); p=it.get("path","")
             btn=QToolButton(self._bm_btn_container)
             btn.setObjectName("quickBookmarkBtn")
             btn.setText(str(name))
+            btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
             btn.setProperty("fullText", str(name))
             btn.setProperty("bookmarkPath", str(p))
             btn.setToolTip(p)
@@ -6638,10 +6679,7 @@ class ExplorerPane(QWidget):
             btn.setFixedWidth(self._quick_bookmark_button_width(str(name)))
             btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _=False, path=p: self.set_path(path, push_history=True))
-            self._bm_btn_layout.addWidget(btn)
             self._quick_bm_buttons.append(btn)
-        self._bm_btn_layout.addWidget(self._quick_bm_more_btn)
-        self._bm_btn_layout.addStretch(1)
         QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
 
     def _refresh_quick_bookmark_button_texts(self):
@@ -6650,27 +6688,25 @@ class ExplorerPane(QWidget):
             more_btn = getattr(self, "_quick_bm_more_btn", None)
             if more_btn is None:
                 return
+            row_layouts = list(getattr(self, "_bm_btn_row_layouts", []))
+            if len(row_layouts) != BOOKMARK_TOOLBAR_ROWS:
+                return
+            for row_layout in row_layouts:
+                while row_layout.count():
+                    row_layout.takeAt(0)
             if not buttons:
                 more_btn.hide()
                 self._update_quick_bookmark_more_menu([])
+                for row_layout in row_layouts:
+                    row_layout.addStretch(1)
                 return
 
             available = max(0, int(self._bm_btn_container.contentsRect().width()))
-            spacing = max(0, int(self._bm_btn_layout.spacing()))
+            spacing = max(0, int(row_layouts[0].spacing()))
             widths = [self._quick_bookmark_button_width(str(btn.property("fullText") or "")) for btn in buttons]
-
-            visible_count = 0
-            used = 0
-            total = len(buttons)
-            for i, w in enumerate(widths):
-                spacing_before = spacing if visible_count else 0
-                remaining_after = total - (i + 1)
-                more_reserve = (spacing + QUICK_BOOKMARK_MORE_W) if remaining_after else 0
-                if used + spacing_before + w + more_reserve <= available:
-                    used += spacing_before + w
-                    visible_count += 1
-                else:
-                    break
+            visible_count, top_count = _two_row_bookmark_fit(
+                widths, available, spacing, QUICK_BOOKMARK_MORE_W
+            )
 
             overflow_buttons = buttons[visible_count:]
             for i, btn in enumerate(buttons):
@@ -6684,6 +6720,11 @@ class ExplorerPane(QWidget):
                 elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, max(24, btn_w - 12))
                 if btn.text() != elided:
                     btn.setText(elided)
+                row_layouts[0 if i < top_count else 1].addWidget(btn)
+            if overflow_buttons:
+                row_layouts[1].addWidget(more_btn)
+            for row_layout in row_layouts:
+                row_layout.addStretch(1)
             self._update_quick_bookmark_more_menu(overflow_buttons)
             more_btn.setVisible(bool(overflow_buttons))
         except Exception:
@@ -8712,31 +8753,94 @@ class SessionManagerDialog(QDialog):
 
 
 
+class BookmarkOrderTable(QTableWidget):
+    rowMoveRequested = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_source_row = -1
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.pos())
+        self._drag_source_row = index.row() if index.isValid() and index.column() == 0 else -1
+        super().mousePressEvent(event)
+
+    def startDrag(self, supported_actions):
+        if self._drag_source_row < 0:
+            return
+        super().startDrag(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        source = self._drag_source_row
+        if event.source() is not self or source < 0:
+            super().dropEvent(event)
+            return
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            target = index.row()
+            if event.pos().y() > self.visualRect(index).center().y():
+                target += 1
+        else:
+            target = self.rowCount()
+        if source < target:
+            target -= 1
+        target = max(0, min(target, self.rowCount() - 1))
+        if source != target:
+            self.rowMoveRequested.emit(source, target)
+        self._drag_source_row = -1
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+
 class BookmarkEditDialog(QDialog):
     def __init__(self, parent=None, items=None):
         super().__init__(parent)
         self.setWindowTitle(f"Edit Bookmarks (max {BOOKMARK_LIMIT})")
         self.resize(760, 520)
+        guide = QLabel("Drag the handle in the Order column to rearrange bookmarks.", self)
         self.table = _setup_readonly_table(
-            QTableWidget(self),
-            ["Enabled", "Name", "Path"],
-            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
+            BookmarkOrderTable(self),
+            ["Order", "Enabled", "Name", "Path"],
+            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
         )
         self.table.setRowCount(BOOKMARK_LIMIT)
         self._rows = []
-        lay = QVBoxLayout(self); lay.addWidget(self.table, 1)
+        lay = QVBoxLayout(self); lay.addWidget(guide); lay.addWidget(self.table, 1)
         _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         items = list(items or [])
         for i in range(BOOKMARK_LIMIT):
             it = items[i] if i < len(items) else _empty_bookmark_item()
             self._add_row(i, it)
+        self.table.rowMoveRequested.connect(self._move_row)
 
     def _add_row(self, row: int, data: dict):
+        handle = QTableWidgetItem("☰")
+        handle.setTextAlignment(Qt.AlignCenter)
+        handle.setToolTip("Drag to change bookmark order")
+        handle.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled)
+        self.table.setItem(row, 0, handle)
         chk = QCheckBox(self.table); chk.setChecked(bool(data.get("enabled", False)))
-        self.table.setCellWidget(row, 0, chk)
+        self.table.setCellWidget(row, 1, chk)
         name_edit = QLineEdit(self.table); name_edit.setText(str(data.get("name", "")))
         name_edit.setPlaceholderText("Bookmark name"); name_edit.setClearButtonEnabled(True); name_edit.setFixedHeight(UI_H)
-        self.table.setCellWidget(row, 1, name_edit)
+        self.table.setCellWidget(row, 2, name_edit)
         path_wrap = QWidget(self.table); h = QHBoxLayout(path_wrap); h.setContentsMargins(0,0,0,0); h.setSpacing(ROW_SPACING)
         path_edit = QLineEdit(path_wrap); path_edit.setText(str(data.get("path", ""))); path_edit.setPlaceholderText("Folder path"); path_edit.setClearButtonEnabled(True); path_edit.setFixedHeight(UI_H)
         btn = QToolButton(path_wrap); btn.setText("..."); btn.setFixedHeight(UI_H)
@@ -8746,16 +8850,29 @@ class BookmarkEditDialog(QDialog):
             if d: path_edit.setText(d)
         btn.clicked.connect(browse)
         h.addWidget(path_edit, 1); h.addWidget(btn, 0)
-        self.table.setCellWidget(row, 2, path_wrap)
+        self.table.setCellWidget(row, 3, path_wrap)
         self._rows.append((chk, name_edit, path_edit))
+
+    def _all_values(self) -> list:
+        return [
+            {"enabled": chk.isChecked(), "name": name_edit.text().strip(), "path": path_edit.text().strip()}
+            for chk, name_edit, path_edit in self._rows
+        ]
 
     def values(self) -> list:
         return [
-            {"enabled": enabled, "name": name, "path": path}
-            for chk, name_edit, path_edit in self._rows
-            for enabled, name, path in [(chk.isChecked(), name_edit.text().strip(), path_edit.text().strip())]
-            if name or path or enabled
+            item for item in self._all_values()
+            if item["name"] or item["path"] or item["enabled"]
         ]
+
+    def _move_row(self, source: int, target: int):
+        items = self._all_values()
+        if not (0 <= source < len(items) and 0 <= target < len(items)):
+            return
+        item = items.pop(source)
+        items.insert(target, item)
+        self.set_items(items)
+        self.table.setCurrentCell(target, 0)
 
     def set_items(self, items: list):
         items = list(items or [])
