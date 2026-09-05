@@ -1,5 +1,6 @@
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -60,6 +61,50 @@ class MoveSourceProtectionTests(unittest.TestCase):
                 errors = explorer._cleanup_copied_source(str(source), snapshot)
             self.assertTrue(errors)
             self.assertEqual((source / "new.txt").read_text(), "keep")
+
+
+class UndoRecoveryTests(unittest.TestCase):
+    def test_cancelled_copy_registers_completed_items_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "source.txt")
+            source.write_text("source")
+            target = Path(root, "target")
+            target.mkdir()
+            worker = explorer.FileOpWorker("copy", [str(source)], str(target))
+            copy = worker._copy_source_transactional
+            errors = []
+            worker.error.connect(errors.append)
+
+            def copy_then_cancel(*args):
+                ok = copy(*args)
+                worker.cancel()
+                return ok
+
+            with mock.patch.object(worker, "_copy_source_transactional", side_effect=copy_then_cancel):
+                worker.run()
+            pane = types.SimpleNamespace(_undo_stack=[])
+            explorer.ExplorerPane._push_file_op_undo(pane, worker, "copy")
+            explorer.ExplorerPane._push_file_op_undo(pane, worker, "copy")
+            self.assertEqual(errors, ["Operation cancelled."])
+            self.assertEqual(len(pane._undo_stack), 1)
+            self.assertEqual(pane._undo_stack[0]["paths"], [str(target / source.name)])
+
+    def test_failed_undo_retains_only_unfinished_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = [str(Path(root, name)) for name in ("fail.txt", "ok.txt")]
+            for path in paths:
+                Path(path).write_text("payload")
+            action = {"type": "remove_created", "paths": list(paths)}
+            pane = types.SimpleNamespace(_undo_stack=[action], host=mock.Mock(), refresh=mock.Mock(),
+                                         window=lambda: types.SimpleNamespace(winId=lambda: 0))
+            pane._undo_remove_created = lambda items: explorer.ExplorerPane._undo_remove_created(pane, items)
+            pane._apply_undo_action = lambda act: explorer.ExplorerPane._apply_undo_action(pane, act)
+            with mock.patch.object(explorer, "recycle_path_to_trash", side_effect=lambda p, _h: p == paths[1]), mock.patch.object(
+                explorer.QMessageBox, "critical"
+            ):
+                explorer.ExplorerPane.undo_last(pane)
+            self.assertEqual(pane._undo_stack, [{"type": "remove_created", "paths": [paths[0]]}])
+            pane.refresh.assert_called_once()
 
 
 class BulkRenameRecoveryTests(unittest.TestCase):

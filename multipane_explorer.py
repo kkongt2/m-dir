@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.6"
+APP_VERSION = "2.7.7"
 
 
 BASE_FONT_PT = 9.5
@@ -7277,6 +7277,8 @@ class ExplorerPane(QWidget):
         )
 
     def _push_file_op_undo(self, worker, op: str):
+        if getattr(worker, "_undo_registered", False):
+            return
         remove_paths = list(getattr(worker, "undo_remove_paths", []) or [])
         move_pairs = list(getattr(worker, "undo_move_pairs", []) or [])
         actions = []
@@ -7289,6 +7291,7 @@ class ExplorerPane(QWidget):
         act = actions[0] if len(actions) == 1 else {"type": "compound", "actions": actions}
         act["label"] = f"Undo {op}"
         self._undo_stack.append(act)
+        worker._undo_registered = True
 
     def _sync_move_clipboard(self, worker):
         expected = getattr(worker, "clipboard_payload", None)
@@ -7311,6 +7314,7 @@ class ExplorerPane(QWidget):
     def _on_file_worker_error(self, msg):
         worker = self.sender()
         if isinstance(worker, FileOpWorker):
+            self._push_file_op_undo(worker, getattr(worker, "_ui_op", worker.op))
             self._sync_move_clipboard(worker)
         op = getattr(worker, "_ui_op", "operation")
         if msg == "Operation cancelled.":
@@ -7348,6 +7352,8 @@ class ExplorerPane(QWidget):
     @QtCore.pyqtSlot()
     def _on_file_worker_thread_finished(self):
         worker = self.sender()
+        if isinstance(worker, FileOpWorker):
+            self._push_file_op_undo(worker, getattr(worker, "_ui_op", worker.op))
         if getattr(self, "_file_worker", None) is worker:
             self._file_worker = None
         self._hide_pane_progress()
@@ -7580,10 +7586,13 @@ class ExplorerPane(QWidget):
         failed = []
         hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
         for p in reversed(list(paths or [])):
-            if not p or not os.path.exists(p):
+            if not p or not os.path.lexists(p):
+                paths.remove(p)
                 continue
             if not recycle_path_to_trash(p, hwnd):
                 failed.append(p)
+            else:
+                paths.remove(p)
         if failed:
             sample = "\n".join(failed[:8])
             more = "\n..." if len(failed) > 8 else ""
@@ -7602,7 +7611,9 @@ class ExplorerPane(QWidget):
                 QMessageBox.information(self,"Undo New Folder","Folder is not empty; cannot undo safely.")
                 return False
         elif t=="delete":
-            for p in act.get("paths",[]): remove_any(p)
+            for p in list(act.get("paths", [])):
+                remove_any(p)
+                act["paths"].remove(p)
         elif t=="remove_created":
             return self._undo_remove_created(act.get("paths", []))
         elif t=="move_back":
@@ -7616,23 +7627,28 @@ class ExplorerPane(QWidget):
                 if not worker._move_source_transactional(dst, src, None, False):
                     details = "\n".join(worker.errors) or f"Could not safely move {dst} back to {src}."
                     raise RuntimeError(details)
+                act["pairs"].pop()
         else:
             return False
         return True
 
     def undo_last(self):
         if not self._undo_stack: self.host.flash_status("Nothing to undo"); return
-        act=self._undo_stack.pop()
+        act=self._undo_stack[-1]
         try:
             if act.get("type") == "compound":
                 for sub in reversed(list(act.get("actions", []))):
                     if not self._apply_undo_action(sub):
                         return
+                    act["actions"].pop()
             elif not self._apply_undo_action(act):
                 return
-            self.refresh(); self.host.flash_status("Undone")
+            self._undo_stack.pop()
+            self.host.flash_status("Undone")
         except Exception as e:
             QMessageBox.critical(self,"Undo failed",str(e))
+        finally:
+            self.refresh()
 
 
     def _dispose_search_models(self, model, proxy):
