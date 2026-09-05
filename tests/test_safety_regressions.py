@@ -54,6 +54,29 @@ class FileOperationSafetyTests(unittest.TestCase):
 
             fsync.assert_called_once()
 
+    def test_delete_worker_does_not_prescan_descendants(self):
+        paths = [r"C:\first", r"C:\second"]
+        worker = explorer.DeleteWorker(paths, permanent=False)
+        completed = []
+        worker.finished_ok.connect(lambda: completed.append(True))
+
+        with mock.patch.object(
+            explorer,
+            "_scan_delete_item_counts",
+            side_effect=AssertionError("delete progress must not walk descendants first"),
+        ), mock.patch.object(
+            explorer,
+            "recycle_any_best_effort",
+            return_value=(1, []),
+        ) as recycle:
+            worker.run()
+
+        self.assertEqual(recycle.call_count, 2)
+        self.assertEqual(worker._total, 2)
+        self.assertEqual(worker._done, 2)
+        self.assertEqual(worker.deleted_count, 2)
+        self.assertEqual(completed, [True])
+
     def test_cross_filesystem_cleanup_failure_keeps_complete_destination(self):
         with tempfile.TemporaryDirectory() as root:
             src = self._make_source_tree(root)

@@ -1766,7 +1766,6 @@ class DeleteWorker(QtCore.QThread):
         self._done = 0
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
-        self._subtree_item_counts: dict[str, int] = {}
         self.deleted_count = 0
         self.errors = []
 
@@ -1797,38 +1796,25 @@ class DeleteWorker(QtCore.QThread):
         self._last_progress_emit_ts = now
         self.progress.emit(pct)
 
-    def _scan_total_items(self):
-        self._total = 0
+    def _prepare_progress(self):
+        # Counting every descendant first doubles directory I/O and can delay a
+        # Recycle Bin rename by minutes.  Progress is therefore based on selected
+        # top-level paths while the delete helpers report the exact deleted count.
+        self._total = max(1, len(self.paths))
         self._done = 0
-        self._subtree_item_counts = {}
-        for idx, path in enumerate(self.paths, start=1):
-            if self._cancel:
-                raise DeleteCancelled()
-            name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
-            self.status.emit(f"Scanning {idx}/{len(self.paths)}: {name}")
-            count, subtree_counts = _scan_delete_item_counts(
-                path,
-                should_cancel=lambda: self._cancel,
-            )
-            self._total += count
-            self._subtree_item_counts.update(subtree_counts)
-        self._total = max(1, self._total)
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
         self._emit_progress()
 
-    def _item_count_of(self, path: str) -> int:
-        return max(1, int(self._subtree_item_counts.get(_path_key(path), 1)))
-
-    def _on_items_done(self, units: int):
-        self._done += max(0, int(units or 0))
+    def _on_path_done(self):
+        self._done += 1
         self._emit_progress()
 
     def run(self):
         coinit = False
         try:
-            self.status.emit("Scanning items for delete ...")
-            self._scan_total_items()
+            self.status.emit("Preparing delete ...")
+            self._prepare_progress()
             if self._cancel:
                 self.error.emit("Operation cancelled.")
                 return
@@ -1861,25 +1847,22 @@ class DeleteWorker(QtCore.QThread):
                         deleted, errors = delete_any_permanent_best_effort(
                             path,
                             should_cancel=lambda: self._cancel,
-                            on_items_done=self._on_items_done,
-                            item_count_of=self._item_count_of,
                         )
                     else:
                         deleted, errors = recycle_any_best_effort(
                             path,
                             hwnd=self.hwnd,
                             should_cancel=lambda: self._cancel,
-                            on_items_done=self._on_items_done,
-                            item_count_of=self._item_count_of,
                         )
                     self.deleted_count += deleted
                     self.errors.extend(errors)
+                    self._on_path_done()
                 except DeleteCancelled:
                     self.error.emit("Operation cancelled.")
                     return
                 except Exception as e:
                     self.errors.append(f"{path}: {e}")
-                    self._on_items_done(self._item_count_of(path))
+                    self._on_path_done()
 
             self._done = max(self._done, self._total)
             self._emit_progress(force=True)
