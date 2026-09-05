@@ -2791,6 +2791,70 @@ SEARCH_ICON_READY_ROLE = Qt.UserRole + 101
 NAME_FOLD_ROLE = Qt.UserRole + 102
 ICON_KEY_ROLE = Qt.UserRole + 103
 
+
+def _record_sort_key(rec: dict, column: int):
+    """Build one native-Python sort key per row instead of per comparison."""
+    name_key = str(rec.get("name_l") or rec.get("name", "")).casefold()
+    if column == 1:
+        try:
+            primary = int(rec.get("size") or 0)
+        except Exception:
+            primary = 0
+    elif column == 2:
+        primary = str(rec.get("ext", "")).casefold()
+    elif column == 3:
+        try:
+            primary = float(rec.get("mtime") or 0.0)
+        except Exception:
+            primary = 0.0
+    elif column == 4:
+        primary = str(rec.get("folder", "")).casefold()
+    else:
+        primary = name_key
+    return primary, name_key
+
+
+def _sorted_record_rows(rows: list[dict], column: int, order) -> list[dict]:
+    """Return rows in folders-first order with the requested direction per group."""
+    reverse = order == Qt.DescendingOrder
+    dirs = [rec for rec in rows if bool(rec.get("is_dir"))]
+    files = [rec for rec in rows if not bool(rec.get("is_dir"))]
+    dirs.sort(key=lambda rec: _record_sort_key(rec, column), reverse=reverse)
+    files.sort(key=lambda rec: _record_sort_key(rec, column), reverse=reverse)
+    return dirs + files
+
+
+class RecordSortProxy(QIdentityProxyModel):
+    """Identity proxy that delegates sorting to list-backed source models.
+
+    QSortFilterProxyModel calls Python lessThan() O(N log N) times.  The backing
+    models can sort their record list from one Python call, which keeps a 50k-row
+    sort comfortably interactive.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dynamic_sort = False
+
+    def setDynamicSortFilter(self, enabled: bool):
+        self._dynamic_sort = bool(enabled)
+
+    def dynamicSortFilter(self) -> bool:
+        return self._dynamic_sort
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        src = self.sourceModel()
+        sorter = getattr(src, "sort_records", None)
+        if callable(sorter):
+            sorter(int(column), order)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.TextAlignmentRole:
+            if section == 1:
+                return int(Qt.AlignRight | Qt.AlignVCenter)
+            return int(Qt.AlignLeft | Qt.AlignVCenter)
+        return super().headerData(section, orientation, role)
+
+
 class FsSortProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3059,6 +3123,7 @@ class FastDirModel(QAbstractTableModel):
         self._icon_rows = {}
         self._icon_file = None
         self._icon_dir = None
+        self._last_sort = None
 
     def rootPath(self):
         return self._root
@@ -3069,6 +3134,7 @@ class FastDirModel(QAbstractTableModel):
         self._rows = []
         self._icon_cache.clear()
         self._icon_rows.clear()
+        self._last_sort = None
         self.endResetModel()
 
     @QtCore.pyqtSlot(list)
@@ -3086,7 +3152,37 @@ class FastDirModel(QAbstractTableModel):
         self._rows.extend(prepared)
         for offset, rec in enumerate(prepared):
             self._icon_rows.setdefault(rec["icon_key"], []).append(start + offset)
+        self._last_sort = None
         self.endInsertRows()
+
+    def _rebuild_icon_rows(self):
+        self._icon_rows = {}
+        for row, rec in enumerate(self._rows):
+            self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def sort_records(self, column: int, order=Qt.AscendingOrder):
+        sort_state = (int(column), int(order))
+        if self._last_sort == sort_state or len(self._rows) < 2:
+            self._last_sort = sort_state
+            return
+        persistent = self.persistentIndexList()
+        persistent_paths = [self.row_path(ix.row()) for ix in persistent]
+        sorted_rows = _sorted_record_rows(self._rows, int(column), order)
+        if all(old is new for old, new in zip(self._rows, sorted_rows)):
+            self._last_sort = sort_state
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._rows = sorted_rows
+        self._rebuild_icon_rows()
+        row_by_path = {str(rec.get("path", "")): row for row, rec in enumerate(self._rows)}
+        remapped = [
+            self.index(row_by_path.get(path, -1), ix.column())
+            if path in row_by_path else QtCore.QModelIndex()
+            for ix, path in zip(persistent, persistent_paths)
+        ]
+        self.changePersistentIndexList(persistent, remapped)
+        self._last_sort = sort_state
+        self.layoutChanged.emit()
 
     def row_path(self, row: int) -> str:
         return self._rows[row]["path"] if 0 <= row < len(self._rows) else ""
@@ -3121,6 +3217,8 @@ class FastDirModel(QAbstractTableModel):
         for col in changed:
             ix = self.index(row, col)
             self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
+        if changed:
+            self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
     def apply_icon_key(self, key: str, icon):
@@ -4081,6 +4179,7 @@ class SearchResultModel(QAbstractTableModel):
         self._icon_rows = {}
         self._icon_file = None
         self._icon_dir = None
+        self._last_sort = None
 
     @QtCore.pyqtSlot(list)
     def append_rows(self, rows: list):
@@ -4106,7 +4205,39 @@ class SearchResultModel(QAbstractTableModel):
             row = first + offset
             self._row_by_path[rec.get("path", "")] = row
             self._icon_rows.setdefault(rec["icon_key"], []).append(row)
+        self._last_sort = None
         self.endInsertRows()
+
+    def _rebuild_row_maps(self):
+        self._row_by_path = {}
+        self._icon_rows = {}
+        for row, rec in enumerate(self._rows):
+            path = str(rec.get("path", ""))
+            self._row_by_path[path] = row
+            self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def sort_records(self, column: int, order=Qt.AscendingOrder):
+        sort_state = (int(column), int(order))
+        if self._last_sort == sort_state or len(self._rows) < 2:
+            self._last_sort = sort_state
+            return
+        persistent = self.persistentIndexList()
+        persistent_paths = [self.row_path(ix.row()) for ix in persistent]
+        sorted_rows = _sorted_record_rows(self._rows, int(column), order)
+        if all(old is new for old, new in zip(self._rows, sorted_rows)):
+            self._last_sort = sort_state
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._rows = sorted_rows
+        self._rebuild_row_maps()
+        remapped = [
+            self.index(self._row_by_path.get(path, -1), ix.column())
+            if path in self._row_by_path else QtCore.QModelIndex()
+            for ix, path in zip(persistent, persistent_paths)
+        ]
+        self.changePersistentIndexList(persistent, remapped)
+        self._last_sort = sort_state
+        self.layoutChanged.emit()
 
     def rowCount(self, parent=QtCore.QModelIndex()):
         return 0 if parent.isValid() else len(self._rows)
@@ -4156,6 +4287,8 @@ class SearchResultModel(QAbstractTableModel):
         for col in changed:
             ix = self.index(row, col)
             self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
+        if changed:
+            self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
     def apply_icon_key(self, key: str, icon):
@@ -4765,7 +4898,7 @@ class ExplorerPane(QWidget):
                 self._tooltip_display_ms = max(1000, int(base_ms * HOVER_TOOLTIP_DURATION_MULTIPLIER))
         except Exception:
             pass
-        self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
+        self._fast_model=FastDirModel(self); self._fast_proxy=RecordSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
         self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None
         self._fast_enum_count = 0
         self._fast_enum_root = ""
@@ -7279,7 +7412,7 @@ class ExplorerPane(QWidget):
         old_search_proxy = getattr(self, "_search_proxy", None)
         self._search_mode=True
         self._search_model=model
-        self._search_proxy=FsSortProxy(self)
+        self._search_proxy=RecordSortProxy(self)
         self._search_proxy.setDynamicSortFilter(False)
         self._search_proxy.setSourceModel(self._search_model)
         self.view.setModel(self._search_proxy)
