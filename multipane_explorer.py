@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.9.0"
 
 
 BASE_FONT_PT = 9.5
@@ -750,6 +750,58 @@ def icon_cmd(theme: str):
         p.setPen(QPen(textc, 2))
         p.drawLine(6, h//2, 10, h//2-3); p.drawLine(6, h//2, 10, h//2+3); p.drawLine(12, h//2+5, w-6, h//2+5)
     return _make_icon(22, 22, paint)
+
+def icon_customize(theme: str, letter: str = ""):
+    def paint(p: QPainter, w, h):
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#e6e9ee" if theme == "dark" else "#30343b"), 1.6))
+        p.drawRoundedRect(2, 2, w - 4, h - 4, 4, 4)
+        font = QFont(); font.setPixelSize(14); font.setBold(True)
+        p.setFont(font)
+        p.drawText(QtCore.QRect(2, 2, w - 4, h - 4), Qt.AlignCenter, letter or "\u25b6")
+    return _make_icon(22, 22, paint)
+
+
+def normalize_custom_commands(value):
+    value = value if isinstance(value, dict) else {}
+    count = value.get("count", 0)
+    count = count if type(count) is int and count in (0, 2, 4, 6) else 0
+    items = value.get("items", [])
+    items = items if isinstance(items, list) else []
+    cleaned = []
+    for index in range(6):
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        icon = item.get("icon", "")
+        cleaned.append({"command": str(item.get("command", "")),
+                        "icon": icon if isinstance(icon, str) and icon in tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ") else ""})
+    return {"count": count, "items": cleaned}
+
+
+def launch_custom_command(command: str, path: str):
+    """Run user-authored CMD syntax without creating a console window."""
+    if os.name != "nt":
+        raise OSError("Customize commands require Windows.")
+    if not command.strip():
+        raise ValueError("Set a command in Customize settings first.")
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise OSError(f"Folder is unavailable: {path}")
+    comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+    cwd = path
+    if path.startswith("\\\\"):
+        # CMD needs pushd to map a UNC working directory to a drive.
+        command = f'pushd "{path}" && {command}'
+        cwd = os.environ.get("SystemRoot", r"C:\Windows")
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    # Pass the command verbatim: list2cmdline would escape embedded CMD quotes.
+    return subprocess.Popen(
+        f'"{comspec}" /d /s /c "{command}"', cwd=cwd,
+        creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
 
 def icon_explorer(theme: str):
     def paint(p: QPainter, w, h):
@@ -3917,6 +3969,8 @@ class ExplorerPane(QWidget):
 
         tool_grid_widget = QWidget(self)
         tool_grid = QGridLayout(tool_grid_widget)
+        self._tool_grid = tool_grid
+        self._custom_buttons = []
         tool_grid.setContentsMargins(0,0,0,0)
         tool_grid.setHorizontalSpacing(max(0, ROW_SPACING-2))
         tool_grid.setVerticalSpacing(max(0, ROW_SPACING-2))
@@ -3927,8 +3981,7 @@ class ExplorerPane(QWidget):
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
         row_toolbar.addWidget(self.btn_star, 0, Qt.AlignVCenter)
         row_toolbar.addWidget(self._bm_btn_container,1)
-        for index, button in enumerate((self.btn_cmd, self.btn_explorer, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh)):
-            tool_grid.addWidget(button, index // 3, index % 3)
+        self._rebuild_custom_buttons()
         row_toolbar.addWidget(tool_grid_widget, 0, Qt.AlignVCenter)
         self._row_toolbar=row_toolbar
 
@@ -3938,6 +3991,44 @@ class ExplorerPane(QWidget):
             b.setStyleSheet(_tight_css)
             b.setAutoRaise(True)
         return row_toolbar
+
+    def _rebuild_custom_buttons(self):
+        while self._tool_grid.count():
+            self._tool_grid.takeAt(0)
+        for button in self._custom_buttons:
+            button.hide()
+            button.deleteLater()
+        self._custom_buttons = []
+        config = self.host.custom_commands
+        columns = config["count"] // 2
+        for row, buttons in enumerate(((self.btn_cmd, self.btn_explorer, self.btn_up),
+                                       (self.btn_new, self.btn_new_file, self.btn_refresh))):
+            for col, button in enumerate(buttons):
+                self._tool_grid.addWidget(button, row, col if col == 0 else col + columns)
+        for index, item in enumerate(config["items"][:config["count"]]):
+            button = QToolButton(self)
+            button.setFixedSize(self.btn_cmd.sizeHint().width(), UI_H)
+            button.setAutoRaise(True)
+            button.setStyleSheet("QToolButton{padding-left:4px;padding-right:4px;}")
+            button.setIcon(icon_customize(self.host.theme, item["icon"]))
+            button.setToolTip(f"Customize {index + 1}: {item['command'] or 'Set command in Customize settings'}")
+            button.setAccessibleName(f"Customize {index + 1}")
+            button.clicked.connect(lambda checked=False, i=index: self._run_custom_command(i))
+            self._tool_grid.addWidget(button, index % 2, 1 + index // 2)
+            self._custom_buttons.append(button)
+        if hasattr(self, "_quick_bm_buttons"):
+            QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
+
+    def _run_custom_command(self, index):
+        command = self.host.custom_commands["items"][index]["command"]
+        try:
+            process = launch_custom_command(command, self.current_path() or os.getcwd())
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Customize", str(error))
+            return
+        self.host._custom_processes.append((process, index + 1))
+        self.host._custom_process_timer.start()
+        self.host.flash_status(f"Customize {index + 1} started")
 
     def _build_path_row(self):
         self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb - Double-click or F4/Ctrl+L to enter path")
@@ -6471,6 +6562,7 @@ class MultiExplorer(QMainWindow):
             ("btn_layout", "Toggle layout (4 / 6 / 8)", self._cycle_layout),
             ("btn_theme", "Toggle Light/Dark", self._toggle_theme),
             ("btn_bm_edit", "Edit Bookmarks", self._open_bookmark_editor),
+            ("btn_customize", "Customize command buttons", self._open_customize_settings),
             ("btn_session", "Session (save/load all pane paths)", self._open_session_manager),
             ("btn_shortcuts", "Keyboard Shortcuts", self._show_shortcuts),
             ("btn_about", "About", self._show_about),
@@ -6482,6 +6574,11 @@ class MultiExplorer(QMainWindow):
         vmain=QVBoxLayout(self.central); vmain.setContentsMargins(0,0,0,0); vmain.setSpacing(ROW_SPACING)
         vmain.addWidget(top,0); self.grid=QGridLayout(); vmain.addLayout(self.grid,1)
         self.named_bookmarks=migrate_legacy_favorites_into_named(load_named_bookmarks()); save_named_bookmarks(self.named_bookmarks)
+        self.custom_commands = normalize_custom_commands(QSettings(ORG_NAME, APP_NAME).value("customize/commands", {}))
+        self._custom_processes = []
+        self._custom_process_timer = QTimer(self)
+        self._custom_process_timer.setInterval(250)
+        self._custom_process_timer.timeout.connect(self._poll_custom_processes)
         self._clipboard=None; self._bm_dlg=None
         self.file_ops = FileOperationManager(self)
         self.icon_broker = ShellIconBroker(self)
@@ -6579,6 +6676,7 @@ class MultiExplorer(QMainWindow):
         for name, icon_fn in (
             ("btn_theme", icon_theme_toggle),
             ("btn_bm_edit", icon_bookmark_edit),
+            ("btn_customize", icon_customize),
             ("btn_session", icon_session),
             ("btn_shortcuts", icon_shortcuts),
             ("btn_about", icon_info),
@@ -6594,6 +6692,8 @@ class MultiExplorer(QMainWindow):
                 p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
                 p.btn_cmd.setIcon(icon_cmd(self.theme))
                 p.btn_explorer.setIcon(icon_explorer(self.theme))
+                for index, button in enumerate(p._custom_buttons):
+                    button.setIcon(icon_customize(self.theme, self.custom_commands["items"][index]["icon"]))
 
                 if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
                     p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
@@ -7046,6 +7146,29 @@ class MultiExplorer(QMainWindow):
             if len(self.named_bookmarks)>BOOKMARK_LIMIT: self.named_bookmarks=self.named_bookmarks[:BOOKMARK_LIMIT]
         save_named_bookmarks(self.named_bookmarks); self.namedBookmarksChanged.emit(self.named_bookmarks); self.flash_status("Bookmarks updated")
 
+    def _poll_custom_processes(self):
+        pending = []
+        for process, number in self._custom_processes:
+            code = process.poll()
+            if code is None:
+                pending.append((process, number))
+            else:
+                self.flash_status(f"Customize {number} finished (exit code {code})")
+        self._custom_processes = pending
+        if not pending:
+            self._custom_process_timer.stop()
+
+    def _open_customize_settings(self):
+        dialog = CustomizeDialog(self, self.custom_commands)
+        if dialog.exec_() == QDialog.Accepted:
+            self.custom_commands = dialog.config()
+            settings = QSettings(ORG_NAME, APP_NAME)
+            settings.setValue("customize/commands", self.custom_commands)
+            settings.sync()
+            for pane in self.panes:
+                pane._rebuild_custom_buttons()
+            self.flash_status("Customize settings saved")
+
     def _open_bookmark_editor(self):
         if getattr(self,"_bm_dlg",None) and self._bm_dlg.isVisible():
             self._bm_dlg.raise_(); self._bm_dlg.activateWindow(); return
@@ -7364,6 +7487,59 @@ class SessionManagerDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Save Session", str(e))
 
+
+
+class CustomizeDialog(QDialog):
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.setWindowTitle("Customize command buttons")
+        self.resize(760, 390)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Run commands in the clicked pane's current folder with the CMD window hidden.", self))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Enabled buttons:", self))
+        self.count_combo = QComboBox(self)
+        for count, label in ((0, "All off (default)"), (2, "2 buttons - 2 x 4"),
+                             (4, "4 buttons - 2 x 5"), (6, "6 buttons - 2 x 6")):
+            self.count_combo.addItem(label, count)
+        self.count_combo.setCurrentIndex((0, 2, 4, 6).index(config["count"]))
+        row.addWidget(self.count_combo); row.addStretch()
+        layout.addLayout(row)
+        grid = QGridLayout()
+        for col, label in enumerate(("Button / position", "Icon", "CMD command")):
+            grid.addWidget(QLabel(label, self), 0, col)
+        self.editors = []
+        for index, item in enumerate(config["items"]):
+            label = QLabel(f"{index + 1} / {'Top' if index % 2 == 0 else 'Bottom'} {index // 2 + 1}", self)
+            icons = QComboBox(self)
+            icons.addItem(icon_customize(parent.theme), "Default", "")
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                icons.addItem(icon_customize(parent.theme, letter), letter, letter)
+            icons.setCurrentIndex(icons.findData(item["icon"]))
+            command = QLineEdit(item["command"], self)
+            command.setPlaceholderText('Example: echo Hello > result.txt')
+            for col, widget in enumerate((label, icons, command)):
+                grid.addWidget(widget, index + 1, col)
+            self.editors.append((label, icons, command))
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+        note = QLabel("Disabled buttons retain their settings. Console output is hidden; use > file.txt to save it.", self)
+        note.setWordWrap(True); layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.count_combo.currentIndexChanged.connect(self._update_enabled)
+        self._update_enabled()
+
+    def _update_enabled(self):
+        for index, widgets in enumerate(self.editors):
+            for widget in widgets:
+                widget.setEnabled(index < self.count_combo.currentData())
+
+    def config(self):
+        return {"count": self.count_combo.currentData(), "items": [
+            {"icon": icons.currentData(), "command": command.text()}
+            for label, icons, command in self.editors]}
 
 
 class BookmarkOrderTable(QTableWidget):

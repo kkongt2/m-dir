@@ -30,6 +30,7 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise
 - Open Command Prompt in the current folder
+- Customize command buttons (v2.9.0): top-left settings enable 0 (default), 2, 4, or 6 shared buttons between the CMD and Explorer columns; each uses a default icon or A-Z icon and runs a saved CMD command in the clicked pane's folder without showing a console. Settings persist, including disabled slots. Console output can be redirected to a file.
 
 ## Install
 ```powershell
