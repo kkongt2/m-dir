@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.7.4"
 
 
 BASE_FONT_PT = 9.5
@@ -1175,6 +1175,59 @@ def _cancel_and_wait_child_threads(owner: QtCore.QObject, wait_ms: int) -> bool:
     return all_stopped
 
 
+def _source_signature(path):
+    info = os.lstat(path)
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _snapshot_move_source(root, should_cancel=lambda: False):
+    """Record exactly the tree whose contents are about to be copied."""
+    snapshot = {}
+    pending = [root]
+    while pending:
+        if should_cancel():
+            raise DeleteCancelled()
+        path = pending.pop()
+        if _is_junction(path):
+            raise OSError(f"Cannot safely copy a directory junction: {path}")
+        signature = _source_signature(path)
+        snapshot[path] = signature
+        if stat.S_ISDIR(signature[2]):
+            with os.scandir(path) as entries:
+                pending.extend(entry.path for entry in entries)
+    return snapshot
+
+
+def _cleanup_copied_source(root, snapshot, should_cancel=lambda: False):
+    """Delete only unchanged copied entries; never recursively delete new data."""
+    if _snapshot_move_source(root, should_cancel) != snapshot:
+        return ["Source changed during copying; source was left in place."]
+    errors = []
+    for path, expected in reversed(list(snapshot.items())):
+        if should_cancel():
+            raise DeleteCancelled()
+        try:
+            # A replaced ancestor could redirect a child path into another tree.
+            parent = os.path.dirname(path)
+            while parent in snapshot:
+                if _source_signature(parent)[:3] != snapshot[parent][:3]:
+                    raise OSError(f"Source directory was replaced: {parent}")
+                parent = os.path.dirname(parent)
+            current = _source_signature(path)
+            if stat.S_ISDIR(expected[2]):
+                if current[:3] != expected[:3]:
+                    raise OSError("Source directory was replaced")
+                os.rmdir(path)  # Refuses any new entries, including late arrivals.
+            else:
+                if current != expected:
+                    raise OSError("Source changed after copying")
+                remove_any(path)
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return errors
+
+
 class FileOpWorker(QtCore.QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
@@ -1636,6 +1689,7 @@ class FileOpWorker(QtCore.QThread):
         # be cancelled and may partially delete the source before reporting an error.
         staging = self._new_sibling_work_path(dst, "move")
         try:
+            source_snapshot = _snapshot_move_source(src, lambda: self._cancel)
             copied_ok = self._copy_to_new_path(src, staging)
         except Exception as exc:
             copied_ok = False
@@ -1672,13 +1726,9 @@ class FileOpWorker(QtCore.QThread):
 
         cleanup_errors = []
         try:
-            if os.path.isdir(src) and not _is_dir_link(src):
-                _deleted, cleanup_errors = delete_any_permanent_best_effort(
-                    src,
-                    should_cancel=lambda: self._cancel,
-                )
-            else:
-                remove_any(src)
+            cleanup_errors = _cleanup_copied_source(
+                src, source_snapshot, should_cancel=lambda: self._cancel,
+            )
         except DeleteCancelled:
             return False
         except Exception as exc:

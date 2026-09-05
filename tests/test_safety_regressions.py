@@ -85,12 +85,12 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst = os.path.join(dst_dir, "source")
             worker = explorer.FileOpWorker("move", [src], dst_dir)
 
-            def partial_source_cleanup(path, **_kwargs):
+            def partial_source_cleanup(path, _snapshot, **_kwargs):
                 os.remove(os.path.join(path, "second.txt"))
-                return 1, ["simulated source cleanup failure"]
+                return ["simulated source cleanup failure"]
 
             with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
-                explorer, "delete_any_permanent_best_effort", side_effect=partial_source_cleanup
+                explorer, "_cleanup_copied_source", side_effect=partial_source_cleanup
             ):
                 result = worker._move_source_transactional(src, dst, None, False)
 
@@ -171,12 +171,12 @@ class FileOperationSafetyTests(unittest.TestCase):
             Path(dst, "old.txt").write_text("old", encoding="utf-8")
             worker = explorer.FileOpWorker("move", [src], dst_dir, conflict_map={src: "overwrite"})
 
-            def partial_source_cleanup(path, **_kwargs):
+            def partial_source_cleanup(path, _snapshot, **_kwargs):
                 os.remove(os.path.join(path, "second.txt"))
-                return 1, ["simulated source cleanup failure"]
+                return ["simulated source cleanup failure"]
 
             with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
-                explorer, "delete_any_permanent_best_effort", side_effect=partial_source_cleanup
+                explorer, "_cleanup_copied_source", side_effect=partial_source_cleanup
             ):
                 result = worker._move_source_transactional(src, dst, "overwrite", True)
 
