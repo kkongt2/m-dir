@@ -18,10 +18,11 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Auto-refresh on file system changes via `QFileSystemWatcher`
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
+- Safe cross-filesystem moves use a completed staging copy before source cleanup; symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - Per-pane file operation progress bar with cancellation
 - Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
-- Bookmark editor and compact quick bookmark buttons (up to 30 bookmarks, with overflow menu)
+- Roomier two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with drag-to-reorder bookmark editing
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise
@@ -51,6 +52,17 @@ python multipane_explorer.py --panes 4 "C:\Windows" "D:\WS" "C:\Users\USER" "C:\
 Enable debug logs with environment variable:
 ```powershell
 $env:MULTIPANE_DEBUG=1; python multipane_explorer.py
+```
+
+Normal copies rely on the operating system's buffered writeback for throughput.
+To force every copied file to stable storage before it is promoted into place:
+```powershell
+$env:MULTIPANE_DURABLE_COPIES=1; python multipane_explorer.py
+```
+
+## Test
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 ## Search/Filter Behavior

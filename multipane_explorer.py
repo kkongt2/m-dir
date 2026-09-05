@@ -1,6 +1,6 @@
 
 
-import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat
+import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -54,7 +54,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.7.2"
 
 
 BASE_FONT_PT = 9.5
@@ -73,7 +73,6 @@ CONTROL_VPAD= 1
 CONTROL_HPAD= 6
 
 CRUMB_MAX_SEG_W = 180
-ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
 SEARCH_PROGRESS_INTERVAL = 250
 DEFAULT_SEARCH_EXCLUDE_DIRS = {
@@ -83,13 +82,18 @@ DEFAULT_SEARCH_EXCLUDE_DIRS = {
 FILEOP_ERROR_DETAIL_LIMIT = 50
 LARGE_FOLDER_THRESHOLD = 3000
 FILEOP_FAST_PROGRESS_SCAN_LIMIT = 4000
+FILE_COPY_BUFFER_SIZE = 4 * 1024 * 1024
+DURABLE_FILE_COPIES = _env_flag("MULTIPANE_DURABLE_COPIES")
 GENERIC_ICON_THRESHOLD = 1200
 SHELL_ICON_FAILURE_TTL_S = 300
+DIR_SNAPSHOT_TTL_S = 5.0
+DIR_SNAPSHOT_CACHE_LIMIT = 8
 PATH_HISTORY_LIMIT = 30
 BOOKMARK_LIMIT = 30
 QUICK_BOOKMARK_MIN_W = 42
-QUICK_BOOKMARK_MAX_W = 78
+QUICK_BOOKMARK_MAX_W = 160
 QUICK_BOOKMARK_MORE_W = 30
+BOOKMARK_TOOLBAR_ROWS = 2
 VALID_THEMES = ("dark", "light")
 SIZE_COL_WIDTH = 60
 DATE_COL_WIDTH = 122
@@ -475,21 +479,6 @@ def human_size(n: int) -> str:
     if i == 0: return f"{int(size)} B"
     return f"{size:.1f} {units[i]}" if size < 10 else f"{size:.0f} {units[i]}"
 
-def unique_dest_path(dst_dir: str, name: str) -> str:
-    base, ext = os.path.splitext(name); candidate = name; i = 1
-    while os.path.exists(os.path.join(dst_dir, candidate)):
-        suffix = " - Copy" if i == 1 else f" - Copy ({i})"
-        candidate = f"{base}{suffix}{ext}"; i += 1
-    return os.path.join(dst_dir, candidate)
-
-def remove_any(path: str):
-    if not os.path.exists(path): return
-    if os.path.isdir(path) and not os.path.islink(path): shutil.rmtree(path)
-    else: os.remove(path)
-
-class DeleteCancelled(Exception):
-    pass
-
 def _path_exists_for_delete(path: str) -> bool:
     try:
         return os.path.lexists(path)
@@ -498,18 +487,81 @@ def _path_exists_for_delete(path: str) -> bool:
 
 def _is_junction(path: str) -> bool:
     isjunction = getattr(os.path, "isjunction", None)
-    if not isjunction:
-        return False
-    try:
-        return bool(isjunction(path))
-    except Exception:
-        return False
+    if isjunction:
+        try:
+            if isjunction(path):
+                return True
+        except Exception:
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+            tag = getattr(st, "st_reparse_tag", 0)
+            junction_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+            return bool(tag == junction_tag)
+        except Exception:
+            pass
+    return False
 
 def _is_dir_link(path: str) -> bool:
     try:
         return bool(os.path.islink(path) or _is_junction(path))
     except Exception:
         return False
+
+def _link_target_is_directory(path: str) -> bool:
+    if os.path.isdir(path):
+        return True
+    if os.name == "nt":
+        try:
+            attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+            directory_attr = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+            return bool(attrs & directory_attr)
+        except Exception:
+            pass
+    return False
+
+def _same_filesystem(src: str, dst_parent: str) -> bool:
+    """Return whether an atomic rename can stay on one filesystem."""
+    try:
+        src_dev = os.stat(src, follow_symlinks=False).st_dev
+        dst_dev = os.stat(dst_parent, follow_symlinks=False).st_dev
+        return src_dev == dst_dev
+    except Exception:
+        if os.name == "nt":
+            try:
+                src_drive = os.path.splitdrive(os.path.abspath(src))[0]
+                dst_drive = os.path.splitdrive(os.path.abspath(dst_parent))[0]
+                return bool(src_drive and dst_drive and src_drive.casefold() == dst_drive.casefold())
+            except Exception:
+                pass
+        return False
+
+def _is_cross_device_error(exc: BaseException) -> bool:
+    return (
+        getattr(exc, "errno", None) == errno.EXDEV
+        or getattr(exc, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
+    )
+
+def unique_dest_path(dst_dir: str, name: str) -> str:
+    base, ext = os.path.splitext(name); candidate = name; i = 1
+    while os.path.lexists(os.path.join(dst_dir, candidate)):
+        suffix = " - Copy" if i == 1 else f" - Copy ({i})"
+        candidate = f"{base}{suffix}{ext}"; i += 1
+    return os.path.join(dst_dir, candidate)
+
+def remove_any(path: str):
+    if not _path_exists_for_delete(path):
+        return
+    if os.path.isdir(path) and not _is_dir_link(path):
+        shutil.rmtree(path)
+    elif os.path.isdir(path) and _is_dir_link(path):
+        os.rmdir(path)
+    else:
+        os.remove(path)
+
+class DeleteCancelled(Exception):
+    pass
 
 def _entry_is_junction(entry) -> bool:
     fn = getattr(entry, "is_junction", None)
@@ -904,11 +956,6 @@ def recycle_any_best_effort(
         mark_done(1)
     return deleted, errors
 
-def move_with_collision(src: str, dst_dir: str) -> str:
-    name = os.path.basename(src); dst = os.path.join(dst_dir, name)
-    if os.path.exists(dst): dst = unique_dest_path(dst_dir, name)
-    return shutil.move(src, dst)
-
 def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
     if not paths: return True
     ok = True
@@ -1019,7 +1066,7 @@ class FileOperationManager(QtCore.QObject):
         try:
             if worker.isRunning() and hasattr(worker, "cancel"):
                 worker.cancel()
-                worker.wait(max(0, int(wait_ms)))
+                return bool(worker.wait(max(0, int(wait_ms))))
             return True
         except Exception:
             return False
@@ -1104,13 +1151,45 @@ class FileOperationManager(QtCore.QObject):
         return all_stopped
 
 
+def _cancel_and_wait_child_threads(owner: QtCore.QObject, wait_ms: int) -> bool:
+    """Cancel and audit child QThreads before their QObject owner is destroyed."""
+    workers = list(owner.findChildren(QtCore.QThread))
+    for worker in workers:
+        try:
+            if worker.isRunning() and hasattr(worker, "cancel"):
+                worker.cancel()
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
+    all_stopped = True
+    for worker in workers:
+        try:
+            if not worker.isRunning():
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0 or not worker.wait(remaining_ms):
+                all_stopped = False
+        except Exception:
+            all_stopped = False
+    return all_stopped
+
+
 class FileOpWorker(QtCore.QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
     finished_ok = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, op: str, srcs: list, dst_dir: str, conflict_map: dict | None = None, parent=None):
+    def __init__(
+        self,
+        op: str,
+        srcs: list,
+        dst_dir: str,
+        conflict_map: dict | None = None,
+        parent=None,
+        durable_copies: bool | None = None,
+    ):
         super().__init__(parent)
         self.op = op
         self.srcs = list(srcs)
@@ -1132,6 +1211,8 @@ class FileOpWorker(QtCore.QThread):
         self.successful_source_keys = set()
         self.clipboard_payload = None
         self._ui_op = op
+        self.durable_copies = DURABLE_FILE_COPIES if durable_copies is None else bool(durable_copies)
+        self._copy_buffer = None
 
     def cancel(self):
         self._cancel = True
@@ -1151,14 +1232,22 @@ class FileOpWorker(QtCore.QThread):
     def _scan_source_progress(self, path: str) -> tuple[int, int]:
         total_bytes = 0
         total_items = 0
-        if os.path.isdir(path) and not os.path.islink(path):
-            for root, _dirs, files in os.walk(path):
+        if os.path.isdir(path) and not _is_dir_link(path):
+            for root, dirs, files in os.walk(path):
                 if self._cancel:
                     break
                 total_items += 1
                 if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
                     self._progress_estimated = True
                     break
+                traversable_dirs = []
+                for dirname in dirs:
+                    child_dir = os.path.join(root, dirname)
+                    if _is_dir_link(child_dir):
+                        total_items += 1
+                    else:
+                        traversable_dirs.append(dirname)
+                dirs[:] = traversable_dirs
                 for filename in files:
                     if self._cancel:
                         break
@@ -1167,10 +1256,11 @@ class FileOpWorker(QtCore.QThread):
                     if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
                         self._progress_estimated = True
                         break
-                    try:
-                        total_bytes += max(0, int(os.path.getsize(fp)))
-                    except Exception:
-                        pass
+                    if not os.path.islink(fp):
+                        try:
+                            total_bytes += max(0, int(os.path.getsize(fp)))
+                        except Exception:
+                            pass
         else:
             total_items = 1
             try:
@@ -1320,16 +1410,22 @@ class FileOpWorker(QtCore.QThread):
             os.makedirs(os.path.dirname(dst) or os.curdir, exist_ok=True)
             temp_path = self._new_sibling_work_path(dst, "partial")
             with open(src, "rb") as fsrc, open(temp_path, "xb") as fdst:
+                if self._copy_buffer is None:
+                    self._copy_buffer = bytearray(FILE_COPY_BUFFER_SIZE)
+                buf = self._copy_buffer
+                view = memoryview(buf)
                 while True:
                     if self._cancel:
                         return False
-                    buf = fsrc.read(1024 * 1024)
-                    if not buf:
+                    count = fsrc.readinto(buf)
+                    if not count:
                         break
-                    fdst.write(buf)
-                    copied += len(buf)
-                    self._tick_progress(delta_bytes=len(buf))
-                fdst.flush()
+                    fdst.write(view[:count])
+                    copied += count
+                    self._tick_progress(delta_bytes=count)
+                if self.durable_copies:
+                    fdst.flush()
+                    os.fsync(fdst.fileno())
             try:
                 shutil.copystat(src, temp_path, follow_symlinks=True)
             except Exception:
@@ -1347,6 +1443,31 @@ class FileOpWorker(QtCore.QThread):
             if temp_path and os.path.lexists(temp_path):
                 try:
                     self._cleanup_path(temp_path)
+                except Exception:
+                    pass
+
+    def _copy_link(self, src: str, dst: str) -> bool:
+        temp_path = None
+        try:
+            if _is_junction(src):
+                raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+            target = os.readlink(src)
+            temp_path = self._new_sibling_work_path(dst, "link")
+            os.symlink(target, temp_path, target_is_directory=_link_target_is_directory(src))
+            try:
+                shutil.copystat(src, temp_path, follow_symlinks=False)
+            except Exception:
+                pass
+            if self._cancel:
+                return False
+            os.replace(temp_path, dst)
+            temp_path = None
+            self._tick_progress(delta_items=1)
+            return True
+        finally:
+            if temp_path and os.path.lexists(temp_path):
+                try:
+                    remove_any(temp_path)
                 except Exception:
                     pass
 
@@ -1384,34 +1505,48 @@ class FileOpWorker(QtCore.QThread):
         self.undo_move_pairs.append((final_path, original_path))
 
     def _copy_dir_recursive(self, src_dir, dst_dir):
+        if self._cancel:
+            return False
+        self._tick_progress(delta_items=1)
         ok = True
-        for root, _dirs, files in os.walk(src_dir):
+        try:
+            entries = list(os.scandir(src_dir))
+        except Exception as exc:
+            self._record_copy_error(src_dir, dst_dir, exc)
+            return False
+
+        for entry in entries:
             if self._cancel:
                 return False
-            rel = os.path.relpath(root, src_dir)
-            target_root = os.path.join(dst_dir, "" if rel == "." else rel)
+            src_path = entry.path
+            dst_path = os.path.join(dst_dir, entry.name)
             try:
-                os.makedirs(target_root, exist_ok=True)
-                self._tick_progress(delta_items=1)
-            except Exception as exc:
-                self._record_copy_error(root, target_root, exc)
-                self._tick_progress(delta_items=1)
-                for filename in files:
-                    self._skip_file_progress(os.path.join(root, filename))
-                ok = False
-                continue
-            for filename in files:
-                if self._cancel:
-                    return False
-                sfile = os.path.join(root, filename)
-                dfile = os.path.join(target_root, filename)
-                try:
-                    if not self._copy_file(sfile, dfile):
+                if _is_junction(src_path):
+                    raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+                if entry.is_symlink():
+                    if not self._copy_link(src_path, dst_path):
                         return False
-                except Exception as exc:
-                    self._record_copy_error(sfile, dfile, exc)
-                    ok = False
+                elif entry.is_dir(follow_symlinks=False):
+                    os.makedirs(dst_path, exist_ok=False)
+                    if not self._copy_dir_recursive(src_path, dst_path):
+                        ok = False
+                elif not self._copy_file(src_path, dst_path):
+                    return False
+            except Exception as exc:
+                self._record_copy_error(src_path, dst_path, exc)
+                self._skip_source_progress(src_path)
+                ok = False
         return ok
+
+    def _copy_to_new_path(self, src: str, dst: str) -> bool:
+        if _is_junction(src):
+            raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+        if os.path.islink(src):
+            return self._copy_link(src, dst)
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=False)
+            return self._copy_dir_recursive(src, dst)
+        return self._copy_file(src, dst)
 
     def _copy_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
         backup = None
@@ -1436,11 +1571,7 @@ class FileOpWorker(QtCore.QThread):
         created_for_undo = self._can_undo_new_destination(existed, action)
         copied_ok = False
         try:
-            if os.path.isdir(src) and not os.path.islink(src):
-                os.makedirs(dst, exist_ok=False)
-                copied_ok = self._copy_dir_recursive(src, dst)
-            else:
-                copied_ok = self._copy_file(src, dst)
+            copied_ok = self._copy_to_new_path(src, dst)
             if copied_ok and not self._cancel:
                 self._discard_backup(backup, dst)
                 if created_for_undo:
@@ -1463,77 +1594,108 @@ class FileOpWorker(QtCore.QThread):
             dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
             existed = False
 
-        backup = None
-        if existed and action == "overwrite":
-            try:
-                backup = self._backup_destination(dst)
-            except Exception as exc:
-                self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
-                self._skip_source_progress(src)
-                return False
-
         can_undo_move = self._can_undo_new_destination(existed, action)
         src_progress = self._source_progress(src)
+        same_filesystem = _same_filesystem(src, os.path.dirname(dst) or self.dst_dir)
 
-        try:
-            final = shutil.move(src, dst)
-            if not os.path.lexists(src) and os.path.lexists(final):
+        if same_filesystem:
+            backup = None
+            if existed and action == "overwrite":
+                try:
+                    backup = self._backup_destination(dst)
+                except Exception as exc:
+                    self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
+                    self._skip_source_progress(src)
+                    return False
+            try:
+                os.replace(src, dst)
                 self._tick_progress(src_progress[0], src_progress[1])
                 self._discard_backup(backup, dst)
                 self._mark_source_success(src)
                 if can_undo_move:
-                    self._remember_move_for_undo(final, src)
+                    self._remember_move_for_undo(dst, src)
                 return True
-        except Exception:
-            pass
+            except Exception as exc:
+                self._rollback_destination(dst, backup)
+                if not _is_cross_device_error(exc):
+                    self._record_copy_error(src, dst, exc)
+                    self._skip_source_progress(src)
+                    return False
+                self.status.emit("Filesystem boundary detected; switching to safe copy-and-cleanup move ...")
 
-        # Some move implementations may report an error after completing the rename.
-        if not os.path.lexists(src) and os.path.lexists(dst):
-            self._tick_progress(src_progress[0], src_progress[1])
-            self._discard_backup(backup, dst)
-            self._mark_source_success(src)
-            if can_undo_move:
-                self._remember_move_for_undo(dst, src)
-            return True
-
-        # Remove any partial fallback destination before a controlled copy-and-delete move.
-        try:
-            if os.path.lexists(dst):
-                self._cleanup_path(dst)
-        except Exception as exc:
-            self._record_copy_error(src, dst, f"Could not clean partial move destination: {exc}")
-            self._rollback_destination(dst, backup)
+        if _is_junction(src):
+            self._record_copy_error(
+                src,
+                dst,
+                "Moving a Windows directory junction across filesystems is not supported; the junction was left unchanged.",
+            )
             self._skip_source_progress(src)
             return False
 
-        copied_ok = False
+        # Cross-filesystem moves are deliberately copy-first.  shutil.move() cannot
+        # be cancelled and may partially delete the source before reporting an error.
+        staging = self._new_sibling_work_path(dst, "move")
         try:
-            if os.path.isdir(src) and not os.path.islink(src):
-                os.makedirs(dst, exist_ok=False)
-                copied_ok = self._copy_dir_recursive(src, dst)
-            else:
-                copied_ok = self._copy_file(src, dst)
+            copied_ok = self._copy_to_new_path(src, staging)
         except Exception as exc:
-            self._record_copy_error(src, dst, exc)
+            copied_ok = False
+            self._record_copy_error(src, staging, exc)
 
-        if copied_ok and not self._cancel:
+        if not copied_ok or self._cancel:
             try:
-                if os.path.isdir(src) and not os.path.islink(src):
-                    shutil.rmtree(src)
-                else:
-                    os.remove(src)
+                self._cleanup_path(staging)
             except Exception as exc:
-                self._record_copy_error(src, dst, f"Copied, but source removal failed: {exc}")
-                copied_ok = False
+                self._record_copy_error(staging, dst, f"Could not remove incomplete staging copy: {exc}")
+            return False
 
-        if copied_ok and not self._cancel:
-            self._discard_backup(backup, dst)
+        backup = None
+        try:
+            if existed and action == "overwrite":
+                backup = self._backup_destination(dst)
+            os.replace(staging, dst)
+            staging = None
+        except Exception as exc:
+            self._record_copy_error(src, dst, f"Could not promote the completed staging copy: {exc}")
+            try:
+                if staging and os.path.lexists(staging):
+                    self._cleanup_path(staging)
+            except Exception as cleanup_exc:
+                self._record_copy_error(staging, dst, f"Could not remove staging copy: {cleanup_exc}")
+            self._rollback_destination(dst, backup)
+            return False
+
+        # The destination is now a complete copy.  Never roll it back if source
+        # cleanup is cancelled or fails: it may be the only complete copy left.
+        self._discard_backup(backup, dst)
+        if self._cancel:
+            return False
+
+        cleanup_errors = []
+        try:
+            if os.path.isdir(src) and not _is_dir_link(src):
+                _deleted, cleanup_errors = delete_any_permanent_best_effort(
+                    src,
+                    should_cancel=lambda: self._cancel,
+                )
+            else:
+                remove_any(src)
+        except DeleteCancelled:
+            return False
+        except Exception as exc:
+            cleanup_errors = [str(exc)]
+
+        if not _path_exists_for_delete(src):
             self._mark_source_success(src)
             if can_undo_move:
                 self._remember_move_for_undo(dst, src)
             return True
 
-        self._rollback_destination(dst, backup)
+        detail = cleanup_errors[0] if cleanup_errors else "source still exists after cleanup"
+        self._record_copy_error(
+            src,
+            dst,
+            f"Destination copy is complete, but source cleanup was incomplete: {detail}",
+        )
         return False
 
     def run(self):
@@ -1566,7 +1728,7 @@ class FileOpWorker(QtCore.QThread):
                         self._emit_source_done()
                         continue
 
-                if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+                if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
                     self.status.emit(f"Skipped nested destination: {base}")
                     self._skip_source_progress(src)
                     self._emit_source_done()
@@ -1606,7 +1768,6 @@ class DeleteWorker(QtCore.QThread):
         self._done = 0
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
-        self._subtree_item_counts: dict[str, int] = {}
         self.deleted_count = 0
         self.errors = []
 
@@ -1637,38 +1798,25 @@ class DeleteWorker(QtCore.QThread):
         self._last_progress_emit_ts = now
         self.progress.emit(pct)
 
-    def _scan_total_items(self):
-        self._total = 0
+    def _prepare_progress(self):
+        # Counting every descendant first doubles directory I/O and can delay a
+        # Recycle Bin rename by minutes.  Progress is therefore based on selected
+        # top-level paths while the delete helpers report the exact deleted count.
+        self._total = max(1, len(self.paths))
         self._done = 0
-        self._subtree_item_counts = {}
-        for idx, path in enumerate(self.paths, start=1):
-            if self._cancel:
-                raise DeleteCancelled()
-            name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
-            self.status.emit(f"Scanning {idx}/{len(self.paths)}: {name}")
-            count, subtree_counts = _scan_delete_item_counts(
-                path,
-                should_cancel=lambda: self._cancel,
-            )
-            self._total += count
-            self._subtree_item_counts.update(subtree_counts)
-        self._total = max(1, self._total)
         self._last_progress_pct = -1
         self._last_progress_emit_ts = 0.0
         self._emit_progress()
 
-    def _item_count_of(self, path: str) -> int:
-        return max(1, int(self._subtree_item_counts.get(_path_key(path), 1)))
-
-    def _on_items_done(self, units: int):
-        self._done += max(0, int(units or 0))
+    def _on_path_done(self):
+        self._done += 1
         self._emit_progress()
 
     def run(self):
         coinit = False
         try:
-            self.status.emit("Scanning items for delete ...")
-            self._scan_total_items()
+            self.status.emit("Preparing delete ...")
+            self._prepare_progress()
             if self._cancel:
                 self.error.emit("Operation cancelled.")
                 return
@@ -1701,25 +1849,22 @@ class DeleteWorker(QtCore.QThread):
                         deleted, errors = delete_any_permanent_best_effort(
                             path,
                             should_cancel=lambda: self._cancel,
-                            on_items_done=self._on_items_done,
-                            item_count_of=self._item_count_of,
                         )
                     else:
                         deleted, errors = recycle_any_best_effort(
                             path,
                             hwnd=self.hwnd,
                             should_cancel=lambda: self._cancel,
-                            on_items_done=self._on_items_done,
-                            item_count_of=self._item_count_of,
                         )
                     self.deleted_count += deleted
                     self.errors.extend(errors)
+                    self._on_path_done()
                 except DeleteCancelled:
                     self.error.emit("Operation cancelled.")
                     return
                 except Exception as e:
                     self.errors.append(f"{path}: {e}")
-                    self._on_items_done(self._item_count_of(path))
+                    self._on_path_done()
 
             self._done = max(self._done, self._total)
             self._emit_progress(force=True)
@@ -1784,6 +1929,32 @@ def _add_dialog_button_box(layout, parent, buttons, accept_slot, reject_slot=Non
 
 def _empty_bookmark_item():
     return {"enabled": False, "name": "", "path": ""}
+
+def _two_row_bookmark_fit(widths, available: int, spacing: int, more_width: int):
+    widths = list(widths or [])
+    total = len(widths)
+    top_count = 0
+    top_width = 0
+    for width in widths:
+        next_width = top_width + (spacing if top_count else 0) + width
+        if next_width > available:
+            break
+        top_width = next_width
+        top_count += 1
+    if top_count == total:
+        return total, top_count
+
+    bottom_count = 0
+    bottom_width = 0
+    for index, width in enumerate(widths[top_count:]):
+        spacing_before = spacing if bottom_count else 0
+        remaining_after = total - (top_count + index + 1)
+        more_reserve = (spacing + more_width) if remaining_after else 0
+        if bottom_width + spacing_before + width + more_reserve > available:
+            break
+        bottom_width += spacing_before + width
+        bottom_count += 1
+    return top_count + bottom_count, top_count
 
 def _apply_palette_colors(widget, colors):
     pal = widget.palette()
@@ -1977,7 +2148,7 @@ def icon_star(checked: bool, theme: str):
         else:
             p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor(200,200,210) if theme=="dark" else QColor(90,90,100), 1.8))
         p.drawPolygon(poly)
-    return _make_icon(20, 20, paint)
+    return _make_icon(40, 40, paint)
 
 def icon_edit(theme: str):
     def paint(p: QPainter, w, h):
@@ -2648,6 +2819,86 @@ SEARCH_ICON_READY_ROLE = Qt.UserRole + 101
 NAME_FOLD_ROLE = Qt.UserRole + 102
 ICON_KEY_ROLE = Qt.UserRole + 103
 
+
+def _record_sort_key(rec: dict, column: int):
+    """Build one native-Python sort key per row instead of per comparison."""
+    name_key = str(rec.get("name_l") or rec.get("name", "")).casefold()
+    if column == 1:
+        try:
+            primary = int(rec.get("size") or 0)
+        except Exception:
+            primary = 0
+    elif column == 2:
+        primary = str(rec.get("ext", "")).casefold()
+    elif column == 3:
+        try:
+            primary = float(rec.get("mtime") or 0.0)
+        except Exception:
+            primary = 0.0
+    elif column == 4:
+        primary = str(rec.get("folder", "")).casefold()
+    else:
+        primary = name_key
+    return primary, name_key
+
+
+def _sorted_record_rows(rows: list[dict], column: int, order) -> list[dict]:
+    """Return rows in folders-first order with the requested direction per group."""
+    reverse = order == Qt.DescendingOrder
+    dirs = [rec for rec in rows if bool(rec.get("is_dir"))]
+    files = [rec for rec in rows if not bool(rec.get("is_dir"))]
+    dirs.sort(key=lambda rec: _record_sort_key(rec, column), reverse=reverse)
+    files.sort(key=lambda rec: _record_sort_key(rec, column), reverse=reverse)
+    return dirs + files
+
+
+def _contiguous_ranges(rows) -> list[tuple[int, int]]:
+    values = sorted({int(row) for row in rows if int(row) >= 0})
+    if not values:
+        return []
+    ranges = []
+    start = previous = values[0]
+    for row in values[1:]:
+        if row == previous + 1:
+            previous = row
+            continue
+        ranges.append((start, previous))
+        start = previous = row
+    ranges.append((start, previous))
+    return ranges
+
+
+class RecordSortProxy(QIdentityProxyModel):
+    """Identity proxy that delegates sorting to list-backed source models.
+
+    QSortFilterProxyModel calls Python lessThan() O(N log N) times.  The backing
+    models can sort their record list from one Python call, which keeps a 50k-row
+    sort comfortably interactive.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dynamic_sort = False
+
+    def setDynamicSortFilter(self, enabled: bool):
+        self._dynamic_sort = bool(enabled)
+
+    def dynamicSortFilter(self) -> bool:
+        return self._dynamic_sort
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        src = self.sourceModel()
+        sorter = getattr(src, "sort_records", None)
+        if callable(sorter):
+            sorter(int(column), order)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.TextAlignmentRole:
+            if section == 1:
+                return int(Qt.AlignRight | Qt.AlignVCenter)
+            return int(Qt.AlignLeft | Qt.AlignVCenter)
+        return super().headerData(section, orientation, role)
+
+
 class FsSortProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2757,69 +3008,93 @@ def _icon_cache_key(path: str, is_dir: bool) -> str:
     return "ext:" + (ext or "<none>")
 
 
+_SHELL_ICON_API = None
+_SHELL_ICON_API_INITIALIZED = False
+_SHELL_ICON_API_LOCK = threading.Lock()
+
+
+def _get_windows_shell_icon_api():
+    """Initialize ctypes structures and function signatures only once."""
+    global _SHELL_ICON_API, _SHELL_ICON_API_INITIALIZED
+    if sys.platform != "win32":
+        return None
+    if _SHELL_ICON_API_INITIALIZED:
+        return _SHELL_ICON_API
+    with _SHELL_ICON_API_LOCK:
+        if _SHELL_ICON_API_INITIALIZED:
+            return _SHELL_ICON_API
+        try:
+            from ctypes import wintypes
+
+            class SHFILEINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("hIcon", wintypes.HICON),
+                    ("iIcon", ctypes.c_int),
+                    ("dwAttributes", wintypes.DWORD),
+                    ("szDisplayName", wintypes.WCHAR * 260),
+                    ("szTypeName", wintypes.WCHAR * 80),
+                ]
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD),
+                    ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long),
+                    ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            class RGBQUAD(ctypes.Structure):
+                _fields_ = [
+                    ("rgbBlue", ctypes.c_ubyte),
+                    ("rgbGreen", ctypes.c_ubyte),
+                    ("rgbRed", ctypes.c_ubyte),
+                    ("rgbReserved", ctypes.c_ubyte),
+                ]
+
+            class BITMAPINFO(ctypes.Structure):
+                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
+
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+            sh_get = shell32.SHGetFileInfoW
+            sh_get.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW), ctypes.c_uint, ctypes.c_uint]
+            sh_get.restype = ctypes.c_size_t
+            gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+            gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+            gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+            gdi32.CreateDIBSection.restype = ctypes.c_void_p
+            gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            gdi32.SelectObject.restype = ctypes.c_void_p
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteObject.restype = wintypes.BOOL
+            gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteDC.restype = wintypes.BOOL
+            user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.HICON, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            user32.DrawIconEx.restype = wintypes.BOOL
+            user32.DestroyIcon.argtypes = [wintypes.HICON]
+            user32.DestroyIcon.restype = wintypes.BOOL
+            _SHELL_ICON_API = (SHFILEINFOW, BITMAPINFOHEADER, BITMAPINFO, sh_get, user32, gdi32)
+        except Exception:
+            _SHELL_ICON_API = None
+        _SHELL_ICON_API_INITIALIZED = True
+        return _SHELL_ICON_API
+
+
 def _load_windows_shell_icon_bgra(path: str, is_dir: bool, size: int = 24):
     """Return (BGRA bytes, width, height) without creating QPixmap off-thread."""
-    if sys.platform != "win32":
+    api = _get_windows_shell_icon_api()
+    if api is None:
         return None, 0, 0
     try:
-        from ctypes import wintypes
-
-        class SHFILEINFOW(ctypes.Structure):
-            _fields_ = [
-                ("hIcon", wintypes.HICON),
-                ("iIcon", ctypes.c_int),
-                ("dwAttributes", wintypes.DWORD),
-                ("szDisplayName", wintypes.WCHAR * 260),
-                ("szTypeName", wintypes.WCHAR * 80),
-            ]
-
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ("biSize", wintypes.DWORD),
-                ("biWidth", ctypes.c_long),
-                ("biHeight", ctypes.c_long),
-                ("biPlanes", wintypes.WORD),
-                ("biBitCount", wintypes.WORD),
-                ("biCompression", wintypes.DWORD),
-                ("biSizeImage", wintypes.DWORD),
-                ("biXPelsPerMeter", ctypes.c_long),
-                ("biYPelsPerMeter", ctypes.c_long),
-                ("biClrUsed", wintypes.DWORD),
-                ("biClrImportant", wintypes.DWORD),
-            ]
-
-        class RGBQUAD(ctypes.Structure):
-            _fields_ = [
-                ("rgbBlue", ctypes.c_ubyte),
-                ("rgbGreen", ctypes.c_ubyte),
-                ("rgbRed", ctypes.c_ubyte),
-                ("rgbReserved", ctypes.c_ubyte),
-            ]
-
-        class BITMAPINFO(ctypes.Structure):
-            _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
-
-        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-
-        sh_get = shell32.SHGetFileInfoW
-        sh_get.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW), ctypes.c_uint, ctypes.c_uint]
-        sh_get.restype = ctypes.c_size_t
-        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
-        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
-        gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-        gdi32.CreateDIBSection.restype = ctypes.c_void_p
-        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        gdi32.SelectObject.restype = ctypes.c_void_p
-        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
-        gdi32.DeleteObject.restype = wintypes.BOOL
-        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
-        gdi32.DeleteDC.restype = wintypes.BOOL
-        user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.HICON, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
-        user32.DrawIconEx.restype = wintypes.BOOL
-        user32.DestroyIcon.argtypes = [wintypes.HICON]
-        user32.DestroyIcon.restype = wintypes.BOOL
+        SHFILEINFOW, BITMAPINFOHEADER, BITMAPINFO, sh_get, user32, gdi32 = api
 
         SHGFI_ICON = 0x000000100
         SHGFI_SMALLICON = 0x000000001
@@ -2905,6 +3180,90 @@ class ShellIconWorker(QtCore.QThread):
             self.finishedCycle.emit(self._jobs)
 
 
+class ShellIconBroker(QtCore.QObject):
+    """Deduplicate shell icon work across every pane in the window."""
+    iconReady = pyqtSignal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pending = set()
+        self._queue = []
+        self._worker = None
+
+    def request(self, jobs):
+        now = time.monotonic()
+        added = False
+        for key, path, is_dir in jobs:
+            key = str(key or "")
+            if not key or key in GLOBAL_SHELL_ICON_CACHE or key in self._pending:
+                continue
+            failed_at = GLOBAL_SHELL_ICON_FAILURES.get(key)
+            if failed_at is not None and (now - float(failed_at)) < SHELL_ICON_FAILURE_TTL_S:
+                continue
+            GLOBAL_SHELL_ICON_FAILURES.pop(key, None)
+            self._pending.add(key)
+            self._queue.append((key, str(path or ""), bool(is_dir)))
+            added = True
+        if added:
+            self._start_next()
+
+    def _start_next(self, batch_limit: int = 64):
+        if self._worker and self._worker.isRunning():
+            return
+        if not self._queue:
+            self._worker = None
+            return
+        batch = self._queue[:max(1, int(batch_limit))]
+        del self._queue[:len(batch)]
+        worker = ShellIconWorker(batch, self)
+        worker.iconReady.connect(self._apply_raw, Qt.QueuedConnection)
+        worker.finishedCycle.connect(
+            lambda jobs=batch, w=worker: self._on_cycle_finished(w, jobs),
+            Qt.QueuedConnection,
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    @QtCore.pyqtSlot(str, bytes, int, int)
+    def _apply_raw(self, key: str, raw: bytes, width: int, height: int):
+        if not raw or width <= 0 or height <= 0:
+            return
+        try:
+            image = QImage(raw, int(width), int(height), int(width) * 4, QImage.Format_ARGB32).copy()
+            icon = QIcon(QPixmap.fromImage(image))
+            if icon.isNull():
+                return
+            GLOBAL_SHELL_ICON_CACHE[key] = icon
+            GLOBAL_SHELL_ICON_FAILURES.pop(key, None)
+            self.iconReady.emit(key, icon)
+        except Exception:
+            pass
+
+    def _on_cycle_finished(self, worker, jobs):
+        if worker is not self._worker:
+            return
+        for key, _path, _is_dir in list(jobs or []):
+            self._pending.discard(key)
+            if key not in GLOBAL_SHELL_ICON_CACHE:
+                GLOBAL_SHELL_ICON_FAILURES[key] = time.monotonic()
+        self._worker = None
+        self._start_next()
+
+    def shutdown(self, wait_ms: int = 3000) -> bool:
+        self._queue = []
+        self._pending.clear()
+        worker = self._worker
+        if not worker or not worker.isRunning():
+            self._worker = None
+            return True
+        worker.cancel()
+        stopped = bool(worker.wait(max(0, int(wait_ms))))
+        if stopped:
+            self._worker = None
+        return stopped
+
+
 class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Ext", "Date Modified"]
 
@@ -2912,10 +3271,12 @@ class FastDirModel(QAbstractTableModel):
         super().__init__(parent)
         self._root = ""
         self._rows = []
+        self._row_by_path = {}
         self._icon_cache = {}
         self._icon_rows = {}
         self._icon_file = None
         self._icon_dir = None
+        self._last_sort = None
 
     def rootPath(self):
         return self._root
@@ -2924,8 +3285,10 @@ class FastDirModel(QAbstractTableModel):
         self.beginResetModel()
         self._root = path
         self._rows = []
+        self._row_by_path.clear()
         self._icon_cache.clear()
         self._icon_rows.clear()
+        self._last_sort = None
         self.endResetModel()
 
     @QtCore.pyqtSlot(list)
@@ -2942,8 +3305,41 @@ class FastDirModel(QAbstractTableModel):
         self.beginInsertRows(QtCore.QModelIndex(), start, start + len(prepared) - 1)
         self._rows.extend(prepared)
         for offset, rec in enumerate(prepared):
-            self._icon_rows.setdefault(rec["icon_key"], []).append(start + offset)
+            row = start + offset
+            self._row_by_path[str(rec.get("path", ""))] = row
+            self._icon_rows.setdefault(rec["icon_key"], []).append(row)
+        self._last_sort = None
         self.endInsertRows()
+
+    def _rebuild_row_maps(self):
+        self._row_by_path = {}
+        self._icon_rows = {}
+        for row, rec in enumerate(self._rows):
+            self._row_by_path[str(rec.get("path", ""))] = row
+            self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def sort_records(self, column: int, order=Qt.AscendingOrder):
+        sort_state = (int(column), int(order))
+        if self._last_sort == sort_state or len(self._rows) < 2:
+            self._last_sort = sort_state
+            return
+        persistent = self.persistentIndexList()
+        persistent_paths = [self.row_path(ix.row()) for ix in persistent]
+        sorted_rows = _sorted_record_rows(self._rows, int(column), order)
+        if all(old is new for old, new in zip(self._rows, sorted_rows)):
+            self._last_sort = sort_state
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._rows = sorted_rows
+        self._rebuild_row_maps()
+        remapped = [
+            self.index(self._row_by_path.get(path, -1), ix.column())
+            if path in self._row_by_path else QtCore.QModelIndex()
+            for ix, path in zip(persistent, persistent_paths)
+        ]
+        self.changePersistentIndexList(persistent, remapped)
+        self._last_sort = sort_state
+        self.layoutChanged.emit()
 
     def row_path(self, row: int) -> str:
         return self._rows[row]["path"] if 0 <= row < len(self._rows) else ""
@@ -2966,18 +3362,33 @@ class FastDirModel(QAbstractTableModel):
 
     @QtCore.pyqtSlot(int, object, object)
     def apply_stat(self, row: int, size_val, mtime_val):
-        if not (0 <= row < len(self._rows)):
+        path = self.row_path(row)
+        if not path:
             return
-        changed = []
-        if self._rows[row].get("size") is None and size_val is not None:
-            self._rows[row]["size"] = int(size_val)
-            changed.append(1)
-        if self._rows[row].get("mtime") is None and mtime_val is not None:
-            self._rows[row]["mtime"] = float(mtime_val)
-            changed.append(3)
-        for col in changed:
-            ix = self.index(row, col)
-            self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
+        self.apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def apply_stat_batch(self, updates: list):
+        size_rows = []
+        mtime_rows = []
+        for path, size_val, mtime_val in updates:
+            row = self._row_by_path.get(str(path))
+            if row is None or not (0 <= row < len(self._rows)):
+                continue
+            rec = self._rows[row]
+            if rec.get("size") is None and size_val is not None:
+                rec["size"] = int(size_val)
+                size_rows.append(row)
+            if rec.get("mtime") is None and mtime_val is not None:
+                rec["mtime"] = float(mtime_val)
+                mtime_rows.append(row)
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(size_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 1), roles)
+        for start, end in _contiguous_ranges(mtime_rows):
+            self.dataChanged.emit(self.index(start, 3), self.index(end, 3), roles)
+        if size_rows or mtime_rows:
+            self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
     def apply_icon_key(self, key: str, icon):
@@ -3087,26 +3498,125 @@ class FastDirModel(QAbstractTableModel):
         return None
 
 class FastStatWorker(QtCore.QThread):
-    statReady=pyqtSignal(int, object, object); finishedCycle=pyqtSignal()
-    def __init__(self, model:FastDirModel, root:str, rows:list[int], parent=None):
-        super().__init__(parent); self._model=model; self._root=root; self._rows=list(rows); self._cancel=False
+    statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
+    def __init__(self, root:str, paths:list[str], parent=None):
+        super().__init__(parent); self._root=root; self._paths=list(paths); self._cancel=False
     def cancel(self): self._cancel=True
     def run(self):
+        batch = []
         try:
-            for row in self._rows:
+            for p in self._paths:
                 if self._cancel: break
-                if self._model.rootPath()!=self._root: break
-                if self._model.has_stat(row): continue
-                p=self._model.row_path(row)
                 try:
                     st=os.stat(p, follow_symlinks=False)
                     size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
                     mtime_val=float(st.st_mtime)
                 except Exception:
                     size_val=0; mtime_val=None
-                self.statReady.emit(row,size_val,mtime_val)
+                batch.append((p, size_val, mtime_val))
+                if len(batch) >= 64:
+                    self.statBatchReady.emit(batch)
+                    batch = []
+            if batch:
+                self.statBatchReady.emit(batch)
         finally:
             self.finishedCycle.emit()
+
+
+class DirectorySnapshotCache:
+    """Thread-safe short-lived cache with one active scan per path/options key."""
+    def __init__(self, ttl_s: float = DIR_SNAPSHOT_TTL_S, max_entries: int = DIR_SNAPSHOT_CACHE_LIMIT):
+        self._ttl_s = max(0.0, float(ttl_s))
+        self._max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._cache = {}
+        self._flights = {}
+        self._generations = {}
+        self._last_invalidations = {}
+
+    @staticmethod
+    def _root_key(path: str) -> str:
+        return _path_key(path)
+
+    def acquire(self, path: str, preload_size: bool, preload_mtime: bool):
+        root_key = self._root_key(path)
+        key = (root_key, bool(preload_size), bool(preload_mtime))
+        now = time.monotonic()
+        with self._lock:
+            generation = int(self._generations.get(root_key, 0))
+            expired = [
+                cache_key for cache_key, item in self._cache.items()
+                if (now - float(item[0])) > self._ttl_s
+            ]
+            for cache_key in expired:
+                self._cache.pop(cache_key, None)
+            cached = self._cache.get(key)
+            if cached is not None and int(cached[1]) == generation:
+                return "cached", key, generation, None, cached[2], cached[3]
+            flight = self._flights.get(key)
+            if flight is not None and int(flight[0]) == generation:
+                return "wait", key, generation, flight[1], None, None
+            event = threading.Event()
+            self._flights[key] = (generation, event)
+            return "leader", key, generation, event, None, None
+
+    def publish(self, key, generation: int, event, rows, error: str | None = None):
+        with self._lock:
+            root_key = key[0]
+            if int(self._generations.get(root_key, 0)) == int(generation):
+                self._cache[key] = (time.monotonic(), int(generation), tuple(rows or ()), error)
+                while len(self._cache) > self._max_entries:
+                    oldest_key = next(iter(self._cache))
+                    self._cache.pop(oldest_key, None)
+            current = self._flights.get(key)
+            if current is not None and current[1] is event:
+                self._flights.pop(key, None)
+            event.set()
+
+    def abandon(self, key, event):
+        with self._lock:
+            current = self._flights.get(key)
+            if current is not None and current[1] is event:
+                self._flights.pop(key, None)
+            event.set()
+
+    def invalidate(self, path: str, coalesce_s: float = 0.0) -> bool:
+        root_key = self._root_key(path)
+        with self._lock:
+            now = time.monotonic()
+            last = self._last_invalidations.get(root_key)
+            if coalesce_s > 0 and last is not None and (now - float(last)) < float(coalesce_s):
+                return False
+            self._last_invalidations[root_key] = now
+            self._generations[root_key] = int(self._generations.get(root_key, 0)) + 1
+            for key in [key for key in self._cache if key[0] == root_key]:
+                self._cache.pop(key, None)
+            return True
+
+
+GLOBAL_DIR_SNAPSHOTS = DirectorySnapshotCache()
+
+
+class FileChangeRefreshState:
+    """Coalesce watcher events while a managed file operation is active."""
+    def __init__(self):
+        self.pending = False
+
+    def note_change(self, operation_pending: bool) -> bool:
+        if operation_pending:
+            self.pending = True
+            return False
+        return True
+
+    def operation_state_changed(self, busy: bool) -> bool:
+        if busy or not self.pending:
+            return False
+        self.pending = False
+        return True
+
+    def reset(self):
+        self.pending = False
+
 
 class DirEnumWorker(QtCore.QThread):
     batchReady=QtCore.pyqtSignal(list); finished=QtCore.pyqtSignal(); error=QtCore.pyqtSignal(str)
@@ -3117,53 +3627,99 @@ class DirEnumWorker(QtCore.QThread):
         self._preload_size = bool(preload_size)
         self._preload_mtime = bool(preload_mtime)
     def cancel(self): self._cancel=True
+
+    def _emit_snapshot(self, rows):
+        batch_size = 400
+        for start in range(0, len(rows), batch_size):
+            if self._cancel:
+                return
+            self.batchReady.emit(list(rows[start:start + batch_size]))
+
+    def _scan_as_leader(self):
+        all_rows = []
+        batch, batch_size = [], 400
+        with os.scandir(self.root) as it:
+            for entry in it:
+                if self._cancel:
+                    break
+                name=entry.name; p=os.path.join(self.root,name)
+                try: is_dir=entry.is_dir(follow_symlinks=False)
+                except Exception: is_dir=os.path.isdir(p)
+                ext = file_extension_label(name, is_dir)
+                size_val = None
+                mtime_val = None
+                if self._preload_size or self._preload_mtime:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if self._preload_size:
+                            size_val = 0 if is_dir else int(st.st_size)
+                        if self._preload_mtime:
+                            mtime_val = float(st.st_mtime)
+                    except Exception:
+                        if self._preload_size:
+                            size_val = 0 if is_dir else None
+                        if self._preload_mtime:
+                            mtime_val = None
+                rec = {
+                    "name": name,
+                    "name_l": name.lower(),
+                    "path": p,
+                    "is_dir": is_dir,
+                    "ext": ext,
+                    "size": size_val,
+                    "mtime": mtime_val,
+                    "icon_key": _icon_cache_key(p, is_dir),
+                }
+                batch.append(rec)
+                all_rows.append(rec)
+                if len(batch)>=batch_size:
+                    self.batchReady.emit(batch)
+                    batch=[]
+            if batch:
+                self.batchReady.emit(batch)
+        return all_rows
+
     def run(self):
-        batch, BATCH=[], 400
         try:
-            with os.scandir(self.root) as it:
-                for entry in it:
-                    if self._cancel: break
-                    name=entry.name; p=os.path.join(self.root,name)
-                    try: is_dir=entry.is_dir(follow_symlinks=False)
-                    except Exception: is_dir=os.path.isdir(p)
-                    ext = file_extension_label(name, is_dir)
-                    size_val = None
-                    mtime_val = None
-                    if self._preload_size or self._preload_mtime:
-                        try:
-                            st = entry.stat(follow_symlinks=False)
-                            if self._preload_size:
-                                size_val = 0 if is_dir else int(st.st_size)
-                            if self._preload_mtime:
-                                mtime_val = float(st.st_mtime)
-                        except Exception:
-                            if self._preload_size:
-                                size_val = 0 if is_dir else None
-                            if self._preload_mtime:
-                                mtime_val = None
-                    batch.append({
-                        "name": name,
-                        "name_l": name.lower(),
-                        "path": p,
-                        "is_dir": is_dir,
-                        "ext": ext,
-                        "size": size_val,
-                        "mtime": mtime_val,
-                        "icon_key": _icon_cache_key(p, is_dir),
-                    })
-                    if len(batch)>=BATCH: self.batchReady.emit(batch); batch=[]
-                if batch: self.batchReady.emit(batch)
-        except Exception as e:
-            self.error.emit(str(e))
+            while not self._cancel:
+                state, key, generation, event, rows, error = GLOBAL_DIR_SNAPSHOTS.acquire(
+                    self.root, self._preload_size, self._preload_mtime
+                )
+                if state == "cached":
+                    if error:
+                        self.error.emit(str(error))
+                    else:
+                        self._emit_snapshot(rows)
+                    return
+                if state == "wait":
+                    while not self._cancel and not event.wait(0.05):
+                        pass
+                    continue
+
+                try:
+                    rows = self._scan_as_leader()
+                    if self._cancel:
+                        GLOBAL_DIR_SNAPSHOTS.abandon(key, event)
+                    else:
+                        GLOBAL_DIR_SNAPSHOTS.publish(key, generation, event, rows)
+                    return
+                except Exception as exc:
+                    if self._cancel:
+                        GLOBAL_DIR_SNAPSHOTS.abandon(key, event)
+                    else:
+                        GLOBAL_DIR_SNAPSHOTS.publish(key, generation, event, (), str(exc))
+                        self.error.emit(str(exc))
+                    return
         finally:
             self.finished.emit()
 
 class NormalStatWorker(QtCore.QThread):
-    statReady=pyqtSignal(str, object, object); finishedCycle=pyqtSignal()
+    statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
     def __init__(self, paths:list[str], parent=None):
         super().__init__(parent); self._paths=list(paths); self._cancel=False
     def cancel(self): self._cancel=True
     def run(self):
+        batch = []
         try:
             for p in self._paths:
                 if self._cancel: break
@@ -3173,7 +3729,12 @@ class NormalStatWorker(QtCore.QThread):
                     mtime_val=float(st.st_mtime)
                 except Exception:
                     size_val=0; mtime_val=None
-                self.statReady.emit(p,size_val,mtime_val)
+                batch.append((p, size_val, mtime_val))
+                if len(batch) >= 64:
+                    self.statBatchReady.emit(batch)
+                    batch = []
+            if batch:
+                self.statBatchReady.emit(batch)
         finally:
             self.finishedCycle.emit()
 
@@ -3476,24 +4037,32 @@ class StatOverlayProxy(QIdentityProxyModel):
         del self._queue[:batch_size]
 
         w = NormalStatWorker(batch, self)
-        w.statReady.connect(self._apply_stat, Qt.QueuedConnection)
+        w.statBatchReady.connect(self._apply_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch: self._on_cycle_finished(b), Qt.QueuedConnection)
         self._worker = w
         w.start()
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_stat(self, path: str, size_val, mtime_val):
-        self._cache[path] = (int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
-        try:
-            src = self.sourceModel()
-            sidx0 = src.index(path)
-            if sidx0.isValid():
-                for col in (1, 3):
-                    sidx = sidx0.sibling(sidx0.row(), col)
+        self._apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def _apply_stat_batch(self, updates: list):
+        changed_rows = []
+        src = self.sourceModel()
+        for path, size_val, mtime_val in updates:
+            self._cache[path] = (int(size_val or 0), float(mtime_val) if mtime_val is not None else None)
+            try:
+                sidx = src.index(path)
+                if sidx.isValid():
                     pidx = self.mapFromSource(sidx)
-                    self.dataChanged.emit(pidx, pidx, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
-        except Exception:
-            pass
+                    if pidx.isValid():
+                        changed_rows.append(pidx.row())
+            except Exception:
+                pass
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(changed_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 3), roles)
 
     def _on_cycle_finished(self, batch):
         retry = []
@@ -3938,6 +4507,7 @@ class SearchResultModel(QAbstractTableModel):
         self._icon_rows = {}
         self._icon_file = None
         self._icon_dir = None
+        self._last_sort = None
 
     @QtCore.pyqtSlot(list)
     def append_rows(self, rows: list):
@@ -3963,7 +4533,39 @@ class SearchResultModel(QAbstractTableModel):
             row = first + offset
             self._row_by_path[rec.get("path", "")] = row
             self._icon_rows.setdefault(rec["icon_key"], []).append(row)
+        self._last_sort = None
         self.endInsertRows()
+
+    def _rebuild_row_maps(self):
+        self._row_by_path = {}
+        self._icon_rows = {}
+        for row, rec in enumerate(self._rows):
+            path = str(rec.get("path", ""))
+            self._row_by_path[path] = row
+            self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def sort_records(self, column: int, order=Qt.AscendingOrder):
+        sort_state = (int(column), int(order))
+        if self._last_sort == sort_state or len(self._rows) < 2:
+            self._last_sort = sort_state
+            return
+        persistent = self.persistentIndexList()
+        persistent_paths = [self.row_path(ix.row()) for ix in persistent]
+        sorted_rows = _sorted_record_rows(self._rows, int(column), order)
+        if all(old is new for old, new in zip(self._rows, sorted_rows)):
+            self._last_sort = sort_state
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._rows = sorted_rows
+        self._rebuild_row_maps()
+        remapped = [
+            self.index(self._row_by_path.get(path, -1), ix.column())
+            if path in self._row_by_path else QtCore.QModelIndex()
+            for ix, path in zip(persistent, persistent_paths)
+        ]
+        self.changePersistentIndexList(persistent, remapped)
+        self._last_sort = sort_state
+        self.layoutChanged.emit()
 
     def rowCount(self, parent=QtCore.QModelIndex()):
         return 0 if parent.isValid() else len(self._rows)
@@ -3999,20 +4601,30 @@ class SearchResultModel(QAbstractTableModel):
 
     @QtCore.pyqtSlot(str, object, object)
     def apply_stat(self, path: str, size_val, mtime_val):
-        row = self._row_by_path.get(path)
-        if row is None or not (0 <= row < len(self._rows)):
-            return
-        rec = self._rows[row]
-        changed = []
-        if rec.get("size") is None and size_val is not None:
-            rec["size"] = int(size_val)
-            changed.append(1)
-        if rec.get("mtime") is None and mtime_val is not None:
-            rec["mtime"] = float(mtime_val)
-            changed.append(3)
-        for col in changed:
-            ix = self.index(row, col)
-            self.dataChanged.emit(ix, ix, [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE])
+        self.apply_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def apply_stat_batch(self, updates: list):
+        size_rows = []
+        mtime_rows = []
+        for path, size_val, mtime_val in updates:
+            row = self._row_by_path.get(path)
+            if row is None or not (0 <= row < len(self._rows)):
+                continue
+            rec = self._rows[row]
+            if rec.get("size") is None and size_val is not None:
+                rec["size"] = int(size_val)
+                size_rows.append(row)
+            if rec.get("mtime") is None and mtime_val is not None:
+                rec["mtime"] = float(mtime_val)
+                mtime_rows.append(row)
+        roles = [Qt.DisplayRole, Qt.EditRole, SIZE_BYTES_ROLE]
+        for start, end in _contiguous_ranges(size_rows):
+            self.dataChanged.emit(self.index(start, 1), self.index(end, 1), roles)
+        for start, end in _contiguous_ranges(mtime_rows):
+            self.dataChanged.emit(self.index(start, 3), self.index(end, 3), roles)
+        if size_rows or mtime_rows:
+            self._last_sort = None
 
     @QtCore.pyqtSlot(str, object)
     def apply_icon_key(self, key: str, icon):
@@ -4587,7 +5199,6 @@ class ExplorerPane(QWidget):
         row_path = self._build_path_row()
         row_filter = self._build_filter_row()
 
-        self._init_models()
         self._setup_view()
         row_status = self._build_status_row()
 
@@ -4622,8 +5233,8 @@ class ExplorerPane(QWidget):
                 self._tooltip_display_ms = max(1000, int(base_ms * HOVER_TOOLTIP_DURATION_MULTIPLIER))
         except Exception:
             pass
-        self._fast_model=FastDirModel(self); self._fast_proxy=FsSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
-        self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None
+        self._fast_model=FastDirModel(self); self._fast_proxy=RecordSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
+        self._using_fast=True; self._fast_stat_worker=None; self._enum_worker=None
         self._fast_enum_count = 0
         self._fast_enum_root = ""
         self._fast_enum_done = False
@@ -4631,11 +5242,7 @@ class ExplorerPane(QWidget):
         self._file_worker=None
         self._icon_cache = {}
         self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
-        self._icon_pending = set()
-        self._icon_queue = []
-        self._icon_worker = None
         self._op_progress_dialog=None
-        self._dirload_timer={}
         self._sort_column = 0
         self._sort_order = Qt.AscendingOrder
         self._search_sort_column = 0
@@ -4653,17 +5260,35 @@ class ExplorerPane(QWidget):
         self._disk_free_cache_text = ""
         self._disk_free_cache_ts = 0.0
         self._disk_free_ttl_s = 2.0
-        self._fs_change_generation = 0
+        self._fs_refresh_state = FileChangeRefreshState()
+        self._settings_sync_timer = None
+        self._pending_sort_settings = False
+        self._pending_search_widths = {}
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
-        self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder"); self.btn_star.setFixedHeight(UI_H)
-        self._bm_btn_container=QWidget(self); self._bm_btn_layout=QHBoxLayout(self._bm_btn_container)
-        self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(ROW_SPACING)
+        self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder")
+        base_star_width = max(UI_H, self.btn_star.sizeHint().width())
+        self.btn_star.setFixedSize(base_star_width * 2, UI_H * 2)
+        self.btn_star.setIconSize(QSize(36, 36))
+        self._bm_btn_container=QWidget(self)
+        self._bm_btn_layout=QVBoxLayout(self._bm_btn_container)
+        self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(max(0, ROW_SPACING-2))
+        self._bm_btn_row_widgets = []
+        self._bm_btn_row_layouts = []
+        for _ in range(BOOKMARK_TOOLBAR_ROWS):
+            row_widget = QWidget(self._bm_btn_container)
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0,0,0,0)
+            row_layout.setSpacing(ROW_SPACING)
+            self._bm_btn_layout.addWidget(row_widget)
+            self._bm_btn_row_widgets.append(row_widget)
+            self._bm_btn_row_layouts.append(row_layout)
         self._quick_bm_buttons = []
         self._quick_bm_more_btn = QToolButton(self._bm_btn_container)
         self._quick_bm_more_btn.setObjectName("quickBookmarkMoreBtn")
         self._quick_bm_more_btn.setText("...")
+        self._quick_bm_more_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._quick_bm_more_btn.setToolTip("More bookmarks")
         self._quick_bm_more_btn.setFixedHeight(UI_H)
         self._quick_bm_more_btn.setFixedWidth(QUICK_BOOKMARK_MORE_W)
@@ -4683,18 +5308,21 @@ class ExplorerPane(QWidget):
 
         self.btn_refresh=QToolButton(self); self.btn_refresh.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload)); self.btn_refresh.setToolTip("Refresh"); self.btn_refresh.setFixedHeight(UI_H)
 
+        tool_grid_widget = QWidget(self)
+        tool_grid = QGridLayout(tool_grid_widget)
+        tool_grid.setContentsMargins(0,0,0,0)
+        tool_grid.setHorizontalSpacing(max(0, ROW_SPACING-2))
+        tool_grid.setVerticalSpacing(max(0, ROW_SPACING-2))
+
         row_toolbar=QHBoxLayout()
         row_toolbar.setContentsMargins(0,0,0,0)
 
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
-        row_toolbar.addWidget(self.btn_star)
+        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignVCenter)
         row_toolbar.addWidget(self._bm_btn_container,1)
-        row_toolbar.addWidget(self.btn_cmd)
-        row_toolbar.addWidget(self.btn_explorer)
-        row_toolbar.addWidget(self.btn_up)
-        row_toolbar.addWidget(self.btn_new)
-        row_toolbar.addWidget(self.btn_new_file)
-        row_toolbar.addWidget(self.btn_refresh)
+        for index, button in enumerate((self.btn_cmd, self.btn_explorer, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh)):
+            tool_grid.addWidget(button, index // 3, index % 3)
+        row_toolbar.addWidget(tool_grid_widget, 0, Qt.AlignVCenter)
         self._row_toolbar=row_toolbar
 
 
@@ -4719,26 +5347,8 @@ class ExplorerPane(QWidget):
         row_filter.addWidget(self.filter_label); row_filter.addWidget(self.filter_edit,1); row_filter.addWidget(self.btn_search,0)
         return row_filter
 
-    def _init_models(self):
-        self.source_model=QFileSystemModel(self); self.source_model.setReadOnly(False)
-        try: self.source_model.setResolveSymlinks(False)
-        except Exception: pass
-        self.source_model.setFilter(QDir.AllEntries|QDir.NoDotAndDotDot|QDir.Hidden|QDir.System|QDir.Drives|QDir.AllDirs)
-        self._native_icons=QFileIconProvider()
-        self._generic_icons=GenericIconProvider(self.style())
-        self._icon_provider_mode="native"
-        if ALWAYS_GENERIC_ICONS:
-            self.source_model.setIconProvider(self._generic_icons)
-            self._icon_provider_mode="generic"
-        else:
-            self.source_model.setIconProvider(self._native_icons)
-
-        self.stat_proxy=StatOverlayProxy(self); self.stat_proxy.setSourceModel(self.source_model)
-        self.proxy=FsSortProxy(self); self.proxy.setSourceModel(self.stat_proxy)
-        self.source_model.directoryLoaded.connect(self._on_directory_loaded)
-
     def _setup_view(self):
-        self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
+        self.view=ExplorerView(self); self.view.setModel(self._fast_proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -4962,6 +5572,10 @@ class ExplorerPane(QWidget):
 
     def _connect_signals(self):
         self.host.namedBookmarksChanged.connect(self._on_bookmarks_changed)
+        if getattr(self.host, "file_ops", None):
+            self.host.file_ops.busyChanged.connect(self._on_file_ops_busy_changed)
+        if getattr(self.host, "icon_broker", None):
+            self.host.icon_broker.iconReady.connect(self._apply_shared_icon, Qt.QueuedConnection)
         self.path_bar.pathSubmitted.connect(lambda p: self.set_path(p, push_history=True))
         self.btn_star.clicked.connect(self._on_star_toggle)
         self.btn_cmd.clicked.connect(self._open_cmd_here)
@@ -4982,12 +5596,6 @@ class ExplorerPane(QWidget):
         self.btn_search.clicked.connect(self._on_search_button_clicked)
         self.filter_edit.textChanged.connect(self._on_filter_text_changed)
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._request_visible_stats())
-        except Exception: pass
-        try: self.proxy.rowsInserted.connect(lambda *_: self._request_visible_stats(0))
-        except Exception: pass
-        try: self.proxy.modelReset.connect(lambda: self._request_visible_stats(0))
-        except Exception: pass
-        try: self.proxy.layoutChanged.connect(lambda *_: self._request_visible_stats(0))
         except Exception: pass
 
     def _register_shortcuts(self):
@@ -5047,11 +5655,31 @@ class ExplorerPane(QWidget):
         self._search_sort_order = Qt.AscendingOrder
 
     def _save_sort_settings(self):
+        self._pending_sort_settings = True
+        self._schedule_ui_settings_sync()
+
+    def _schedule_ui_settings_sync(self):
+        if self._settings_sync_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(self._flush_pending_ui_settings)
+            self._settings_sync_timer = timer
+        self._settings_sync_timer.start()
+
+    def _flush_pending_ui_settings(self):
+        if not self._pending_sort_settings and not self._pending_search_widths:
+            return
         try:
-            s = QSettings(ORG_NAME, APP_NAME)
-            s.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
-            s.setValue(f"pane_{self.pane_id}/sort_order", int(self._sort_order))
-            s.sync()
+            settings = QSettings(ORG_NAME, APP_NAME)
+            if self._pending_sort_settings:
+                settings.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
+                settings.setValue(f"pane_{self.pane_id}/sort_order", int(self._sort_order))
+            for logical_index, width in self._pending_search_widths.items():
+                settings.setValue(f"pane_{self.pane_id}/search_width_{logical_index}", width)
+            settings.sync()
+            self._pending_sort_settings = False
+            self._pending_search_widths = {}
         except Exception:
             pass
 
@@ -5110,6 +5738,8 @@ class ExplorerPane(QWidget):
 
     def _load_search_header_width(self, logical_index: int, default: int) -> int:
         fallback = max(24, int(default))
+        if logical_index in self._pending_search_widths:
+            return max(24, int(self._pending_search_widths[logical_index]))
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             width = s.value(f"pane_{self.pane_id}/search_width_{logical_index}", fallback, type=int)
@@ -5118,12 +5748,8 @@ class ExplorerPane(QWidget):
             return fallback
 
     def _save_search_header_width(self, logical_index: int, width: int):
-        try:
-            s = QSettings(ORG_NAME, APP_NAME)
-            s.setValue(f"pane_{self.pane_id}/search_width_{logical_index}", max(24, int(width)))
-            s.sync()
-        except Exception:
-            pass
+        self._pending_search_widths[int(logical_index)] = max(24, int(width))
+        self._schedule_ui_settings_sync()
 
     def _apply_saved_sort(self, search_mode: bool | None = None):
         try:
@@ -5270,23 +5896,11 @@ class ExplorerPane(QWidget):
             return False
 
         try:
-            if self._using_fast:
-                rows = self._fast_model.rowCount()
-                for r in range(rows):
-                    rp = self._fast_model.row_path(r)
-                    if rp and os.path.normcase(rp) == target_key:
-                        prx_ix = self._fast_proxy.index(r, 0)
-                        sm = self.view.selectionModel()
-                        sm.clearSelection()
-                        sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-                        self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
-                        self.view.setCurrentIndex(prx_ix)
-                        return True
-            else:
-                src_ix = self.source_model.index(target_path)
-                if src_ix.isValid():
-                    st_ix = self.stat_proxy.mapFromSource(src_ix)
-                    prx_ix = self.proxy.mapFromSource(st_ix)
+            rows = self._fast_model.rowCount()
+            for r in range(rows):
+                rp = self._fast_model.row_path(r)
+                if rp and os.path.normcase(rp) == target_key:
+                    prx_ix = self._fast_proxy.index(r, 0)
                     sm = self.view.selectionModel()
                     sm.clearSelection()
                     sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
@@ -5369,10 +5983,11 @@ class ExplorerPane(QWidget):
             return False
 
     def _cancel_search_worker(self):
-
-        self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
+        stopped = self._stop_worker_thread(getattr(self, "_search_worker", None), 120, "search")
         self._search_worker = None
-        self._stop_worker_thread(getattr(self, "_search_stat_worker", None), 80, "search-stat")
+        stopped = self._stop_worker_thread(
+            getattr(self, "_search_stat_worker", None), 80, "search-stat"
+        ) and stopped
         self._search_stat_worker = None
         self._search_pending_items = {}
         self._search_stats_done = set()
@@ -5384,6 +5999,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
         self._set_search_button_state(False)
+        return stopped
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
@@ -5452,7 +6068,7 @@ class ExplorerPane(QWidget):
         del self._search_stat_queue[:size]
 
         w = NormalStatWorker(batch, self)
-        w.statReady.connect(self._apply_search_stat, Qt.QueuedConnection)
+        w.statBatchReady.connect(self._apply_search_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch, worker=w: self._on_search_stat_cycle_finished(worker, b), Qt.QueuedConnection)
         self._search_stat_worker = w
         w.start()
@@ -5486,11 +6102,15 @@ class ExplorerPane(QWidget):
 
     @QtCore.pyqtSlot(str, object, object)
     def _apply_search_stat(self, path: str, size_val, mtime_val):
+        self._apply_search_stat_batch([(path, size_val, mtime_val)])
+
+    @QtCore.pyqtSlot(list)
+    def _apply_search_stat_batch(self, updates: list):
         if self.sender() is not getattr(self, "_search_stat_worker", None):
             return
         model = getattr(self, "_search_model", None)
         if isinstance(model, SearchResultModel):
-            model.apply_stat(path, size_val, mtime_val)
+            model.apply_stat_batch(updates)
 
 
 
@@ -5520,25 +6140,11 @@ class ExplorerPane(QWidget):
                 return
 
             try:
-                if self._using_fast:
-
-                    rows = self._fast_model.rowCount()
-                    for r in range(rows):
-                        rp = self._fast_model.row_path(r)
-                        if rp and os.path.normcase(rp) == os.path.normcase(new_path):
-                            prx_ix = self._fast_proxy.index(r, 0)
-                            sm = self.view.selectionModel()
-                            sm.clearSelection()
-                            sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-                            self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
-                            self.view.setCurrentIndex(prx_ix)
-                            return
-                else:
-
-                    src_ix = self.source_model.index(new_path)
-                    if src_ix.isValid():
-                        st_ix = self.stat_proxy.mapFromSource(src_ix)
-                        prx_ix = self.proxy.mapFromSource(st_ix)
+                rows = self._fast_model.rowCount()
+                for r in range(rows):
+                    rp = self._fast_model.row_path(r)
+                    if rp and os.path.normcase(rp) == os.path.normcase(new_path):
+                        prx_ix = self._fast_proxy.index(r, 0)
                         sm = self.view.selectionModel()
                         sm.clearSelection()
                         sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
@@ -5557,13 +6163,6 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
-    def _default_icon(self, is_dir: bool) -> QIcon:
-        try:
-            if ALWAYS_GENERIC_ICONS:
-                return self._generic_icons.icon(QFileIconProvider.Folder if is_dir else QFileIconProvider.File)
-            return self.style().standardIcon(QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon)
-        except Exception: return QIcon()
-
     def _apply_icon_to_models(self, key: str, icon: QIcon):
         try:
             self._fast_model.apply_icon_key(key, icon)
@@ -5576,25 +6175,16 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
 
-    @QtCore.pyqtSlot(str, bytes, int, int)
-    def _apply_async_icon_raw(self, key: str, raw: bytes, width: int, height: int):
-        if not raw or width <= 0 or height <= 0:
+    @QtCore.pyqtSlot(str, object)
+    def _apply_shared_icon(self, key: str, icon):
+        if not key or not isinstance(icon, QIcon) or icon.isNull():
             return
-        try:
-            image = QImage(raw, int(width), int(height), int(width) * 4, QImage.Format_ARGB32).copy()
-            icon = QIcon(QPixmap.fromImage(image))
-            if icon.isNull():
-                return
-            self._icon_cache[key] = icon
-            GLOBAL_SHELL_ICON_CACHE[key] = icon
-            self._icon_failed.pop(key, None)
-            self._apply_icon_to_models(key, icon)
-        except Exception:
-            pass
+        self._icon_cache[key] = icon
+        self._icon_failed.pop(key, None)
+        self._apply_icon_to_models(key, icon)
 
     def _queue_async_icons(self, jobs):
-        added = False
-        now = time.monotonic()
+        pending = []
         for key, path, is_dir in jobs:
             key = str(key or "")
             if not key:
@@ -5605,64 +6195,33 @@ class ExplorerPane(QWidget):
                 self._icon_failed.pop(key, None)
                 self._apply_icon_to_models(key, cached)
                 continue
-            failed_at = self._icon_failed.get(key)
-            if failed_at is not None and (now - float(failed_at)) < SHELL_ICON_FAILURE_TTL_S:
-                continue
-            if failed_at is not None:
-                self._icon_failed.pop(key, None)
-            if key in self._icon_pending:
-                continue
-            self._icon_pending.add(key)
-            self._icon_queue.append((key, str(path or ""), bool(is_dir)))
-            added = True
-        if added:
-            self._start_next_icon_worker()
-
-    def _start_next_icon_worker(self, batch_limit: int = 64):
-        cur = getattr(self, "_icon_worker", None)
-        if cur and cur.isRunning():
-            return
-        if not self._icon_queue:
-            self._icon_worker = None
-            return
-        batch = self._icon_queue[:max(1, int(batch_limit))]
-        del self._icon_queue[:len(batch)]
-        worker = ShellIconWorker(batch, self)
-        worker.iconReady.connect(self._apply_async_icon_raw, Qt.QueuedConnection)
-        worker.finishedCycle.connect(self._on_icon_cycle_finished, Qt.QueuedConnection)
-        self._icon_worker = worker
-        worker.start()
-
-    @QtCore.pyqtSlot(object)
-    def _on_icon_cycle_finished(self, jobs):
-        for key, _path, _is_dir in list(jobs or []):
-            self._icon_pending.discard(key)
-            if key not in self._icon_cache:
-                self._icon_failed[key] = time.monotonic()
-        self._icon_worker = None
-        self._start_next_icon_worker()
+            pending.append((key, str(path or ""), bool(is_dir)))
+        broker = getattr(self.host, "icon_broker", None)
+        if pending and broker is not None:
+            broker.request(pending)
 
     def _cancel_icon_worker(self):
-        self._icon_queue = []
-        self._icon_pending.clear()
-        self._stop_worker_thread(getattr(self, "_icon_worker", None), 150, "shell-icon")
-        self._icon_worker = None
+        # Icon work belongs to the window-wide broker and may still be needed by
+        # another pane, so navigating or closing one pane must not cancel it.
+        return True
 
     def _cancel_fast_stat_worker(self):
-        self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
+        stopped = self._stop_worker_thread(self._fast_stat_worker, 120, "fast-stat")
         self._fast_stat_worker=None
+        return stopped
 
     def _cancel_enum_worker(self, wait_ms: int = 150):
-        self._stop_worker_thread(self._enum_worker, wait_ms, "dir-enum")
+        stopped = self._stop_worker_thread(self._enum_worker, wait_ms, "dir-enum")
         self._enum_worker = None
+        return stopped
 
     def _cancel_file_worker(self, wait_ms: int = 300):
         worker = getattr(self, "_file_worker", None)
         manager = getattr(getattr(self, "host", None), "file_ops", None)
         if worker and manager and manager.owns(worker):
-            manager.cancel_worker(worker, wait_ms)
+            stopped = manager.cancel_worker(worker, wait_ms)
         else:
-            self._stop_worker_thread(worker, wait_ms, "file-op")
+            stopped = self._stop_worker_thread(worker, wait_ms, "file-op")
         self._file_worker = None
         try:
             self._hide_pane_progress()
@@ -5676,8 +6235,10 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
             self._op_progress_dialog = None
+        return stopped
 
     def shutdown(self, wait_ms: int = 300):
+        self._flush_pending_ui_settings()
         try:
             self._cancel_search_worker()
         except Exception:
@@ -5699,6 +6260,11 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
 
+        # References may have been cleared after a timed-out cancellation.  The
+        # workers remain QObject children, so audit every child thread before the
+        # pane is allowed to be destroyed.
+        return _cancel_and_wait_child_threads(self, wait_ms)
+
     def _ensure_visible_stats_timer(self):
         if self._visible_stats_timer is not None:
             return
@@ -5718,54 +6284,6 @@ class ExplorerPane(QWidget):
                 return
             t.stop()
         t.start(delay)
-
-    def _visible_browse_stat_paths(self, margin_before: int = 40, margin_after: int = 80) -> list[str]:
-        if self._search_mode or self._using_fast:
-            return []
-        if self.view.model() is not self.proxy:
-            return []
-
-        model = self.proxy
-        stat_proxy = self.stat_proxy
-        src_model = self.source_model
-        root_ix = self.view.rootIndex()
-        vp = self.view.viewport()
-
-        top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
-        bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
-        start = top_ix.row() if top_ix.isValid() else 0
-        rc = model.rowCount(root_ix)
-        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, rc - 1)
-        start = max(0, start - max(0, int(margin_before)))
-        end = min(rc - 1, end + max(0, int(margin_after)))
-        if end < start:
-            end = start
-
-        paths = []
-        for r in range(start, end + 1):
-            prx_ix = model.index(r, 0, root_ix)
-            if not prx_ix.isValid():
-                continue
-            st_ix = model.mapToSource(prx_ix)
-            if not st_ix.isValid():
-                continue
-            src_ix = stat_proxy.mapToSource(st_ix)
-            if not src_ix.isValid():
-                continue
-            try:
-                p = src_model.filePath(src_ix)
-            except Exception:
-                p = None
-            if p:
-                paths.append(p)
-        return paths
-
-    def _refresh_visible_browse_stats(self, force: bool = False, generation: int | None = None):
-        if generation is not None and generation != getattr(self, "_fs_change_generation", 0):
-            return
-        paths = self._visible_browse_stat_paths()
-        if paths:
-            self.stat_proxy.request_paths(paths, force=force)
 
     def _ensure_selection_update_timer(self):
         if self._selection_update_timer is not None:
@@ -5893,7 +6411,7 @@ class ExplorerPane(QWidget):
             proxy_start = max(0, proxy_start - 30)
             proxy_end   = min(rc - 1, proxy_end + 50)
 
-            to_rows = []
+            stat_paths = []
             icon_jobs = []
             for r in range(proxy_start, proxy_end + 1):
                 prx_ix = self._fast_proxy.index(r, 0, root_ix)
@@ -5902,8 +6420,10 @@ class ExplorerPane(QWidget):
                 if row is None or row < 0:
                     continue
                 if not self._fast_model.has_stat(row):
-                    to_rows.append(row)
-                    if len(to_rows) >= 220:
+                    path = self._fast_model.row_path(row)
+                    if path:
+                        stat_paths.append(path)
+                    if len(stat_paths) >= 220:
                         break
 
 
@@ -5915,13 +6435,13 @@ class ExplorerPane(QWidget):
 
             if icon_jobs:
                 self._queue_async_icons(icon_jobs)
-            if not to_rows:
+            if not stat_paths:
                 return
             if self._fast_stat_worker and self._fast_stat_worker.isRunning():
                 return
             root = self._fast_model.rootPath()
-            w = FastStatWorker(self._fast_model, root, to_rows, self)
-            w.statReady.connect(self._fast_model.apply_stat, Qt.QueuedConnection)
+            w = FastStatWorker(root, stat_paths, self)
+            w.statBatchReady.connect(self._fast_model.apply_stat_batch, Qt.QueuedConnection)
             def _on_fast_cycle_finished():
                 if self._fast_stat_worker is w:
                     self._fast_stat_worker = None
@@ -5930,12 +6450,6 @@ class ExplorerPane(QWidget):
             self._fast_stat_worker = w
             w.start()
             return
-
-
-        if current_model is not self.proxy:
-            return
-
-        self._refresh_visible_browse_stats(force=False)
 
     def _on_header_clicked(self, col:int):
         v=self.view
@@ -6153,15 +6667,19 @@ class ExplorerPane(QWidget):
         more_btn.setToolTip(f"More bookmarks ({len(overflow_buttons)})")
 
     def _rebuild_quick_bookmark_buttons(self):
-        while self._bm_btn_layout.count():
-            it=self._bm_btn_layout.takeAt(0); w=it.widget()
-            if w and w is not getattr(self, "_quick_bm_more_btn", None): w.deleteLater()
+        for row_layout in self._bm_btn_row_layouts:
+            while row_layout.count():
+                row_layout.takeAt(0)
+        for button in getattr(self, "_quick_bm_buttons", []):
+            button.hide()
+            button.deleteLater()
         self._quick_bm_buttons = []
         for it in self.host.get_enabled_bookmarks():
             name=it.get("name") or _derive_name_from_path(it.get("path","")); p=it.get("path","")
             btn=QToolButton(self._bm_btn_container)
             btn.setObjectName("quickBookmarkBtn")
             btn.setText(str(name))
+            btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
             btn.setProperty("fullText", str(name))
             btn.setProperty("bookmarkPath", str(p))
             btn.setToolTip(p)
@@ -6169,10 +6687,7 @@ class ExplorerPane(QWidget):
             btn.setFixedWidth(self._quick_bookmark_button_width(str(name)))
             btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _=False, path=p: self.set_path(path, push_history=True))
-            self._bm_btn_layout.addWidget(btn)
             self._quick_bm_buttons.append(btn)
-        self._bm_btn_layout.addWidget(self._quick_bm_more_btn)
-        self._bm_btn_layout.addStretch(1)
         QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
 
     def _refresh_quick_bookmark_button_texts(self):
@@ -6181,27 +6696,25 @@ class ExplorerPane(QWidget):
             more_btn = getattr(self, "_quick_bm_more_btn", None)
             if more_btn is None:
                 return
+            row_layouts = list(getattr(self, "_bm_btn_row_layouts", []))
+            if len(row_layouts) != BOOKMARK_TOOLBAR_ROWS:
+                return
+            for row_layout in row_layouts:
+                while row_layout.count():
+                    row_layout.takeAt(0)
             if not buttons:
                 more_btn.hide()
                 self._update_quick_bookmark_more_menu([])
+                for row_layout in row_layouts:
+                    row_layout.addStretch(1)
                 return
 
             available = max(0, int(self._bm_btn_container.contentsRect().width()))
-            spacing = max(0, int(self._bm_btn_layout.spacing()))
+            spacing = max(0, int(row_layouts[0].spacing()))
             widths = [self._quick_bookmark_button_width(str(btn.property("fullText") or "")) for btn in buttons]
-
-            visible_count = 0
-            used = 0
-            total = len(buttons)
-            for i, w in enumerate(widths):
-                spacing_before = spacing if visible_count else 0
-                remaining_after = total - (i + 1)
-                more_reserve = (spacing + QUICK_BOOKMARK_MORE_W) if remaining_after else 0
-                if used + spacing_before + w + more_reserve <= available:
-                    used += spacing_before + w
-                    visible_count += 1
-                else:
-                    break
+            visible_count, top_count = _two_row_bookmark_fit(
+                widths, available, spacing, QUICK_BOOKMARK_MORE_W
+            )
 
             overflow_buttons = buttons[visible_count:]
             for i, btn in enumerate(buttons):
@@ -6215,6 +6728,11 @@ class ExplorerPane(QWidget):
                 elided = btn.fontMetrics().elidedText(full, Qt.ElideRight, max(24, btn_w - 12))
                 if btn.text() != elided:
                     btn.setText(elided)
+                row_layouts[0 if i < top_count else 1].addWidget(btn)
+            if overflow_buttons:
+                row_layouts[1].addWidget(more_btn)
+            for row_layout in row_layouts:
+                row_layout.addStretch(1)
             self._update_quick_bookmark_more_menu(overflow_buttons)
             more_btn.setVisible(bool(overflow_buttons))
         except Exception:
@@ -6248,23 +6766,6 @@ class ExplorerPane(QWidget):
 
             if model in (self._fast_proxy, self._fast_model, self._search_proxy, self._search_model):
                 return index.sibling(index.row(), 0).data(Qt.UserRole)
-
-
-            if model is self.proxy:
-                st_ix = self.proxy.mapToSource(index)
-                if not st_ix.isValid():
-                    return None
-                src_ix = self.stat_proxy.mapToSource(st_ix)
-                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
-
-            if model is self.stat_proxy:
-                src_ix = self.stat_proxy.mapToSource(index)
-                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
-
-            if model is self.source_model:
-                return self.source_model.filePath(index)
-
-
             return index.sibling(index.row(), 0).data(Qt.UserRole)
         except Exception:
             return None
@@ -6272,10 +6773,6 @@ class ExplorerPane(QWidget):
     def _use_fast_model(self, path: str):
         self._cancel_fast_stat_worker()
         self._cancel_enum_worker(wait_ms=150)
-        try:
-            self.stat_proxy.clear_cache()
-        except Exception:
-            pass
 
         self._using_fast = True
         self._fast_model.reset_dir(path)
@@ -6337,11 +6834,6 @@ class ExplorerPane(QWidget):
         worker.finished.connect(_on_finished, Qt.QueuedConnection)
         self._request_visible_stats(0)
         worker.start()
-
-    def _start_normal_model_loading(self, path: str, known_count: int | None = None):
-        # FastDirModel is now the only browse model. Retain this compatibility
-        # stub for older call sites without triggering QFileSystemModel scanning.
-        return
 
     def _unc_share_root(self, path:str)->str:
         if not path:
@@ -6448,8 +6940,7 @@ class ExplorerPane(QWidget):
                 pass
 
 
-            # FastDirModel is the sole browse model. This performs one directory
-            # enumeration instead of scanning once here and again in QFileSystemModel.
+            # FastDirModel is the sole browse model.
             self._use_fast_model(path)
 
 
@@ -6469,6 +6960,10 @@ class ExplorerPane(QWidget):
             self._fswatch_debounce.setInterval(600)
             self._fswatch_debounce.timeout.connect(self._apply_fs_change)
 
+        self._fs_refresh_state.reset()
+        if self._fswatch_debounce.isActive():
+            self._fswatch_debounce.stop()
+
 
         try:
             dirs = list(self._fswatch.directories())
@@ -6487,14 +6982,32 @@ class ExplorerPane(QWidget):
 
     def _on_fs_changed(self, _path: str):
         try:
+            manager = getattr(self.host, "file_ops", None)
+            operation_pending = bool(manager and manager.has_pending())
+            if not self._fs_refresh_state.note_change(operation_pending):
+                if self._fswatch_debounce.isActive():
+                    self._fswatch_debounce.stop()
+                return
             if self._fswatch_debounce.isActive():
                 self._fswatch_debounce.stop()
             self._fswatch_debounce.start()
         except Exception:
             pass
 
+    @QtCore.pyqtSlot(bool)
+    def _on_file_ops_busy_changed(self, busy: bool):
+        try:
+            if not self._fs_refresh_state.operation_state_changed(bool(busy)):
+                return
+            if self._fswatch_debounce.isActive():
+                self._fswatch_debounce.stop()
+            self._fswatch_debounce.start(150)
+        except Exception:
+            pass
+
     def _apply_fs_change(self):
         try:
+            self._fs_refresh_state.pending = False
 
             if getattr(self, "_search_mode", False):
                 pattern = self.filter_edit.text().strip()
@@ -6510,33 +7023,14 @@ class ExplorerPane(QWidget):
                 return
 
 
-            if getattr(self, "_using_fast", False):
-                self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
-                self._use_fast_model(self.current_path())
-                return
-
-
-            self._fs_change_generation += 1
-            generation = self._fs_change_generation
-            self._refresh_visible_browse_stats(force=True, generation=generation)
-            for delay in (350, 1200, 2500):
-                QTimer.singleShot(
-                    delay,
-                    lambda g=generation: self._refresh_visible_browse_stats(force=True, generation=g),
-                )
-            self._update_pane_status()
+            self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
+            # Several panes may watch the same folder and receive the same native
+            # event. Invalidate once, then let all panes join one shared scan.
+            GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
+            self._use_fast_model(self.current_path())
         except Exception:
             pass
 
-
-    @QtCore.pyqtSlot(str)
-    def _on_directory_loaded(self, loaded_path: str):
-        key = loaded_path.lower()
-        timer = self._dirload_timer.pop(key, None)
-        if timer is not None:
-            dlog(f"directoryLoaded: '{loaded_path}' in {timer.elapsed()} ms")
-        # Kept only for QFileSystemModel compatibility; browse rows are supplied
-        # by FastDirModel and never switch models after enumeration.
 
     def current_path(self)->str: return self.path_bar._current_path or QDir.homePath()
     def go_back(self):
@@ -6558,11 +7052,16 @@ class ExplorerPane(QWidget):
             except Exception:
                 pass
             return
+        self._fs_refresh_state.reset()
+        try:
+            if self._fswatch_debounce.isActive():
+                self._fswatch_debounce.stop()
+        except Exception:
+            pass
+        GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path())
         try: self._cancel_fast_stat_worker()
         except Exception: pass
         try: self._cancel_enum_worker(wait_ms=100)
-        except Exception: pass
-        try: self.stat_proxy.clear_cache()
         except Exception: pass
         self.set_path(self.current_path(), push_history=False)
         try:
@@ -6745,8 +7244,6 @@ class ExplorerPane(QWidget):
             return
         op = getattr(worker, "_ui_op", worker.op)
         self._hide_pane_progress()
-        if not self._using_fast and not self._search_mode:
-            self.stat_proxy.clear_cache()
         self._request_visible_stats(0)
         self._update_pane_status()
         self._push_file_op_undo(worker, op)
@@ -6800,7 +7297,7 @@ class ExplorerPane(QWidget):
                 else:
                     skipped_same.append(src)
                 continue
-            if os.path.isdir(src) and not os.path.islink(src) and _is_subpath(dst, src):
+            if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
                 blocked_nested.append(src)
                 continue
             valid_srcs.append(src)
@@ -6877,8 +7374,6 @@ class ExplorerPane(QWidget):
             return
         permanent = bool(getattr(worker, "_ui_permanent", False))
         self._hide_pane_progress()
-        if not self._using_fast and not self._search_mode:
-            self.stat_proxy.clear_cache()
         self.refresh()
         self._request_visible_stats(0)
         self._update_pane_status()
@@ -7036,7 +7531,10 @@ class ExplorerPane(QWidget):
                     os.makedirs(target_dir, exist_ok=True)
                 if os.path.exists(src):
                     base=os.path.basename(src); src=unique_dest_path(target_dir, base)
-                shutil.move(dst, src)
+                worker = FileOpWorker("move", [dst], target_dir or os.curdir)
+                if not worker._move_source_transactional(dst, src, None, False):
+                    details = "\n".join(worker.errors) or f"Could not safely move {dst} back to {src}."
+                    raise RuntimeError(details)
         else:
             return False
         return True
@@ -7122,7 +7620,7 @@ class ExplorerPane(QWidget):
         old_search_proxy = getattr(self, "_search_proxy", None)
         self._search_mode=True
         self._search_model=model
-        self._search_proxy=FsSortProxy(self)
+        self._search_proxy=RecordSortProxy(self)
         self._search_proxy.setDynamicSortFilter(False)
         self._search_proxy.setSourceModel(self._search_model)
         self.view.setModel(self._search_proxy)
@@ -7348,7 +7846,9 @@ class ExplorerPane(QWidget):
         self._render_selection_status(update_statusbar=False, update_label=True, update_free=True)
 
     def closeEvent(self, e):
-        self.shutdown(wait_ms=1000)
+        if not self.shutdown(wait_ms=2000):
+            e.ignore()
+            return
         super().closeEvent(e)
 
 
@@ -7379,6 +7879,7 @@ class MultiExplorer(QMainWindow):
         self.named_bookmarks=migrate_legacy_favorites_into_named(load_named_bookmarks()); save_named_bookmarks(self.named_bookmarks)
         self._clipboard=None; self._bm_dlg=None
         self.file_ops = FileOperationManager(self)
+        self.icon_broker = ShellIconBroker(self)
         self._update_layout_icon(); self._update_theme_icon()
         self._help_shortcut = QShortcut(QKeySequence("F1"), self)
         self._help_shortcut.setContext(Qt.ApplicationShortcut)
@@ -7531,7 +8032,7 @@ class MultiExplorer(QMainWindow):
         self._apply_theme("light" if self.theme == "dark" else "dark", persist=True)
 
     def build_panes(self, n:int, start_paths):
-        if getattr(self, "panes", None) and getattr(self, "file_ops", None) and self.file_ops.is_busy():
+        if getattr(self, "panes", None) and getattr(self, "file_ops", None) and self.file_ops.has_pending():
             self.flash_status("Finish or cancel the file operation before rebuilding panes")
             return False
         was_max = self.isMaximized()
@@ -7568,11 +8069,21 @@ class MultiExplorer(QMainWindow):
 
 
         old_panes = list(getattr(self, "panes", []))
+        shutdown_failed = False
         for p in old_panes:
             try:
-                p.shutdown(wait_ms=600)
+                if not p.shutdown(wait_ms=2000):
+                    shutdown_failed = True
             except Exception:
-                pass
+                shutdown_failed = True
+        if shutdown_failed:
+            QMessageBox.warning(
+                self,
+                "Could not change layout safely",
+                "A background folder, search, or icon task has not stopped yet. "
+                "The existing panes were kept to prevent a thread-lifecycle crash.",
+            )
+            return False
 
         vmain = self.centralWidget().layout() if self.centralWidget() else None
         if hasattr(self, "grid") and isinstance(self.grid, QGridLayout):
@@ -8045,11 +8556,32 @@ class MultiExplorer(QMainWindow):
         except Exception:
             paths = []
 
+        pane_shutdown_failed = False
         for pane in list(getattr(self, "panes", [])):
             try:
-                pane.shutdown(wait_ms=1000)
+                if not pane.shutdown(wait_ms=3000):
+                    pane_shutdown_failed = True
             except Exception:
-                pass
+                pane_shutdown_failed = True
+        if pane_shutdown_failed:
+            QMessageBox.warning(
+                self,
+                "Could not exit safely",
+                "A background folder, search, or icon task has not stopped yet. "
+                "The window will remain open to prevent a thread-lifecycle crash.",
+            )
+            e.ignore()
+            return
+
+        icon_broker = getattr(self, "icon_broker", None)
+        if icon_broker and not icon_broker.shutdown(wait_ms=3000):
+            QMessageBox.warning(
+                self,
+                "Could not exit safely",
+                "The shared icon task has not stopped yet. The window will remain open.",
+            )
+            e.ignore()
+            return
 
         settings = QSettings(ORG_NAME, APP_NAME)
         settings.setValue("window/geometry", self.saveGeometry())
@@ -8229,31 +8761,94 @@ class SessionManagerDialog(QDialog):
 
 
 
+class BookmarkOrderTable(QTableWidget):
+    rowMoveRequested = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_source_row = -1
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.pos())
+        self._drag_source_row = index.row() if index.isValid() and index.column() == 0 else -1
+        super().mousePressEvent(event)
+
+    def startDrag(self, supported_actions):
+        if self._drag_source_row < 0:
+            return
+        super().startDrag(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        source = self._drag_source_row
+        if event.source() is not self or source < 0:
+            super().dropEvent(event)
+            return
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            target = index.row()
+            if event.pos().y() > self.visualRect(index).center().y():
+                target += 1
+        else:
+            target = self.rowCount()
+        if source < target:
+            target -= 1
+        target = max(0, min(target, self.rowCount() - 1))
+        if source != target:
+            self.rowMoveRequested.emit(source, target)
+        self._drag_source_row = -1
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+
 class BookmarkEditDialog(QDialog):
     def __init__(self, parent=None, items=None):
         super().__init__(parent)
         self.setWindowTitle(f"Edit Bookmarks (max {BOOKMARK_LIMIT})")
         self.resize(760, 520)
+        guide = QLabel("Drag the handle in the Order column to rearrange bookmarks.", self)
         self.table = _setup_readonly_table(
-            QTableWidget(self),
-            ["Enabled", "Name", "Path"],
-            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
+            BookmarkOrderTable(self),
+            ["Order", "Enabled", "Name", "Path"],
+            [QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.ResizeToContents, QHeaderView.Stretch],
         )
         self.table.setRowCount(BOOKMARK_LIMIT)
         self._rows = []
-        lay = QVBoxLayout(self); lay.addWidget(self.table, 1)
+        lay = QVBoxLayout(self); lay.addWidget(guide); lay.addWidget(self.table, 1)
         _add_dialog_button_box(lay, self, QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self.accept, self.reject)
         items = list(items or [])
         for i in range(BOOKMARK_LIMIT):
             it = items[i] if i < len(items) else _empty_bookmark_item()
             self._add_row(i, it)
+        self.table.rowMoveRequested.connect(self._move_row)
 
     def _add_row(self, row: int, data: dict):
+        handle = QTableWidgetItem("☰")
+        handle.setTextAlignment(Qt.AlignCenter)
+        handle.setToolTip("Drag to change bookmark order")
+        handle.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled)
+        self.table.setItem(row, 0, handle)
         chk = QCheckBox(self.table); chk.setChecked(bool(data.get("enabled", False)))
-        self.table.setCellWidget(row, 0, chk)
+        self.table.setCellWidget(row, 1, chk)
         name_edit = QLineEdit(self.table); name_edit.setText(str(data.get("name", "")))
         name_edit.setPlaceholderText("Bookmark name"); name_edit.setClearButtonEnabled(True); name_edit.setFixedHeight(UI_H)
-        self.table.setCellWidget(row, 1, name_edit)
+        self.table.setCellWidget(row, 2, name_edit)
         path_wrap = QWidget(self.table); h = QHBoxLayout(path_wrap); h.setContentsMargins(0,0,0,0); h.setSpacing(ROW_SPACING)
         path_edit = QLineEdit(path_wrap); path_edit.setText(str(data.get("path", ""))); path_edit.setPlaceholderText("Folder path"); path_edit.setClearButtonEnabled(True); path_edit.setFixedHeight(UI_H)
         btn = QToolButton(path_wrap); btn.setText("..."); btn.setFixedHeight(UI_H)
@@ -8263,16 +8858,29 @@ class BookmarkEditDialog(QDialog):
             if d: path_edit.setText(d)
         btn.clicked.connect(browse)
         h.addWidget(path_edit, 1); h.addWidget(btn, 0)
-        self.table.setCellWidget(row, 2, path_wrap)
+        self.table.setCellWidget(row, 3, path_wrap)
         self._rows.append((chk, name_edit, path_edit))
+
+    def _all_values(self) -> list:
+        return [
+            {"enabled": chk.isChecked(), "name": name_edit.text().strip(), "path": path_edit.text().strip()}
+            for chk, name_edit, path_edit in self._rows
+        ]
 
     def values(self) -> list:
         return [
-            {"enabled": enabled, "name": name, "path": path}
-            for chk, name_edit, path_edit in self._rows
-            for enabled, name, path in [(chk.isChecked(), name_edit.text().strip(), path_edit.text().strip())]
-            if name or path or enabled
+            item for item in self._all_values()
+            if item["name"] or item["path"] or item["enabled"]
         ]
+
+    def _move_row(self, source: int, target: int):
+        items = self._all_values()
+        if not (0 <= source < len(items) and 0 <= target < len(items)):
+            return
+        item = items.pop(source)
+        items.insert(target, item)
+        self.set_items(items)
+        self.table.setCurrentCell(target, 0)
 
     def set_items(self, items: list):
         items = list(items or [])
@@ -8294,12 +8902,25 @@ def _load_start_paths(desired_panes:int, cli_paths):
         paths.append(p if p and os.path.exists(p) else QDir.homePath())
     return paths
 
-def parse_args():
+def _resolve_pane_count(cli_panes, settings=None) -> int:
+    if cli_panes in (4, 6, 8):
+        return int(cli_panes)
+    settings = settings or QSettings(ORG_NAME, APP_NAME)
+    try:
+        saved = int(settings.value("layout/pane_count", 6))
+    except (TypeError, ValueError):
+        saved = 6
+    return saved if saved in (4, 6, 8) else 6
+
+def parse_args(argv=None):
     ap=argparse.ArgumentParser(description="Multi-Pane File Explorer (PyQt5)")
     ap.add_argument("paths", nargs="*", help="Optional start paths per pane")
-    ap.add_argument("--panes", type=int, choices=[4,6,8], default=6, help="Number of panes: 4, 6 or 8")
+    ap.add_argument(
+        "--panes", type=int, choices=[4,6,8], default=None,
+        help="Number of panes: 4, 6 or 8 (default: restore the last layout)",
+    )
     ap.add_argument("--debug", action="store_true", help="Enable debug logs (or set MULTIPANE_DEBUG=1)")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 def main():
     global DEBUG
@@ -8324,8 +8945,9 @@ def main():
     settings=QSettings(ORG_NAME, APP_NAME); theme=settings.value("ui/theme","dark")
     if theme not in VALID_THEMES: theme="dark"
     apply_theme_by_name(app, theme)
-    start_paths=_load_start_paths(args.panes, args.paths)
-    w=MultiExplorer(pane_count=args.panes, start_paths=start_paths, initial_theme=theme); w.show()
+    pane_count=_resolve_pane_count(args.panes, settings)
+    start_paths=_load_start_paths(pane_count, args.paths)
+    w=MultiExplorer(pane_count=pane_count, start_paths=start_paths, initial_theme=theme); w.show()
     sys.exit(app.exec_())
 if __name__=="__main__":
     main()
