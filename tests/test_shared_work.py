@@ -2,6 +2,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -79,6 +80,43 @@ class SharedWorkTests(unittest.TestCase):
         self.assertFalse(state.operation_state_changed(busy=True))
         self.assertTrue(state.operation_state_changed(busy=False))
         self.assertFalse(state.pending)
+
+    def test_header_width_settings_are_deferred(self):
+        pane = types.SimpleNamespace(
+            _pending_search_widths={},
+            _schedule_ui_settings_sync=mock.Mock(),
+        )
+
+        explorer.ExplorerPane._save_search_header_width(pane, 3, 144)
+
+        self.assertEqual(pane._pending_search_widths, {3: 144})
+        pane._schedule_ui_settings_sync.assert_called_once()
+
+    def test_deferred_settings_are_flushed_together(self):
+        settings = mock.Mock()
+        pane = types.SimpleNamespace(
+            pane_id=2,
+            _sort_column=3,
+            _sort_order=QtCore.Qt.DescendingOrder,
+            _pending_sort_settings=True,
+            _pending_search_widths={1: 80, 3: 140},
+        )
+
+        with mock.patch.object(explorer, "QSettings", return_value=settings):
+            explorer.ExplorerPane._flush_pending_ui_settings(pane)
+
+        self.assertEqual(settings.setValue.call_count, 4)
+        settings.sync.assert_called_once()
+        self.assertFalse(pane._pending_sort_settings)
+        self.assertEqual(pane._pending_search_widths, {})
+
+    def test_shell_icon_api_returns_the_cached_binding(self):
+        sentinel = object()
+        with mock.patch.object(explorer.sys, "platform", "win32"), mock.patch.object(
+            explorer, "_SHELL_ICON_API_INITIALIZED", True
+        ), mock.patch.object(explorer, "_SHELL_ICON_API", sentinel):
+            self.assertIs(explorer._get_windows_shell_icon_api(), sentinel)
+            self.assertIs(explorer._get_windows_shell_icon_api(), sentinel)
 
 
 if __name__ == "__main__":

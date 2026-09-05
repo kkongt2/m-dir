@@ -73,7 +73,6 @@ CONTROL_VPAD= 1
 CONTROL_HPAD= 6
 
 CRUMB_MAX_SEG_W = 180
-ALWAYS_GENERIC_ICONS = False
 SEARCH_RESULT_LIMIT = 50000
 SEARCH_PROGRESS_INTERVAL = 250
 DEFAULT_SEARCH_EXCLUDE_DIRS = {
@@ -2982,69 +2981,93 @@ def _icon_cache_key(path: str, is_dir: bool) -> str:
     return "ext:" + (ext or "<none>")
 
 
+_SHELL_ICON_API = None
+_SHELL_ICON_API_INITIALIZED = False
+_SHELL_ICON_API_LOCK = threading.Lock()
+
+
+def _get_windows_shell_icon_api():
+    """Initialize ctypes structures and function signatures only once."""
+    global _SHELL_ICON_API, _SHELL_ICON_API_INITIALIZED
+    if sys.platform != "win32":
+        return None
+    if _SHELL_ICON_API_INITIALIZED:
+        return _SHELL_ICON_API
+    with _SHELL_ICON_API_LOCK:
+        if _SHELL_ICON_API_INITIALIZED:
+            return _SHELL_ICON_API
+        try:
+            from ctypes import wintypes
+
+            class SHFILEINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("hIcon", wintypes.HICON),
+                    ("iIcon", ctypes.c_int),
+                    ("dwAttributes", wintypes.DWORD),
+                    ("szDisplayName", wintypes.WCHAR * 260),
+                    ("szTypeName", wintypes.WCHAR * 80),
+                ]
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD),
+                    ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long),
+                    ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            class RGBQUAD(ctypes.Structure):
+                _fields_ = [
+                    ("rgbBlue", ctypes.c_ubyte),
+                    ("rgbGreen", ctypes.c_ubyte),
+                    ("rgbRed", ctypes.c_ubyte),
+                    ("rgbReserved", ctypes.c_ubyte),
+                ]
+
+            class BITMAPINFO(ctypes.Structure):
+                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
+
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+            sh_get = shell32.SHGetFileInfoW
+            sh_get.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW), ctypes.c_uint, ctypes.c_uint]
+            sh_get.restype = ctypes.c_size_t
+            gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+            gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+            gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+            gdi32.CreateDIBSection.restype = ctypes.c_void_p
+            gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            gdi32.SelectObject.restype = ctypes.c_void_p
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteObject.restype = wintypes.BOOL
+            gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteDC.restype = wintypes.BOOL
+            user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.HICON, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            user32.DrawIconEx.restype = wintypes.BOOL
+            user32.DestroyIcon.argtypes = [wintypes.HICON]
+            user32.DestroyIcon.restype = wintypes.BOOL
+            _SHELL_ICON_API = (SHFILEINFOW, BITMAPINFOHEADER, BITMAPINFO, sh_get, user32, gdi32)
+        except Exception:
+            _SHELL_ICON_API = None
+        _SHELL_ICON_API_INITIALIZED = True
+        return _SHELL_ICON_API
+
+
 def _load_windows_shell_icon_bgra(path: str, is_dir: bool, size: int = 24):
     """Return (BGRA bytes, width, height) without creating QPixmap off-thread."""
-    if sys.platform != "win32":
+    api = _get_windows_shell_icon_api()
+    if api is None:
         return None, 0, 0
     try:
-        from ctypes import wintypes
-
-        class SHFILEINFOW(ctypes.Structure):
-            _fields_ = [
-                ("hIcon", wintypes.HICON),
-                ("iIcon", ctypes.c_int),
-                ("dwAttributes", wintypes.DWORD),
-                ("szDisplayName", wintypes.WCHAR * 260),
-                ("szTypeName", wintypes.WCHAR * 80),
-            ]
-
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ("biSize", wintypes.DWORD),
-                ("biWidth", ctypes.c_long),
-                ("biHeight", ctypes.c_long),
-                ("biPlanes", wintypes.WORD),
-                ("biBitCount", wintypes.WORD),
-                ("biCompression", wintypes.DWORD),
-                ("biSizeImage", wintypes.DWORD),
-                ("biXPelsPerMeter", ctypes.c_long),
-                ("biYPelsPerMeter", ctypes.c_long),
-                ("biClrUsed", wintypes.DWORD),
-                ("biClrImportant", wintypes.DWORD),
-            ]
-
-        class RGBQUAD(ctypes.Structure):
-            _fields_ = [
-                ("rgbBlue", ctypes.c_ubyte),
-                ("rgbGreen", ctypes.c_ubyte),
-                ("rgbRed", ctypes.c_ubyte),
-                ("rgbReserved", ctypes.c_ubyte),
-            ]
-
-        class BITMAPINFO(ctypes.Structure):
-            _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
-
-        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-
-        sh_get = shell32.SHGetFileInfoW
-        sh_get.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW), ctypes.c_uint, ctypes.c_uint]
-        sh_get.restype = ctypes.c_size_t
-        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
-        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
-        gdi32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-        gdi32.CreateDIBSection.restype = ctypes.c_void_p
-        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        gdi32.SelectObject.restype = ctypes.c_void_p
-        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
-        gdi32.DeleteObject.restype = wintypes.BOOL
-        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
-        gdi32.DeleteDC.restype = wintypes.BOOL
-        user32.DrawIconEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, wintypes.HICON, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
-        user32.DrawIconEx.restype = wintypes.BOOL
-        user32.DestroyIcon.argtypes = [wintypes.HICON]
-        user32.DestroyIcon.restype = wintypes.BOOL
+        SHFILEINFOW, BITMAPINFOHEADER, BITMAPINFO, sh_get, user32, gdi32 = api
 
         SHGFI_ICON = 0x000000100
         SHGFI_SMALLICON = 0x000000001
@@ -5149,7 +5172,6 @@ class ExplorerPane(QWidget):
         row_path = self._build_path_row()
         row_filter = self._build_filter_row()
 
-        self._init_models()
         self._setup_view()
         row_status = self._build_status_row()
 
@@ -5185,7 +5207,7 @@ class ExplorerPane(QWidget):
         except Exception:
             pass
         self._fast_model=FastDirModel(self); self._fast_proxy=RecordSortProxy(self); self._fast_proxy.setSourceModel(self._fast_model)
-        self._using_fast=False; self._fast_stat_worker=None; self._enum_worker=None
+        self._using_fast=True; self._fast_stat_worker=None; self._enum_worker=None
         self._fast_enum_count = 0
         self._fast_enum_root = ""
         self._fast_enum_done = False
@@ -5194,7 +5216,6 @@ class ExplorerPane(QWidget):
         self._icon_cache = {}
         self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
         self._op_progress_dialog=None
-        self._dirload_timer={}
         self._sort_column = 0
         self._sort_order = Qt.AscendingOrder
         self._search_sort_column = 0
@@ -5212,8 +5233,10 @@ class ExplorerPane(QWidget):
         self._disk_free_cache_text = ""
         self._disk_free_cache_ts = 0.0
         self._disk_free_ttl_s = 2.0
-        self._fs_change_generation = 0
         self._fs_refresh_state = FileChangeRefreshState()
+        self._settings_sync_timer = None
+        self._pending_sort_settings = False
+        self._pending_search_widths = {}
 
     def _build_toolbar(self):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
@@ -5279,26 +5302,8 @@ class ExplorerPane(QWidget):
         row_filter.addWidget(self.filter_label); row_filter.addWidget(self.filter_edit,1); row_filter.addWidget(self.btn_search,0)
         return row_filter
 
-    def _init_models(self):
-        self.source_model=QFileSystemModel(self); self.source_model.setReadOnly(False)
-        try: self.source_model.setResolveSymlinks(False)
-        except Exception: pass
-        self.source_model.setFilter(QDir.AllEntries|QDir.NoDotAndDotDot|QDir.Hidden|QDir.System|QDir.Drives|QDir.AllDirs)
-        self._native_icons=QFileIconProvider()
-        self._generic_icons=GenericIconProvider(self.style())
-        self._icon_provider_mode="native"
-        if ALWAYS_GENERIC_ICONS:
-            self.source_model.setIconProvider(self._generic_icons)
-            self._icon_provider_mode="generic"
-        else:
-            self.source_model.setIconProvider(self._native_icons)
-
-        self.stat_proxy=StatOverlayProxy(self); self.stat_proxy.setSourceModel(self.source_model)
-        self.proxy=FsSortProxy(self); self.proxy.setSourceModel(self.stat_proxy)
-        self.source_model.directoryLoaded.connect(self._on_directory_loaded)
-
     def _setup_view(self):
-        self.view=ExplorerView(self); self.view.setModel(self.proxy); self.view.setSortingEnabled(True)
+        self.view=ExplorerView(self); self.view.setModel(self._fast_proxy); self.view.setSortingEnabled(True)
         self.view.setAlternatingRowColors(True); self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -5547,12 +5552,6 @@ class ExplorerPane(QWidget):
         self.filter_edit.textChanged.connect(self._on_filter_text_changed)
         try: self.view.verticalScrollBar().valueChanged.connect(lambda _v: self._request_visible_stats())
         except Exception: pass
-        try: self.proxy.rowsInserted.connect(lambda *_: self._request_visible_stats(0))
-        except Exception: pass
-        try: self.proxy.modelReset.connect(lambda: self._request_visible_stats(0))
-        except Exception: pass
-        try: self.proxy.layoutChanged.connect(lambda *_: self._request_visible_stats(0))
-        except Exception: pass
 
     def _register_shortcuts(self):
         def add_sc(seq, slot):
@@ -5611,11 +5610,31 @@ class ExplorerPane(QWidget):
         self._search_sort_order = Qt.AscendingOrder
 
     def _save_sort_settings(self):
+        self._pending_sort_settings = True
+        self._schedule_ui_settings_sync()
+
+    def _schedule_ui_settings_sync(self):
+        if self._settings_sync_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(self._flush_pending_ui_settings)
+            self._settings_sync_timer = timer
+        self._settings_sync_timer.start()
+
+    def _flush_pending_ui_settings(self):
+        if not self._pending_sort_settings and not self._pending_search_widths:
+            return
         try:
-            s = QSettings(ORG_NAME, APP_NAME)
-            s.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
-            s.setValue(f"pane_{self.pane_id}/sort_order", int(self._sort_order))
-            s.sync()
+            settings = QSettings(ORG_NAME, APP_NAME)
+            if self._pending_sort_settings:
+                settings.setValue(f"pane_{self.pane_id}/sort_column", self._sort_column)
+                settings.setValue(f"pane_{self.pane_id}/sort_order", int(self._sort_order))
+            for logical_index, width in self._pending_search_widths.items():
+                settings.setValue(f"pane_{self.pane_id}/search_width_{logical_index}", width)
+            settings.sync()
+            self._pending_sort_settings = False
+            self._pending_search_widths = {}
         except Exception:
             pass
 
@@ -5674,6 +5693,8 @@ class ExplorerPane(QWidget):
 
     def _load_search_header_width(self, logical_index: int, default: int) -> int:
         fallback = max(24, int(default))
+        if logical_index in self._pending_search_widths:
+            return max(24, int(self._pending_search_widths[logical_index]))
         try:
             s = QSettings(ORG_NAME, APP_NAME)
             width = s.value(f"pane_{self.pane_id}/search_width_{logical_index}", fallback, type=int)
@@ -5682,12 +5703,8 @@ class ExplorerPane(QWidget):
             return fallback
 
     def _save_search_header_width(self, logical_index: int, width: int):
-        try:
-            s = QSettings(ORG_NAME, APP_NAME)
-            s.setValue(f"pane_{self.pane_id}/search_width_{logical_index}", max(24, int(width)))
-            s.sync()
-        except Exception:
-            pass
+        self._pending_search_widths[int(logical_index)] = max(24, int(width))
+        self._schedule_ui_settings_sync()
 
     def _apply_saved_sort(self, search_mode: bool | None = None):
         try:
@@ -5834,23 +5851,11 @@ class ExplorerPane(QWidget):
             return False
 
         try:
-            if self._using_fast:
-                rows = self._fast_model.rowCount()
-                for r in range(rows):
-                    rp = self._fast_model.row_path(r)
-                    if rp and os.path.normcase(rp) == target_key:
-                        prx_ix = self._fast_proxy.index(r, 0)
-                        sm = self.view.selectionModel()
-                        sm.clearSelection()
-                        sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-                        self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
-                        self.view.setCurrentIndex(prx_ix)
-                        return True
-            else:
-                src_ix = self.source_model.index(target_path)
-                if src_ix.isValid():
-                    st_ix = self.stat_proxy.mapFromSource(src_ix)
-                    prx_ix = self.proxy.mapFromSource(st_ix)
+            rows = self._fast_model.rowCount()
+            for r in range(rows):
+                rp = self._fast_model.row_path(r)
+                if rp and os.path.normcase(rp) == target_key:
+                    prx_ix = self._fast_proxy.index(r, 0)
                     sm = self.view.selectionModel()
                     sm.clearSelection()
                     sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
@@ -6090,25 +6095,11 @@ class ExplorerPane(QWidget):
                 return
 
             try:
-                if self._using_fast:
-
-                    rows = self._fast_model.rowCount()
-                    for r in range(rows):
-                        rp = self._fast_model.row_path(r)
-                        if rp and os.path.normcase(rp) == os.path.normcase(new_path):
-                            prx_ix = self._fast_proxy.index(r, 0)
-                            sm = self.view.selectionModel()
-                            sm.clearSelection()
-                            sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-                            self.view.scrollTo(prx_ix, QAbstractItemView.PositionAtCenter)
-                            self.view.setCurrentIndex(prx_ix)
-                            return
-                else:
-
-                    src_ix = self.source_model.index(new_path)
-                    if src_ix.isValid():
-                        st_ix = self.stat_proxy.mapFromSource(src_ix)
-                        prx_ix = self.proxy.mapFromSource(st_ix)
+                rows = self._fast_model.rowCount()
+                for r in range(rows):
+                    rp = self._fast_model.row_path(r)
+                    if rp and os.path.normcase(rp) == os.path.normcase(new_path):
+                        prx_ix = self._fast_proxy.index(r, 0)
                         sm = self.view.selectionModel()
                         sm.clearSelection()
                         sm.select(prx_ix, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
@@ -6126,13 +6117,6 @@ class ExplorerPane(QWidget):
             self.host.flash_status("Text file created")
         except Exception:
             pass
-
-    def _default_icon(self, is_dir: bool) -> QIcon:
-        try:
-            if ALWAYS_GENERIC_ICONS:
-                return self._generic_icons.icon(QFileIconProvider.Folder if is_dir else QFileIconProvider.File)
-            return self.style().standardIcon(QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon)
-        except Exception: return QIcon()
 
     def _apply_icon_to_models(self, key: str, icon: QIcon):
         try:
@@ -6209,6 +6193,7 @@ class ExplorerPane(QWidget):
         return stopped
 
     def shutdown(self, wait_ms: int = 300):
+        self._flush_pending_ui_settings()
         try:
             self._cancel_search_worker()
         except Exception:
@@ -6254,54 +6239,6 @@ class ExplorerPane(QWidget):
                 return
             t.stop()
         t.start(delay)
-
-    def _visible_browse_stat_paths(self, margin_before: int = 40, margin_after: int = 80) -> list[str]:
-        if self._search_mode or self._using_fast:
-            return []
-        if self.view.model() is not self.proxy:
-            return []
-
-        model = self.proxy
-        stat_proxy = self.stat_proxy
-        src_model = self.source_model
-        root_ix = self.view.rootIndex()
-        vp = self.view.viewport()
-
-        top_ix = self.view.indexAt(QtCore.QPoint(1, 1))
-        bot_ix = self.view.indexAt(QtCore.QPoint(1, max(1, vp.height() - 2)))
-        start = top_ix.row() if top_ix.isValid() else 0
-        rc = model.rowCount(root_ix)
-        end = bot_ix.row() if bot_ix.isValid() else min(start + 120, rc - 1)
-        start = max(0, start - max(0, int(margin_before)))
-        end = min(rc - 1, end + max(0, int(margin_after)))
-        if end < start:
-            end = start
-
-        paths = []
-        for r in range(start, end + 1):
-            prx_ix = model.index(r, 0, root_ix)
-            if not prx_ix.isValid():
-                continue
-            st_ix = model.mapToSource(prx_ix)
-            if not st_ix.isValid():
-                continue
-            src_ix = stat_proxy.mapToSource(st_ix)
-            if not src_ix.isValid():
-                continue
-            try:
-                p = src_model.filePath(src_ix)
-            except Exception:
-                p = None
-            if p:
-                paths.append(p)
-        return paths
-
-    def _refresh_visible_browse_stats(self, force: bool = False, generation: int | None = None):
-        if generation is not None and generation != getattr(self, "_fs_change_generation", 0):
-            return
-        paths = self._visible_browse_stat_paths()
-        if paths:
-            self.stat_proxy.request_paths(paths, force=force)
 
     def _ensure_selection_update_timer(self):
         if self._selection_update_timer is not None:
@@ -6468,12 +6405,6 @@ class ExplorerPane(QWidget):
             self._fast_stat_worker = w
             w.start()
             return
-
-
-        if current_model is not self.proxy:
-            return
-
-        self._refresh_visible_browse_stats(force=False)
 
     def _on_header_clicked(self, col:int):
         v=self.view
@@ -6786,23 +6717,6 @@ class ExplorerPane(QWidget):
 
             if model in (self._fast_proxy, self._fast_model, self._search_proxy, self._search_model):
                 return index.sibling(index.row(), 0).data(Qt.UserRole)
-
-
-            if model is self.proxy:
-                st_ix = self.proxy.mapToSource(index)
-                if not st_ix.isValid():
-                    return None
-                src_ix = self.stat_proxy.mapToSource(st_ix)
-                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
-
-            if model is self.stat_proxy:
-                src_ix = self.stat_proxy.mapToSource(index)
-                return self.source_model.filePath(src_ix) if src_ix.isValid() else None
-
-            if model is self.source_model:
-                return self.source_model.filePath(index)
-
-
             return index.sibling(index.row(), 0).data(Qt.UserRole)
         except Exception:
             return None
@@ -6810,10 +6724,6 @@ class ExplorerPane(QWidget):
     def _use_fast_model(self, path: str):
         self._cancel_fast_stat_worker()
         self._cancel_enum_worker(wait_ms=150)
-        try:
-            self.stat_proxy.clear_cache()
-        except Exception:
-            pass
 
         self._using_fast = True
         self._fast_model.reset_dir(path)
@@ -6875,11 +6785,6 @@ class ExplorerPane(QWidget):
         worker.finished.connect(_on_finished, Qt.QueuedConnection)
         self._request_visible_stats(0)
         worker.start()
-
-    def _start_normal_model_loading(self, path: str, known_count: int | None = None):
-        # FastDirModel is now the only browse model. Retain this compatibility
-        # stub for older call sites without triggering QFileSystemModel scanning.
-        return
 
     def _unc_share_root(self, path:str)->str:
         if not path:
@@ -6986,8 +6891,7 @@ class ExplorerPane(QWidget):
                 pass
 
 
-            # FastDirModel is the sole browse model. This performs one directory
-            # enumeration instead of scanning once here and again in QFileSystemModel.
+            # FastDirModel is the sole browse model.
             self._use_fast_model(path)
 
 
@@ -7070,36 +6974,14 @@ class ExplorerPane(QWidget):
                 return
 
 
-            if getattr(self, "_using_fast", False):
-                self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
-                # Several panes may watch the same folder and receive the same
-                # native event. Invalidate once, then let all panes join one scan.
-                GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
-                self._use_fast_model(self.current_path())
-                return
-
-
-            self._fs_change_generation += 1
-            generation = self._fs_change_generation
-            self._refresh_visible_browse_stats(force=True, generation=generation)
-            for delay in (350, 1200, 2500):
-                QTimer.singleShot(
-                    delay,
-                    lambda g=generation: self._refresh_visible_browse_stats(force=True, generation=g),
-                )
-            self._update_pane_status()
+            self.host.statusBar().showMessage("Folder changed; refreshing listing ...", 1500)
+            # Several panes may watch the same folder and receive the same native
+            # event. Invalidate once, then let all panes join one shared scan.
+            GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
+            self._use_fast_model(self.current_path())
         except Exception:
             pass
 
-
-    @QtCore.pyqtSlot(str)
-    def _on_directory_loaded(self, loaded_path: str):
-        key = loaded_path.lower()
-        timer = self._dirload_timer.pop(key, None)
-        if timer is not None:
-            dlog(f"directoryLoaded: '{loaded_path}' in {timer.elapsed()} ms")
-        # Kept only for QFileSystemModel compatibility; browse rows are supplied
-        # by FastDirModel and never switch models after enumeration.
 
     def current_path(self)->str: return self.path_bar._current_path or QDir.homePath()
     def go_back(self):
@@ -7131,8 +7013,6 @@ class ExplorerPane(QWidget):
         try: self._cancel_fast_stat_worker()
         except Exception: pass
         try: self._cancel_enum_worker(wait_ms=100)
-        except Exception: pass
-        try: self.stat_proxy.clear_cache()
         except Exception: pass
         self.set_path(self.current_path(), push_history=False)
         try:
@@ -7315,8 +7195,6 @@ class ExplorerPane(QWidget):
             return
         op = getattr(worker, "_ui_op", worker.op)
         self._hide_pane_progress()
-        if not self._using_fast and not self._search_mode:
-            self.stat_proxy.clear_cache()
         self._request_visible_stats(0)
         self._update_pane_status()
         self._push_file_op_undo(worker, op)
@@ -7447,8 +7325,6 @@ class ExplorerPane(QWidget):
             return
         permanent = bool(getattr(worker, "_ui_permanent", False))
         self._hide_pane_progress()
-        if not self._using_fast and not self._search_mode:
-            self.stat_proxy.clear_cache()
         self.refresh()
         self._request_visible_stats(0)
         self._update_pane_status()
