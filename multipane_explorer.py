@@ -2,6 +2,7 @@
 
 import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading
 from contextlib import contextmanager
+from collections import OrderedDict
 from pathlib import Path
 
 import file_operations
@@ -74,7 +75,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.5"
+APP_VERSION = "2.9.6"
 
 
 BASE_FONT_PT = 9.5
@@ -2203,6 +2204,66 @@ def prepare_file_operation(op, srcs, dst_dir, cancelled):
     return valid, skipped, blocked, automatic, conflicts
 
 
+class SharedStatCache:
+    """Bounded metadata cache; concurrent readers share one filesystem call."""
+    def __init__(self, ttl_s=5.0, max_entries=16384):
+        self.ttl_s = ttl_s
+        self.max_entries = max(1, max_entries)
+        self._lock = threading.Lock()
+        self._cache = OrderedDict()
+        self._flights = {}
+        self._generations = {}
+
+    def read(self, path, cancelled=lambda: False, loader=None):
+        key = _path_key(path)
+        folder = _path_key(os.path.dirname(path))
+        while not cancelled():
+            with self._lock:
+                generation = self._generations.get(folder, 0)
+                cached = self._cache.get(key)
+                if cached and cached[0] > time.monotonic() and cached[1] == generation:
+                    self._cache.move_to_end(key)
+                    return cached[2]
+                flight_key = (key, generation)
+                event = self._flights.get(flight_key)
+                leader = event is None
+                if leader:
+                    event = threading.Event()
+                    self._flights[flight_key] = event
+            if not leader:
+                while not cancelled() and not event.wait(0.05):
+                    pass
+                continue
+            try:
+                st = loader() if loader else os.stat(path, follow_symlinks=False)
+                result = (0 if stat.S_ISDIR(st.st_mode) else int(st.st_size), float(st.st_mtime))
+            except Exception:
+                result = (None, None)
+            with self._lock:
+                current = self._generations.get(folder, 0) == generation
+                if current and not cancelled():
+                    ttl = self.ttl_s if result[1] is not None else min(self.ttl_s, STAT_RETRY_BASE_S)
+                    self._cache[key] = (time.monotonic() + ttl, generation, result)
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > self.max_entries:
+                        self._cache.popitem(last=False)
+                self._flights.pop(flight_key, None)
+                event.set()
+            if current:
+                return result
+            # A DirEntry may retain metadata from before the invalidation.
+            loader = None
+        return None, None
+
+    def invalidate(self, folder):
+        key = _path_key(folder)
+        with self._lock:
+            self._generations[key] = self._generations.get(key, 0) + 1
+
+
+GLOBAL_STAT_CACHE = SharedStatCache()
+
+
 class FastStatWorker(QtCore.QThread):
     statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
     def __init__(self, root:str, paths:list[str], parent=None):
@@ -2213,12 +2274,9 @@ class FastStatWorker(QtCore.QThread):
         try:
             for p in self._paths:
                 if self._cancel: break
-                try:
-                    st=os.stat(p, follow_symlinks=False)
-                    size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
-                    mtime_val=float(st.st_mtime)
-                except Exception:
-                    size_val=None; mtime_val=None
+                size_val, mtime_val = GLOBAL_STAT_CACHE.read(p, lambda: self._cancel)
+                if self._cancel:
+                    break
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -2230,7 +2288,7 @@ class FastStatWorker(QtCore.QThread):
 
 
 class DirectorySnapshotCache:
-    """Thread-safe short-lived cache with one active scan per path/options key."""
+    """Share directory enumeration regardless of each pane's sort options."""
     def __init__(self, ttl_s: float = DIR_SNAPSHOT_TTL_S, max_entries: int = DIR_SNAPSHOT_CACHE_LIMIT):
         self._ttl_s = max(0.0, float(ttl_s))
         self._max_entries = max(1, int(max_entries))
@@ -2246,7 +2304,7 @@ class DirectorySnapshotCache:
 
     def acquire(self, path: str, preload_size: bool, preload_mtime: bool):
         root_key = self._root_key(path)
-        key = (root_key, bool(preload_size), bool(preload_mtime))
+        key = (root_key,)
         now = time.monotonic()
         with self._lock:
             generation = int(self._generations.get(root_key, 0))
@@ -2297,6 +2355,7 @@ class DirectorySnapshotCache:
             self._generations[root_key] = int(self._generations.get(root_key, 0)) + 1
             for key in [key for key in self._cache if key[0] == root_key]:
                 self._cache.pop(key, None)
+            GLOBAL_STAT_CACHE.invalidate(path)
             return True
 
 
@@ -2339,7 +2398,16 @@ class DirEnumWorker(QtCore.QThread):
         for start in range(0, len(rows), batch_size):
             if self._cancel:
                 return
-            self.batchReady.emit(list(rows[start:start + batch_size]))
+            batch = []
+            for original in rows[start:start + batch_size]:
+                if self._cancel:
+                    return
+                rec = dict(original)
+                if (self._preload_size or self._preload_mtime) and rec.get("mtime") is None:
+                    rec["size"], rec["mtime"] = GLOBAL_STAT_CACHE.read(rec["path"], lambda: self._cancel)
+                batch.append(rec)
+            if not self._cancel:
+                self.batchReady.emit(batch)
 
     def _scan_as_leader(self):
         all_rows = []
@@ -2355,17 +2423,10 @@ class DirEnumWorker(QtCore.QThread):
                 size_val = None
                 mtime_val = None
                 if self._preload_size or self._preload_mtime:
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                        if self._preload_size:
-                            size_val = 0 if is_dir else int(st.st_size)
-                        if self._preload_mtime:
-                            mtime_val = float(st.st_mtime)
-                    except Exception:
-                        if self._preload_size:
-                            size_val = 0 if is_dir else None
-                        if self._preload_mtime:
-                            mtime_val = None
+                    size_val, mtime_val = GLOBAL_STAT_CACHE.read(
+                        p, lambda: self._cancel,
+                        loader=lambda: entry.stat(follow_symlinks=False),
+                    )
                 rec = {
                     "name": name,
                     "name_l": name.lower(),
@@ -2429,12 +2490,9 @@ class NormalStatWorker(QtCore.QThread):
         try:
             for p in self._paths:
                 if self._cancel: break
-                try:
-                    st=os.stat(p, follow_symlinks=False)
-                    size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
-                    mtime_val=float(st.st_mtime)
-                except Exception:
-                    size_val=None; mtime_val=None
+                size_val, mtime_val = GLOBAL_STAT_CACHE.read(p, lambda: self._cancel)
+                if self._cancel:
+                    break
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -2743,6 +2801,7 @@ class StatOverlayProxy(QIdentityProxyModel):
         del self._queue[:batch_size]
 
         w = NormalStatWorker(batch, self)
+        w.finished.connect(w.deleteLater)
         w.statBatchReady.connect(self._apply_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch: self._on_cycle_finished(b), Qt.QueuedConnection)
         self._worker = w
@@ -4872,6 +4931,7 @@ class ExplorerPane(QWidget):
         del self._search_stat_queue[:size]
 
         w = NormalStatWorker(batch, self)
+        w.finished.connect(w.deleteLater)
         w.statBatchReady.connect(self._apply_search_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch, worker=w: self._on_search_stat_cycle_finished(worker, b), Qt.QueuedConnection)
         self._search_stat_worker = w
@@ -5299,6 +5359,7 @@ class ExplorerPane(QWidget):
                 return
             root = self._fast_model.rootPath()
             w = FastStatWorker(root, stat_paths, self)
+            w.finished.connect(w.deleteLater)
             w.statBatchReady.connect(self._apply_fast_stat_batch, Qt.QueuedConnection)
             def _on_fast_cycle_finished():
                 if self._fast_stat_worker is w:
