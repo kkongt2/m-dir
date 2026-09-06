@@ -1203,32 +1203,31 @@ class FileOpWorker(QtCore.QThread):
         self._tick_progress(delta_items=1)
         ok = True
         try:
-            entries = list(os.scandir(src_dir))
+            with os.scandir(src_dir) as entries:
+                for entry in entries:
+                    if self._cancel:
+                        return False
+                    src_path = entry.path
+                    dst_path = os.path.join(dst_dir, entry.name)
+                    try:
+                        if _is_junction(src_path):
+                            raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
+                        if entry.is_symlink():
+                            if not self._copy_link(src_path, dst_path):
+                                return False
+                        elif entry.is_dir(follow_symlinks=False):
+                            os.makedirs(dst_path, exist_ok=False)
+                            if not self._copy_dir_recursive(src_path, dst_path):
+                                ok = False
+                        elif not self._copy_file(src_path, dst_path):
+                            return False
+                    except Exception as exc:
+                        self._record_copy_error(src_path, dst_path, exc)
+                        self._skip_source_progress(src_path)
+                        ok = False
         except Exception as exc:
             self._record_copy_error(src_dir, dst_dir, exc)
             return False
-
-        for entry in entries:
-            if self._cancel:
-                return False
-            src_path = entry.path
-            dst_path = os.path.join(dst_dir, entry.name)
-            try:
-                if _is_junction(src_path):
-                    raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
-                if entry.is_symlink():
-                    if not self._copy_link(src_path, dst_path):
-                        return False
-                elif entry.is_dir(follow_symlinks=False):
-                    os.makedirs(dst_path, exist_ok=False)
-                    if not self._copy_dir_recursive(src_path, dst_path):
-                        ok = False
-                elif not self._copy_file(src_path, dst_path):
-                    return False
-            except Exception as exc:
-                self._record_copy_error(src_path, dst_path, exc)
-                self._skip_source_progress(src_path)
-                ok = False
         return ok
 
     def _copy_to_new_path(self, src: str, dst: str) -> bool:

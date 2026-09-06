@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +34,69 @@ class OperationPerformanceTests(unittest.TestCase):
             worker._calc_total()
         scan.assert_called_once_with("source")
         self.assertEqual((worker._total_bytes, worker._total_items), (123, 4))
+
+    def test_directory_copy_starts_before_enumeration_finishes(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root, "source"), Path(root, "destination")
+            source.mkdir(); destination.mkdir()
+            for i in range(3):
+                Path(source, f"{i}.txt").write_text(f"payload {i}")
+            worker = operations.FileOpWorker("copy", [str(source)], str(destination))
+            worker._calc_total()
+            real_scan = os.scandir
+            copied, closed = [], []
+            real_copy = worker._copy_file
+            def copy(src, dst):
+                result = real_copy(src, dst)
+                copied.append(src)
+                return result
+            @contextmanager
+            def incremental(path):
+                with real_scan(path) as entries:
+                    def stream():
+                        for index, entry in enumerate(entries):
+                            if index:
+                                self.assertTrue(copied, "enumerated entire directory before copying")
+                            yield entry
+                    try:
+                        yield stream()
+                    finally:
+                        closed.append(True)
+            with mock.patch.object(operations.os, "scandir", incremental), mock.patch.object(worker, "_copy_file", side_effect=copy):
+                self.assertTrue(worker._copy_dir_recursive(str(source), str(destination)))
+            self.assertEqual(len(copied), 3)
+            self.assertEqual(closed, [True])
+            for i in range(3):
+                self.assertEqual(Path(destination, f"{i}.txt").read_text(), f"payload {i}")
+
+    def test_directory_copy_cancellation_closes_iterator_without_draining_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root, "source"), Path(root, "destination")
+            source.mkdir(); destination.mkdir()
+            for i in range(10):
+                Path(source, f"{i}.txt").touch()
+            worker = operations.FileOpWorker("copy", [str(source)], str(destination))
+            worker._calc_total()
+            real_scan = os.scandir
+            enumerated, closed = [], []
+            @contextmanager
+            def incremental(path):
+                with real_scan(path) as entries:
+                    def stream():
+                        for entry in entries:
+                            enumerated.append(entry.name)
+                            yield entry
+                    try:
+                        yield stream()
+                    finally:
+                        closed.append(True)
+            def cancel(*args):
+                worker.cancel()
+                return False
+            with mock.patch.object(operations.os, "scandir", incremental), mock.patch.object(worker, "_copy_file", side_effect=cancel):
+                self.assertFalse(worker._copy_dir_recursive(str(source), str(destination)))
+            self.assertEqual(len(enumerated), 1)
+            self.assertEqual(closed, [True])
 
 
 if __name__ == "__main__":

@@ -14,11 +14,14 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Per-pane back/forward/up navigation history
 - Path-bar edit mode with recent-path dropdown and background folder path autocomplete; stale suggestions are discarded when input changes
 - Folders-first sorting, with proper size/date sorting for files
-- Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff, with a visible large-folder mode badge
-- Auto-refresh on file system changes via `QFileSystemWatcher`
+- Large-folder optimization: incremental `os.scandir` listing with a visible large-folder mode badge; directory snapshots and metadata queries are shared across panes and sort modes
+- Auto-refresh via `QFileSystemWatcher` keeps the existing listing visible and applies changed rows after a successful scan, preserving selections for surviving files
+- Background path validation, paste conflict checks, and free-space queries keep navigation responsive; cancelled navigation results are discarded
+- Failed metadata queries back off and stop after three attempts until the listing is refreshed
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
 - Safe cross-filesystem moves use a completed staging copy before source cleanup; source changes detected during copying are preserved and reported, and cleanup never recursively removes newly added entries
+- Same-filesystem moves skip descendant progress scans; folder copies process entries as they are enumerated and close enumeration handles on cancellation
 - Copy/move promotion refuses concurrent destination conflicts; if restoring an overwritten destination is blocked, its backup is retained and its recovery path is reported
 - Symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
