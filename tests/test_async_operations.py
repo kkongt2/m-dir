@@ -95,6 +95,66 @@ class AsyncOperationTests(unittest.TestCase):
                     app.processEvents()
         ''')
 
+    def test_navigation_and_paste_checks_do_not_block_ui(self):
+        self.run_gui_check('''
+            import tempfile, threading, time
+            from pathlib import Path
+            from unittest import mock
+            from PyQt5 import QtCore, QtWidgets
+            import multipane_explorer as e
+            app = QtWidgets.QApplication([])
+            def pump(check):
+                deadline = time.monotonic() + 4
+                while not check() and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(.001)
+                assert check(), 'timed out'
+            with tempfile.TemporaryDirectory() as root:
+                QtCore.QSettings.setDefaultFormat(QtCore.QSettings.IniFormat)
+                QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope, root)
+                old, new = Path(root, 'old'), Path(root, 'new')
+                old.mkdir(); new.mkdir()
+                window = e.MultiExplorer(pane_count=4, start_paths=[root] * 4)
+                pump(lambda: all(p._fast_enum_done for p in window.panes))
+                pane = window.panes[0]
+                entered, release = threading.Event(), threading.Event()
+                original = e.os.path.isdir
+                def slow(path):
+                    if str(path) == str(old):
+                        entered.set(); release.wait(3)
+                    return original(path)
+                try:
+                    with mock.patch.object(e.os.path, 'isdir', side_effect=slow):
+                        pane.set_path(str(old))
+                        pump(entered.is_set)
+                        ticks = []
+                        QtCore.QTimer.singleShot(0, lambda: ticks.append(True))
+                        pane.set_path(str(new))
+                        pump(lambda: ticks and pane.current_path() == str(new))
+                        assert not release.is_set()
+                        release.set()
+                        pump(lambda: all(not w.isRunning() for w in pane.findChildren(e.BackgroundCheck)))
+                        app.processEvents()
+                        assert pane.current_path() == str(new)
+                    entered.clear(); release.clear()
+                    def prepare(*args):
+                        entered.set(); release.wait(3)
+                        return ([], [], [], {}, [])
+                    with mock.patch.object(e, 'prepare_file_operation', side_effect=prepare), mock.patch.object(pane, '_start_prepared_op') as finish:
+                        pane._start_bg_op('copy', [str(old)], str(new))
+                        pump(entered.is_set)
+                        ticks.clear()
+                        QtCore.QTimer.singleShot(0, lambda: ticks.append(True))
+                        pump(lambda: bool(ticks))
+                        assert not finish.called
+                        release.set()
+                        pump(lambda: finish.called)
+                finally:
+                    release.set()
+                    assert window.close()
+                    app.processEvents()
+        ''')
+
     def test_undo_runs_in_background_and_preserves_cancelled_remainder(self):
         self.run_gui_check('''
             import tempfile, threading, time, types

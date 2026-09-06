@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.1"
+APP_VERSION = "2.9.2"
 
 
 BASE_FONT_PT = 9.5
@@ -2104,6 +2104,55 @@ class FastDirModel(QAbstractTableModel):
             return rec.get("icon_key", "")
         return None
 
+class BackgroundCheck(QtCore.QThread):
+    completed = pyqtSignal(object)
+
+    def __init__(self, check, parent=None):
+        super().__init__(parent)
+        self.check = check
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            result = self.check(lambda: self._cancel)
+        except Exception as exc:
+            result = exc
+        if not self._cancel:
+            self.completed.emit(result)
+
+
+def prepare_file_operation(op, srcs, dst_dir, cancelled):
+    valid, skipped, blocked, automatic, conflicts = [], [], [], {}, []
+    seen = set()
+    for src in srcs:
+        if cancelled():
+            break
+        key = _path_key(src)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not src or not os.path.lexists(src):
+            continue
+        dst = os.path.join(dst_dir, os.path.basename(src.rstrip("\\/")) or os.path.basename(src))
+        if _paths_same(src, dst):
+            if op == "copy":
+                automatic[src] = "copy"
+                valid.append(src)
+            else:
+                skipped.append(src)
+            continue
+        if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
+            blocked.append(src)
+            continue
+        valid.append(src)
+        if os.path.lexists(dst):
+            conflicts.append((src, dst))
+    return valid, skipped, blocked, automatic, conflicts
+
+
 class FastStatWorker(QtCore.QThread):
     statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
     def __init__(self, root:str, paths:list[str], parent=None):
@@ -3876,6 +3925,10 @@ class ExplorerPane(QWidget):
         self._update_pane_status()
 
     def _init_state(self):
+        self._closing = False
+        self._navigation_generation = 0
+        self._path_check = None
+        self._space_check = None
         self._search_mode=False; self._search_model=None; self._search_proxy=None
         self._search_pending_items={}; self._search_stats_done=set(); self._search_stat_worker=None
         self._search_stat_queue=[]; self._search_stat_pending=set()
@@ -4663,7 +4716,7 @@ class ExplorerPane(QWidget):
                         w.cancel()
                 except Exception:
                     pass
-                if not w.wait(wait_ms):
+                if not w.wait(0):
                     # Don't block UI; defer deletion after thread finishes.
                     try:
                         w.finished.connect(w.deleteLater, QtCore.Qt.UniqueConnection)
@@ -4701,6 +4754,8 @@ class ExplorerPane(QWidget):
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
+        if self.sender() is not getattr(self, "_search_worker", None):
+            return
         if not self._search_mode or not isinstance(self._search_model, SearchResultModel):
             return
         self._search_model.append_rows(rows)
@@ -4936,6 +4991,9 @@ class ExplorerPane(QWidget):
         return stopped
 
     def shutdown(self, wait_ms: int = 300):
+        self._closing = True
+        for timer in self.findChildren(QTimer):
+            timer.stop()
         for pathbar in self.findChildren(PathBar):
             pathbar.shutdown_suggestions()
         self._flush_pending_ui_settings()
@@ -4963,7 +5021,10 @@ class ExplorerPane(QWidget):
         # References may have been cleared after a timed-out cancellation.  The
         # workers remain QObject children, so audit every child thread before the
         # pane is allowed to be destroyed.
-        return _cancel_and_wait_child_threads(self, wait_ms)
+        stopped = _cancel_and_wait_child_threads(self, wait_ms)
+        if not stopped:
+            self._closing = False
+        return stopped
 
     def _ensure_visible_stats_timer(self):
         if self._visible_stats_timer is not None:
@@ -4975,6 +5036,8 @@ class ExplorerPane(QWidget):
         self._visible_stats_timer = t
 
     def _request_visible_stats(self, delay_ms: int | None = None):
+        if self._closing:
+            return
         self._ensure_visible_stats_timer()
         t = self._visible_stats_timer
         delay = self._visible_stats_interval_ms if delay_ms is None else max(0, int(delay_ms))
@@ -5035,29 +5098,48 @@ class ExplorerPane(QWidget):
         self._selection_cache_ts = now
         return data
 
-    def _update_free_space_label(self, force: bool = False):
-        path = self.current_path()
-        if self._is_network_path(path):
-            self.lbl_free.setText("")
-            return
+    def _background_check(self, check, callback):
+        worker = BackgroundCheck(check, self)
+        def completed(result):
+            if not self._closing and not worker._cancel:
+                callback(result)
+        def finished():
+            for name in ("_path_check", "_space_check"):
+                if getattr(self, name, None) is worker:
+                    setattr(self, name, None)
+        worker.completed.connect(completed, Qt.QueuedConnection)
+        worker.finished.connect(finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        return worker
 
+    def _update_free_space_label(self, force: bool = False):
+        if self._closing:
+            return
+        path = self.current_path()
         key = self._drive_label(path)
         now = time.perf_counter()
         if (not force and self._disk_free_cache_key == key
-            and (now - self._disk_free_cache_ts) <= self._disk_free_ttl_s):
+            and now - self._disk_free_cache_ts <= self._disk_free_ttl_s):
             self.lbl_free.setText(self._disk_free_cache_text)
             return
-
-        try:
-            _total, _used, free = shutil.disk_usage(path)
-            text = f"{key} free {human_size(free)}"
-        except Exception:
-            text = ""
-
-        self._disk_free_cache_key = key
-        self._disk_free_cache_text = text
-        self._disk_free_cache_ts = now
-        self.lbl_free.setText(text)
+        if self._space_check is not None:
+            return
+        def check(cancelled):
+            if self._is_network_path(path) or cancelled():
+                return ""
+            return f"{key} free {human_size(shutil.disk_usage(path).free)}"
+        def completed(result):
+            self._space_check = None
+            if path != self.current_path():
+                self._update_free_space_label()
+                return
+            text = "" if isinstance(result, Exception) else result
+            self._disk_free_cache_key = key
+            self._disk_free_cache_text = text
+            self._disk_free_cache_ts = time.perf_counter()
+            self.lbl_free.setText(text)
+        self._space_check = self._background_check(check, completed)
 
     def _flush_selection_status_update(self):
         self._render_selection_status(update_statusbar=True, update_label=True, update_free=True)
@@ -5086,7 +5168,14 @@ class ExplorerPane(QWidget):
         if update_free:
             self._update_free_space_label(force=False)
 
+    @QtCore.pyqtSlot(list)
+    def _apply_fast_stat_batch(self, updates):
+        if self.sender() is self._fast_stat_worker:
+            self._fast_model.apply_stat_batch(updates)
+
     def _schedule_visible_stats(self):
+        if self._closing:
+            return
 
         if self._search_mode:
             self._fill_search_visible_icons()
@@ -5141,7 +5230,7 @@ class ExplorerPane(QWidget):
                 return
             root = self._fast_model.rootPath()
             w = FastStatWorker(root, stat_paths, self)
-            w.statBatchReady.connect(self._fast_model.apply_stat_batch, Qt.QueuedConnection)
+            w.statBatchReady.connect(self._apply_fast_stat_batch, Qt.QueuedConnection)
             def _on_fast_cycle_finished():
                 if self._fast_stat_worker is w:
                     self._fast_stat_worker = None
@@ -5588,8 +5677,8 @@ class ExplorerPane(QWidget):
                 if DEBUG:
                     dlog(f"[net] WNetAddConnection3W failed: {e}")
 
-            if os.path.exists(path) or os.path.exists(target):
-                return True, prompted
+            if prompted:
+                return False, prompted
 
         open_target = target or path
         try:
@@ -5599,28 +5688,37 @@ class ExplorerPane(QWidget):
             if DEBUG:
                 dlog(f"[net] explorer launch failed ({open_target}): {e}")
 
-        return os.path.exists(path), prompted
+        return False, prompted
 
-    def set_path(self, path:str, push_history:bool=True):
-        with perf(f"set_path begin -> {path}"):
-            path = nice_path(path)
-            if (not os.path.exists(path)) and self._is_network_path(path):
-                accessible, prompted = self._try_network_auth_prompt(path)
-                if accessible:
-                    pass
-                elif prompted:
-                    QMessageBox.information(
-                        self,
-                        "Network Sign-in",
-                        "Network location requires sign-in.\nPlease complete sign-in and try again.",
-                    )
-                    return
-            if not os.path.exists(path):
-                QMessageBox.warning(self, "Path not found", path)
+    def set_path(self, path: str, push_history: bool = True, _allow_auth: bool = True):
+        path = nice_path(path)
+        self._navigation_generation += 1
+        generation = self._navigation_generation
+        if self._path_check is not None:
+            self._path_check.cancel()
+        def check(cancelled):
+            accessible = os.path.isdir(path)
+            return accessible, not accessible and self._is_network_path(path)
+        def completed(result):
+            if generation != self._navigation_generation:
                 return
+            self._path_check = None
+            if isinstance(result, Exception):
+                self.host.flash_status(str(result))
+                return
+            accessible, network = result
+            if not accessible:
+                if network and _allow_auth:
+                    self._try_network_auth_prompt(path)
+                    self.set_path(path, push_history, _allow_auth=False)
+                else:
+                    QMessageBox.warning(self, "Path not found", path)
+                return
+            self._accept_path(path, push_history)
+        self._path_check = self._background_check(check, completed)
 
-
-
+    def _accept_path(self, path: str, push_history: bool):
+        with perf(f"set_path -> {path}"):
             if self._search_mode:
                 self._enter_browse_mode()
 
@@ -5674,8 +5772,7 @@ class ExplorerPane(QWidget):
 
         try:
 
-            if os.path.isdir(folder_path):
-                self._fswatch.addPath(folder_path)
+            self._fswatch.addPath(folder_path)
         except Exception:
 
             pass
@@ -5978,35 +6075,21 @@ class ExplorerPane(QWidget):
         self._hide_pane_progress()
 
     def _start_bg_op(self, op, srcs, dst_dir, clipboard_payload=None):
+        srcs = list(srcs)
+        self.host.flash_status(f"Checking {len(srcs)} item(s) for {op} ...")
+        def completed(result):
+            if isinstance(result, Exception):
+                self.host.flash_status(f"Could not prepare {op}: {result}")
+                return
+            self._start_prepared_op(op, dst_dir, clipboard_payload, result)
+        self._background_check(
+            lambda cancelled: prepare_file_operation(op, srcs, dst_dir, cancelled), completed
+        )
+        return True
+
+    def _start_prepared_op(self, op, dst_dir, clipboard_payload, prepared):
         manager = getattr(self.host, "file_ops", None)
-
-        valid_srcs = []
-        skipped_same = []
-        blocked_nested = []
-        auto_map = {}
-        seen_src_keys = set()
-
-        for src in srcs:
-            src_key = _path_key(src)
-            if src_key in seen_src_keys:
-                continue
-            seen_src_keys.add(src_key)
-            if not src or not os.path.lexists(src):
-                continue
-
-            base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
-            dst = os.path.join(dst_dir, base)
-            if _paths_same(src, dst):
-                if op == "copy":
-                    auto_map[src] = "copy"
-                    valid_srcs.append(src)
-                else:
-                    skipped_same.append(src)
-                continue
-            if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
-                blocked_nested.append(src)
-                continue
-            valid_srcs.append(src)
+        valid_srcs, skipped_same, blocked_nested, auto_map, conflicts = prepared
 
         if blocked_nested:
             sample = "\n".join(blocked_nested[:5])
@@ -6021,15 +6104,6 @@ class ExplorerPane(QWidget):
             if skipped_same:
                 self.host.flash_status("Nothing to move (same source and destination)")
             return False
-
-        conflicts = []
-        for src in valid_srcs:
-            if src in auto_map:
-                continue
-            base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
-            dst = os.path.join(dst_dir, base)
-            if os.path.lexists(dst):
-                conflicts.append((src, dst))
 
         conflict_map = dict(auto_map)
         if conflicts:
