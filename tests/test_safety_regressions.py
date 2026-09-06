@@ -11,6 +11,7 @@ from unittest import mock
 from PyQt5 import QtCore
 
 import multipane_explorer as explorer
+import file_operations as file_ops
 
 
 class _FakeSettings:
@@ -34,9 +35,9 @@ class FileOperationSafetyTests(unittest.TestCase):
             src = os.path.join(root, "source.txt")
             dst = os.path.join(root, "destination.txt")
             Path(src).write_bytes(b"payload")
-            worker = explorer.FileOpWorker("copy", [src], root, durable_copies=False)
+            worker = file_ops.FileOpWorker("copy", [src], root, durable_copies=False)
 
-            with mock.patch.object(explorer.os, "fsync") as fsync:
+            with mock.patch.object(file_ops.os, "fsync") as fsync:
                 self.assertTrue(worker._copy_file(src, dst))
 
             fsync.assert_not_called()
@@ -47,25 +48,25 @@ class FileOperationSafetyTests(unittest.TestCase):
             src = os.path.join(root, "source.txt")
             dst = os.path.join(root, "destination.txt")
             Path(src).write_bytes(b"payload")
-            worker = explorer.FileOpWorker("copy", [src], root, durable_copies=True)
+            worker = file_ops.FileOpWorker("copy", [src], root, durable_copies=True)
 
-            with mock.patch.object(explorer.os, "fsync") as fsync:
+            with mock.patch.object(file_ops.os, "fsync") as fsync:
                 self.assertTrue(worker._copy_file(src, dst))
 
             fsync.assert_called_once()
 
     def test_delete_worker_does_not_prescan_descendants(self):
         paths = [r"C:\first", r"C:\second"]
-        worker = explorer.DeleteWorker(paths, permanent=False)
+        worker = file_ops.DeleteWorker(paths, permanent=False)
         completed = []
         worker.finished_ok.connect(lambda: completed.append(True))
 
         with mock.patch.object(
-            explorer,
+            file_ops,
             "_scan_delete_item_counts",
             side_effect=AssertionError("delete progress must not walk descendants first"),
         ), mock.patch.object(
-            explorer,
+            file_ops,
             "recycle_any_best_effort",
             return_value=(1, []),
         ) as recycle:
@@ -83,14 +84,14 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source")
-            worker = explorer.FileOpWorker("move", [src], dst_dir)
+            worker = file_ops.FileOpWorker("move", [src], dst_dir)
 
-            def partial_source_cleanup(path, **_kwargs):
+            def partial_source_cleanup(path, _snapshot, **_kwargs):
                 os.remove(os.path.join(path, "second.txt"))
-                return 1, ["simulated source cleanup failure"]
+                return ["simulated source cleanup failure"]
 
-            with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
-                explorer, "delete_any_permanent_best_effort", side_effect=partial_source_cleanup
+            with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
+                file_ops, "_cleanup_copied_source", side_effect=partial_source_cleanup
             ):
                 result = worker._move_source_transactional(src, dst, None, False)
 
@@ -110,9 +111,9 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source")
-            worker = explorer.FileOpWorker("move", [src], dst_dir)
+            worker = file_ops.FileOpWorker("move", [src], dst_dir)
 
-            with mock.patch.object(explorer, "_same_filesystem", return_value=False):
+            with mock.patch.object(file_ops, "_same_filesystem", return_value=False):
                 result = worker._move_source_transactional(src, dst, None, False)
 
             self.assertTrue(result)
@@ -120,17 +121,17 @@ class FileOperationSafetyTests(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(dst)), ["first.txt", "second.txt"])
             self.assertEqual(worker.error_count, 0)
 
-    def test_same_filesystem_move_uses_atomic_replace(self):
+    def test_same_filesystem_move_uses_atomic_rename(self):
         with tempfile.TemporaryDirectory() as root:
             src = os.path.join(root, "source.txt")
             Path(src).write_text("payload", encoding="utf-8")
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source.txt")
-            worker = explorer.FileOpWorker("move", [src], dst_dir)
+            worker = file_ops.FileOpWorker("move", [src], dst_dir)
 
-            with mock.patch.object(explorer, "_same_filesystem", return_value=True), mock.patch.object(
-                explorer.shutil, "move", side_effect=AssertionError("shutil.move must not be used")
+            with mock.patch.object(file_ops, "_same_filesystem", return_value=True), mock.patch.object(
+                file_ops.shutil, "move", side_effect=AssertionError("shutil.move must not be used")
             ):
                 result = worker._move_source_transactional(src, dst, None, False)
 
@@ -145,16 +146,16 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source.txt")
-            worker = explorer.FileOpWorker("move", [src], dst_dir)
-            real_replace = os.replace
+            worker = file_ops.FileOpWorker("move", [src], dst_dir)
+            real_replace = file_ops._rename_no_replace
 
             def replace_with_cross_device_detection(source, destination):
                 if source == src and destination == dst:
                     raise OSError(errno.EXDEV, "simulated filesystem boundary")
                 return real_replace(source, destination)
 
-            with mock.patch.object(explorer, "_same_filesystem", return_value=True), mock.patch.object(
-                explorer.os, "replace", side_effect=replace_with_cross_device_detection
+            with mock.patch.object(file_ops, "_same_filesystem", return_value=True), mock.patch.object(
+                file_ops, "_rename_no_replace", side_effect=replace_with_cross_device_detection
             ):
                 result = worker._move_source_transactional(src, dst, None, False)
 
@@ -169,14 +170,14 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst = os.path.join(dst_dir, "source")
             os.makedirs(dst)
             Path(dst, "old.txt").write_text("old", encoding="utf-8")
-            worker = explorer.FileOpWorker("move", [src], dst_dir, conflict_map={src: "overwrite"})
+            worker = file_ops.FileOpWorker("move", [src], dst_dir, conflict_map={src: "overwrite"})
 
-            def partial_source_cleanup(path, **_kwargs):
+            def partial_source_cleanup(path, _snapshot, **_kwargs):
                 os.remove(os.path.join(path, "second.txt"))
-                return 1, ["simulated source cleanup failure"]
+                return ["simulated source cleanup failure"]
 
-            with mock.patch.object(explorer, "_same_filesystem", return_value=False), mock.patch.object(
-                explorer, "delete_any_permanent_best_effort", side_effect=partial_source_cleanup
+            with mock.patch.object(file_ops, "_same_filesystem", return_value=False), mock.patch.object(
+                file_ops, "_cleanup_copied_source", side_effect=partial_source_cleanup
             ):
                 result = worker._move_source_transactional(src, dst, "overwrite", True)
 
@@ -190,9 +191,9 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source")
-            worker = explorer.FileOpWorker("copy", [src], dst_dir)
+            worker = file_ops.FileOpWorker("copy", [src], dst_dir)
 
-            with mock.patch.object(explorer, "_is_junction", side_effect=lambda path: path == src):
+            with mock.patch.object(file_ops, "_is_junction", side_effect=lambda path: path == src):
                 result = worker._copy_source_transactional(src, dst, None, False)
 
             self.assertFalse(result)
@@ -203,10 +204,10 @@ class FileOperationSafetyTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows junction fallback")
     def test_junction_detection_falls_back_to_reparse_tag(self):
         fake_stat = types.SimpleNamespace(st_reparse_tag=0xA0000003)
-        with mock.patch.object(explorer.os.path, "isjunction", return_value=False, create=True), mock.patch.object(
-            explorer.os, "lstat", return_value=fake_stat
+        with mock.patch.object(file_ops.os.path, "isjunction", return_value=False, create=True), mock.patch.object(
+            file_ops.os, "lstat", return_value=fake_stat
         ):
-            self.assertTrue(explorer._is_junction(r"C:\\junction"))
+            self.assertTrue(file_ops._is_junction(r"C:\\junction"))
 
     @unittest.skipUnless(os.name == "nt", "Windows junction behavior")
     def test_remove_junction_does_not_delete_its_target(self):
@@ -225,8 +226,8 @@ class FileOperationSafetyTests(unittest.TestCase):
             if created.returncode != 0:
                 self.skipTest(f"could not create junction: {created.stderr or created.stdout}")
 
-            self.assertTrue(explorer._is_junction(junction))
-            explorer.remove_any(junction)
+            self.assertTrue(file_ops._is_junction(junction))
+            file_ops.remove_any(junction)
             self.assertFalse(os.path.lexists(junction))
             self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
@@ -243,7 +244,7 @@ class FileOperationSafetyTests(unittest.TestCase):
             dst_dir = os.path.join(root, "destination")
             os.makedirs(dst_dir)
             dst = os.path.join(dst_dir, "source-link")
-            worker = explorer.FileOpWorker("copy", [link], dst_dir)
+            worker = file_ops.FileOpWorker("copy", [link], dst_dir)
             result = worker._copy_source_transactional(link, dst, None, False)
 
             self.assertTrue(result)

@@ -54,6 +54,69 @@ class SharedWorkTests(unittest.TestCase):
         next_state, _key, _generation, _event, _rows, _error = cache.acquire("C:/same", False, False)
         self.assertEqual(next_state, "leader")
 
+    def test_different_sort_options_share_listing_and_correct_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "payload.txt").write_text("12345")
+            cache = explorer.DirectorySnapshotCache()
+            stats = explorer.SharedStatCache()
+            real_scandir = os.scandir
+            with mock.patch.object(explorer, "GLOBAL_DIR_SNAPSHOTS", cache), mock.patch.object(
+                explorer, "GLOBAL_STAT_CACHE", stats
+            ), mock.patch.object(explorer.os, "scandir", wraps=real_scandir) as scans:
+                for size, date in ((False, False), (True, False), (False, True)):
+                    worker = explorer.DirEnumWorker(root, preload_size=size, preload_mtime=date)
+                    rows = []
+                    worker.batchReady.connect(rows.extend)
+                    worker.run()
+                    self.assertEqual(len(rows), 1)
+                    if size or date:
+                        self.assertEqual(rows[0]["size"], 5)
+                        self.assertIsNotNone(rows[0]["mtime"])
+                self.assertEqual(scans.call_count, 1)
+
+    def test_metadata_reads_share_one_call_and_invalidation_rejects_old_result(self):
+        cache = explorer.SharedStatCache()
+        entered, release = threading.Event(), threading.Event()
+        old = types.SimpleNamespace(st_mode=0, st_size=1, st_mtime=1)
+        new = types.SimpleNamespace(st_mode=0, st_size=2, st_mtime=2)
+        results = []
+        def slow():
+            entered.set()
+            release.wait(3)
+            return old
+        thread = threading.Thread(target=lambda: results.append(cache.read("C:/shared/file", loader=slow)))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            cache.invalidate("C:/shared")
+            self.assertEqual(cache.read("C:/shared/file", loader=lambda: new), (2, 2.0))
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [(2, 2.0)])
+
+    def test_concurrent_metadata_readers_only_query_once(self):
+        cache = explorer.SharedStatCache()
+        entered, release = threading.Event(), threading.Event()
+        calls, results = [], []
+        def slow():
+            calls.append(True)
+            entered.set()
+            release.wait(3)
+            return types.SimpleNamespace(st_mode=0, st_size=7, st_mtime=8)
+        readers = [threading.Thread(target=lambda: results.append(cache.read("C:/shared/file", loader=slow))) for _ in range(4)]
+        try:
+            for reader in readers:
+                reader.start()
+            self.assertTrue(entered.wait(2))
+        finally:
+            release.set()
+            for reader in readers:
+                reader.join(3)
+        self.assertEqual(calls, [True])
+        self.assertEqual(results, [(7, 8.0)] * 4)
+
     def test_icon_broker_deduplicates_pending_keys(self):
         broker = explorer.ShellIconBroker()
         job = ("ext:.shared-test", "C:/one.shared-test", False)

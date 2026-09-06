@@ -2,7 +2,28 @@
 
 import os, sys, fnmatch, argparse, shutil, ctypes, math, subprocess, time, re, uuid, errno, stat, threading
 from contextlib import contextmanager
+from collections import OrderedDict
 from pathlib import Path
+
+import file_operations
+from file_operations import (
+    DeleteWorker,
+    FileOpWorker,
+    FileOperationManager,
+    UndoWorker,
+    _cancel_and_wait_child_threads,
+    _dedupe_local_paths,
+    _is_dir_link,
+    _is_subpath,
+    _normalize_fs_path,
+    _path_key,
+    _paths_same,
+    execute_bulk_rename_transaction,
+    human_size,
+    nice_path,
+    unique_dest_path,
+)
+
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import (
@@ -54,7 +75,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.9.9"
 
 
 BASE_FONT_PT = 9.5
@@ -79,11 +100,7 @@ DEFAULT_SEARCH_EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv",
     "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
 }
-FILEOP_ERROR_DETAIL_LIMIT = 50
 LARGE_FOLDER_THRESHOLD = 3000
-FILEOP_FAST_PROGRESS_SCAN_LIMIT = 4000
-FILE_COPY_BUFFER_SIZE = 4 * 1024 * 1024
-DURABLE_FILE_COPIES = _env_flag("MULTIPANE_DURABLE_COPIES")
 GENERIC_ICON_THRESHOLD = 1200
 SHELL_ICON_FAILURE_TTL_S = 300
 DIR_SNAPSHOT_TTL_S = 5.0
@@ -135,24 +152,6 @@ try:
     from win32com.shell import shell, shellcon
 except Exception:
     HAS_PYWIN32 = False
-
-
-def _dedupe_local_paths(paths):
-    out = []
-    seen = set()
-    for raw in paths or ():
-        if not raw:
-            continue
-        try:
-            path = os.path.normpath(os.fspath(raw))
-        except Exception:
-            continue
-        key = os.path.normcase(path) if sys.platform == "win32" else path
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(path)
-    return out
 
 
 def _decode_preferred_drop_effect(raw):
@@ -231,53 +230,6 @@ def _clipboard_payload_matches(left, right) -> bool:
     if left_op != right_op:
         return False
     return [_path_key(p) for p in left["paths"]] == [_path_key(p) for p in right["paths"]]
-
-
-def execute_bulk_rename_transaction(operations) -> list[tuple[str, str]]:
-    """Rename all items atomically as a group, rolling back every completed step on failure."""
-    temp_pairs = []
-    committed = []
-    try:
-        for src, dst in operations:
-            parent = os.path.dirname(src) or os.curdir
-            temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
-            while os.path.lexists(temp):
-                temp = os.path.join(parent, f".__mprn_tmp_{uuid.uuid4().hex}")
-            os.rename(src, temp)
-            temp_pairs.append((src, temp, dst))
-
-        for src, temp, dst in temp_pairs:
-            os.rename(temp, dst)
-            committed.append((dst, src))
-        return committed
-    except Exception as original_error:
-        rollback_errors = []
-
-        # Final names must be restored first because original names are still free.
-        for dst, src in reversed(committed):
-            if not os.path.lexists(dst):
-                continue
-            try:
-                os.rename(dst, src)
-            except Exception as exc:
-                rollback_errors.append(f"{dst} -> {src}: {exc}")
-
-        committed_sources = {_path_key(src) for _dst, src in committed}
-        for src, temp, _dst in reversed(temp_pairs):
-            if _path_key(src) in committed_sources or not os.path.lexists(temp):
-                continue
-            try:
-                os.rename(temp, src)
-            except Exception as exc:
-                rollback_errors.append(f"{temp} -> {src}: {exc}")
-
-        if rollback_errors:
-            details = "\n".join(rollback_errors[:10])
-            more = "\n..." if len(rollback_errors) > 10 else ""
-            raise RuntimeError(
-                f"{original_error}\n\nRollback was incomplete:\n{details}{more}"
-            ) from original_error
-        raise
 
 
 def _write_windows_file_clipboard_payload(payload):
@@ -416,13 +368,6 @@ def _clear_windows_clipboard():
         close_clipboard()
 
 
-try:
-    from send2trash import send2trash
-    HAS_SEND2TRASH = True
-except Exception:
-    HAS_SEND2TRASH = False
-
-
 def _enable_win_per_monitor_v2():
     if sys.platform != "win32": return
     # Windows only: try per-monitor DPI awareness with fallbacks.
@@ -437,532 +382,6 @@ def _enable_win_per_monitor_v2():
 
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
-
-def _normalize_fs_path(p: str) -> str:
-    try: p = os.path.normpath(p)
-    except Exception: pass
-    if os.name == "nt" and len(p) == 2 and p[1] == ":":
-        # Normalize drive-root paths like "C:" to "C:\\".
-        p = p + os.sep
-    return p
-
-def nice_path(p: str) -> str:
-    try: return str(Path(p).resolve())
-    except Exception: return _normalize_fs_path(p)
-
-def _path_key(p: str) -> str:
-    try:
-        p = os.path.abspath(_normalize_fs_path(p))
-    except Exception:
-        p = _normalize_fs_path(p)
-    return os.path.normcase(p)
-
-def _paths_same(a: str, b: str) -> bool:
-    try:
-        return os.path.samefile(a, b)
-    except Exception:
-        return _path_key(a) == _path_key(b)
-
-def _is_subpath(child: str, parent: str) -> bool:
-    child_key = _path_key(child)
-    parent_key = _path_key(parent)
-    try:
-        return os.path.commonpath([child_key, parent_key]) == parent_key
-    except Exception:
-        # Different drives on Windows can raise ValueError here.
-        return False
-
-def human_size(n: int) -> str:
-    if n is None: return ""
-    size = float(n); units = ["B", "KB", "MB", "GB", "TB", "PB"]; i = 0
-    while size >= 1024 and i < len(units)-1: size /= 1024.0; i += 1
-    if i == 0: return f"{int(size)} B"
-    return f"{size:.1f} {units[i]}" if size < 10 else f"{size:.0f} {units[i]}"
-
-def _path_exists_for_delete(path: str) -> bool:
-    try:
-        return os.path.lexists(path)
-    except Exception:
-        return os.path.exists(path)
-
-def _is_junction(path: str) -> bool:
-    isjunction = getattr(os.path, "isjunction", None)
-    if isjunction:
-        try:
-            if isjunction(path):
-                return True
-        except Exception:
-            pass
-    if os.name == "nt":
-        try:
-            st = os.lstat(path)
-            tag = getattr(st, "st_reparse_tag", 0)
-            junction_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
-            return bool(tag == junction_tag)
-        except Exception:
-            pass
-    return False
-
-def _is_dir_link(path: str) -> bool:
-    try:
-        return bool(os.path.islink(path) or _is_junction(path))
-    except Exception:
-        return False
-
-def _link_target_is_directory(path: str) -> bool:
-    if os.path.isdir(path):
-        return True
-    if os.name == "nt":
-        try:
-            attrs = getattr(os.lstat(path), "st_file_attributes", 0)
-            directory_attr = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
-            return bool(attrs & directory_attr)
-        except Exception:
-            pass
-    return False
-
-def _same_filesystem(src: str, dst_parent: str) -> bool:
-    """Return whether an atomic rename can stay on one filesystem."""
-    try:
-        src_dev = os.stat(src, follow_symlinks=False).st_dev
-        dst_dev = os.stat(dst_parent, follow_symlinks=False).st_dev
-        return src_dev == dst_dev
-    except Exception:
-        if os.name == "nt":
-            try:
-                src_drive = os.path.splitdrive(os.path.abspath(src))[0]
-                dst_drive = os.path.splitdrive(os.path.abspath(dst_parent))[0]
-                return bool(src_drive and dst_drive and src_drive.casefold() == dst_drive.casefold())
-            except Exception:
-                pass
-        return False
-
-def _is_cross_device_error(exc: BaseException) -> bool:
-    return (
-        getattr(exc, "errno", None) == errno.EXDEV
-        or getattr(exc, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
-    )
-
-def unique_dest_path(dst_dir: str, name: str) -> str:
-    base, ext = os.path.splitext(name); candidate = name; i = 1
-    while os.path.lexists(os.path.join(dst_dir, candidate)):
-        suffix = " - Copy" if i == 1 else f" - Copy ({i})"
-        candidate = f"{base}{suffix}{ext}"; i += 1
-    return os.path.join(dst_dir, candidate)
-
-def remove_any(path: str):
-    if not _path_exists_for_delete(path):
-        return
-    if os.path.isdir(path) and not _is_dir_link(path):
-        shutil.rmtree(path)
-    elif os.path.isdir(path) and _is_dir_link(path):
-        os.rmdir(path)
-    else:
-        os.remove(path)
-
-class DeleteCancelled(Exception):
-    pass
-
-def _entry_is_junction(entry) -> bool:
-    fn = getattr(entry, "is_junction", None)
-    if fn:
-        try:
-            return bool(fn())
-        except Exception:
-            pass
-    return _is_junction(getattr(entry, "path", ""))
-
-def _make_delete_writable(path: str):
-    try:
-        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
-    except Exception:
-        pass
-
-def _is_not_empty_error(exc: BaseException) -> bool:
-    return (
-        getattr(exc, "errno", None) in (errno.ENOTEMPTY, errno.EEXIST)
-        or getattr(exc, "winerror", None) in (145, 183)
-    )
-
-def _delete_error_message(path: str, exc: BaseException) -> str:
-    return f"{path}: {exc}"
-
-def _is_qt_main_thread() -> bool:
-    try:
-        app = QApplication.instance()
-        return app is None or QtCore.QThread.currentThread() == app.thread()
-    except Exception:
-        return True
-
-def _scan_delete_item_counts(path: str, should_cancel=None) -> tuple[int, dict[str, int]]:
-    """Return the total item count and subtree counts without following directory links."""
-    counts: dict[str, int] = {}
-
-    def check_cancel():
-        if should_cancel and should_cancel():
-            raise DeleteCancelled()
-
-    def visit(p: str) -> int:
-        check_cancel()
-        key = _path_key(p)
-        if not _path_exists_for_delete(p):
-            counts[key] = 1
-            return 1
-
-        if not (os.path.isdir(p) and not _is_dir_link(p)):
-            counts[key] = 1
-            return 1
-
-        total = 1  # the directory itself
-        try:
-            with os.scandir(p) as it:
-                entries = list(it)
-        except OSError:
-            counts[key] = total
-            return total
-
-        for entry in entries:
-            total += visit(entry.path)
-        counts[key] = total
-        return total
-
-    path = _normalize_fs_path(path)
-    return visit(path), counts
-
-
-def delete_any_permanent_best_effort(
-    path: str,
-    should_cancel=None,
-    on_items_done=None,
-    item_count_of=None,
-) -> tuple[int, list[str]]:
-    """Delete everything possible under path, returning (deleted_count, errors)."""
-    deleted = 0
-    errors: list[str] = []
-
-    def check_cancel():
-        if should_cancel and should_cancel():
-            raise DeleteCancelled()
-
-    def planned_count(p: str) -> int:
-        if item_count_of:
-            try:
-                return max(1, int(item_count_of(p)))
-            except Exception:
-                pass
-        return 1
-
-    def mark_done(units: int = 1):
-        if on_items_done:
-            try:
-                on_items_done(max(0, int(units)))
-            except Exception:
-                pass
-
-    def record_error(p: str, exc: BaseException):
-        errors.append(_delete_error_message(p, exc))
-
-    def remove_file_like(p: str) -> bool:
-        nonlocal deleted
-        check_cancel()
-        if not _path_exists_for_delete(p):
-            mark_done(1)
-            return True
-        last_exc = None
-        for attempt in range(2):
-            try:
-                if _is_dir_link(p) and os.path.isdir(p):
-                    os.rmdir(p)
-                else:
-                    os.remove(p)
-                deleted += 1
-                mark_done(1)
-                return True
-            except PermissionError as exc:
-                last_exc = exc
-                if attempt == 0:
-                    _make_delete_writable(p)
-                    continue
-                break
-            except OSError as exc:
-                last_exc = exc
-                if attempt == 0 and getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
-                    _make_delete_writable(p)
-                    continue
-                break
-        if last_exc:
-            record_error(p, last_exc)
-        mark_done(1)
-        return False
-
-    def remove_dir(p: str) -> bool:
-        nonlocal deleted
-        check_cancel()
-        child_failed = False
-        try:
-            with os.scandir(p) as it:
-                entries = list(it)
-        except OSError as exc:
-            record_error(p, exc)
-            mark_done(planned_count(p))
-            return False
-
-        for entry in entries:
-            check_cancel()
-            child = entry.path
-            try:
-                is_dir = entry.is_dir(follow_symlinks=False)
-                is_link = entry.is_symlink()
-                is_junction = _entry_is_junction(entry)
-            except OSError as exc:
-                record_error(child, exc)
-                mark_done(planned_count(child))
-                child_failed = True
-                continue
-
-            if is_dir and not is_link and not is_junction:
-                if not remove_dir(child):
-                    child_failed = True
-            elif not remove_file_like(child):
-                child_failed = True
-
-        if not _path_exists_for_delete(p):
-            mark_done(1)
-            return not child_failed
-
-        last_exc = None
-        for attempt in range(2):
-            try:
-                os.rmdir(p)
-                deleted += 1
-                mark_done(1)
-                return not child_failed
-            except PermissionError as exc:
-                last_exc = exc
-                if attempt == 0:
-                    _make_delete_writable(p)
-                    continue
-                break
-            except OSError as exc:
-                last_exc = exc
-                if attempt == 0 and getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM):
-                    _make_delete_writable(p)
-                    continue
-                break
-
-        if last_exc and not (child_failed and _is_not_empty_error(last_exc)):
-            record_error(p, last_exc)
-        mark_done(1)
-        return False
-
-    path = _normalize_fs_path(path)
-    check_cancel()
-    if not _path_exists_for_delete(path):
-        mark_done(planned_count(path))
-        return 0, []
-    if os.path.isdir(path) and not _is_dir_link(path):
-        remove_dir(path)
-    else:
-        remove_file_like(path)
-    return deleted, errors
-
-def _qt_move_path_to_trash(path: str) -> bool:
-    if not path or not hasattr(QtCore.QFile, "moveToTrash") or not _is_qt_main_thread():
-        return False
-    try:
-        result = QtCore.QFile.moveToTrash(_normalize_fs_path(path))
-        if isinstance(result, tuple):
-            return bool(result[0])
-        return bool(result)
-    except Exception as e:
-        if DEBUG: print("[delete] QFile.moveToTrash failed:", e)
-    return False
-
-def _win_shell_move_path_to_trash(path: str, hwnd: int = 0) -> bool:
-    if sys.platform != "win32" or not path:
-        return False
-    try:
-        class _SHFILEOPSTRUCTW(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", ctypes.c_void_p),
-                ("wFunc", ctypes.c_uint),
-                ("pFrom", ctypes.c_void_p),
-                ("pTo", ctypes.c_void_p),
-                ("fFlags", ctypes.c_ushort),
-                ("fAnyOperationsAborted", ctypes.c_int),
-                ("hNameMappings", ctypes.c_void_p),
-                ("lpszProgressTitle", ctypes.c_void_p),
-            ]
-
-        shell_path = _normalize_fs_path(os.path.abspath(path))
-        from_buf = ctypes.create_unicode_buffer(shell_path + "\0\0")
-        op = _SHFILEOPSTRUCTW()
-        op.hwnd = ctypes.c_void_p(int(hwnd or 0))
-        op.wFunc = 3  # FO_DELETE
-        op.pFrom = ctypes.cast(from_buf, ctypes.c_void_p)
-        op.pTo = None
-        op.fFlags = 0x0040 | 0x0010 | 0x0400 | 0x0004  # ALLOWUNDO, NOCONFIRMATION, NOERRORUI, SILENT
-        op.fAnyOperationsAborted = 0
-        op.hNameMappings = None
-        op.lpszProgressTitle = None
-
-        shfile_operation = ctypes.WinDLL("shell32").SHFileOperationW
-        shfile_operation.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
-        shfile_operation.restype = ctypes.c_int
-        res = shfile_operation(ctypes.byref(op))
-        return (res == 0) and (not op.fAnyOperationsAborted) and (not os.path.exists(path))
-    except Exception as e:
-        if DEBUG: print("[delete] SHFileOperationW(ctypes) failed:", e)
-    return False
-
-def recycle_path_to_trash(path: str, hwnd: int = 0) -> bool:
-    if not path or not _path_exists_for_delete(path):
-        return True
-    if _qt_move_path_to_trash(path) and not _path_exists_for_delete(path):
-        return True
-    if HAS_SEND2TRASH:
-        try:
-            send2trash(path)
-            if not _path_exists_for_delete(path):
-                return True
-        except Exception as e:
-            if DEBUG: print("[delete] send2trash failed:", e)
-    if HAS_PYWIN32:
-        try:
-            pFrom = (_normalize_fs_path(path) + "\0\0")
-            flags = (shellcon.FOF_ALLOWUNDO | shellcon.FOF_NOCONFIRMATION |
-                     shellcon.FOF_NOERRORUI | shellcon.FOF_SILENT)
-            res, aborted = shell.SHFileOperation((int(hwnd), shellcon.FO_DELETE, pFrom, None, flags, False, None, None))
-            if (res == 0) and (not aborted) and not _path_exists_for_delete(path):
-                return True
-        except Exception as e:
-            if DEBUG: print("[delete] SHFileOperation failed:", e)
-    if _win_shell_move_path_to_trash(path, hwnd):
-        return True
-    if DEBUG:
-        print("[delete] refusing permanent fallback for Recycle Bin delete:", path)
-    return False
-
-def recycle_any_best_effort(
-    path: str,
-    hwnd: int = 0,
-    should_cancel=None,
-    on_items_done=None,
-    item_count_of=None,
-) -> tuple[int, list[str]]:
-    """Move as much as possible to Recycle Bin while reporting subtree progress."""
-    deleted = 0
-    errors: list[str] = []
-
-    def check_cancel():
-        if should_cancel and should_cancel():
-            raise DeleteCancelled()
-
-    def planned_count(p: str) -> int:
-        if item_count_of:
-            try:
-                return max(1, int(item_count_of(p)))
-            except Exception:
-                pass
-        return 1
-
-    def mark_done(units: int):
-        if on_items_done:
-            try:
-                on_items_done(max(0, int(units)))
-            except Exception:
-                pass
-
-    def record_error(p: str):
-        errors.append(f"{p}: Could not move item to Recycle Bin.")
-
-    def dir_has_entries(p: str) -> bool:
-        try:
-            with os.scandir(p) as it:
-                for _entry in it:
-                    return True
-        except OSError:
-            return True
-        return False
-
-    def recycle_whole(p: str, units: int | None = None) -> bool:
-        nonlocal deleted
-        check_cancel()
-        work_units = planned_count(p) if units is None else max(1, int(units))
-        if not _path_exists_for_delete(p):
-            mark_done(work_units)
-            return True
-        if recycle_path_to_trash(p, hwnd):
-            deleted += work_units
-            mark_done(work_units)
-            return True
-        return False
-
-    def recycle_dir_contents(p: str) -> bool:
-        check_cancel()
-        child_failed = False
-        try:
-            with os.scandir(p) as it:
-                entries = list(it)
-        except OSError as exc:
-            errors.append(_delete_error_message(p, exc))
-            mark_done(planned_count(p))
-            return False
-
-        for entry in entries:
-            check_cancel()
-            child = entry.path
-            if recycle_whole(child):
-                continue
-            try:
-                is_dir = entry.is_dir(follow_symlinks=False)
-                is_link = entry.is_symlink()
-                is_junction = _entry_is_junction(entry)
-            except OSError as exc:
-                errors.append(_delete_error_message(child, exc))
-                mark_done(planned_count(child))
-                child_failed = True
-                continue
-
-            if is_dir and not is_link and not is_junction:
-                if not recycle_dir_contents(child):
-                    child_failed = True
-            else:
-                record_error(child)
-                mark_done(1)
-                child_failed = True
-
-        if not _path_exists_for_delete(p):
-            mark_done(1)
-            return not child_failed
-        if recycle_whole(p, units=1):
-            return not child_failed
-        if not (child_failed and dir_has_entries(p)):
-            record_error(p)
-        mark_done(1)
-        return False
-
-    path = _normalize_fs_path(path)
-    check_cancel()
-    if not _path_exists_for_delete(path):
-        mark_done(planned_count(path))
-        return 0, []
-    if recycle_whole(path):
-        return deleted, []
-    if os.path.isdir(path) and not _is_dir_link(path):
-        recycle_dir_contents(path)
-    else:
-        record_error(path)
-        mark_done(1)
-    return deleted, errors
-
-def recycle_to_trash(paths: list, hwnd: int = 0) -> bool:
-    if not paths: return True
-    ok = True
-    for p in paths:
-        if not recycle_path_to_trash(p, hwnd):
-            ok = False
-    return ok
 
 def icon_bookmark_edit(theme: str):
     def paint(p: QPainter, w, h):
@@ -1016,869 +435,6 @@ def icon_bookmark_edit(theme: str):
         p.restore()
 
     return _make_icon(22, 22, paint)
-
-
-
-class FileOperationManager(QtCore.QObject):
-    busyChanged = pyqtSignal(bool)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._workers = set()
-        self._queue = []
-
-    def _prune_finished(self):
-        for worker in list(self._workers):
-            if worker in self._queue:
-                continue
-            try:
-                running = worker.isRunning()
-            except Exception:
-                running = False
-            if running:
-                continue
-            self._workers.discard(worker)
-            try:
-                worker.deleteLater()
-            except Exception:
-                pass
-
-    def is_busy(self) -> bool:
-        self._prune_finished()
-        return any(worker.isRunning() for worker in list(self._workers))
-
-    def has_pending(self) -> bool:
-        self._prune_finished()
-        return self.is_busy() or bool(self._queue)
-
-    def owns(self, worker) -> bool:
-        return worker in self._workers
-
-    def cancel_worker(self, worker, wait_ms: int = 300) -> bool:
-        if worker not in self._workers:
-            return False
-        if worker in self._queue:
-            self._queue.remove(worker)
-            self._workers.discard(worker)
-            worker.deleteLater()
-            self.busyChanged.emit(self.has_pending())
-            return True
-        try:
-            if worker.isRunning() and hasattr(worker, "cancel"):
-                worker.cancel()
-                return bool(worker.wait(max(0, int(wait_ms))))
-            return True
-        except Exception:
-            return False
-
-    def register(self, worker) -> bool:
-        if worker is None or self.is_busy():
-            return False
-        worker.setParent(self)
-        self._workers.add(worker)
-        worker.finished.connect(self._on_worker_finished)
-        self.busyChanged.emit(True)
-        return True
-
-    def submit(self, worker) -> str:
-        if worker is None:
-            return "rejected"
-        busy = self.is_busy()
-        worker.setParent(self)
-        self._workers.add(worker)
-        worker.finished.connect(self._on_worker_finished)
-        if busy:
-            self._queue.append(worker)
-            self.busyChanged.emit(True)
-            return "queued"
-        worker.start()
-        self.busyChanged.emit(True)
-        return "started"
-
-    @QtCore.pyqtSlot()
-    def _on_worker_finished(self):
-        worker = self.sender()
-        if worker in self._workers:
-            self._workers.discard(worker)
-            try:
-                worker.deleteLater()
-            except Exception:
-                pass
-        self._start_next_queued()
-        self.busyChanged.emit(self.has_pending())
-
-    def _start_next_queued(self):
-        if any(worker.isRunning() for worker in list(self._workers)):
-            return
-        while self._queue:
-            worker = self._queue.pop(0)
-            if worker not in self._workers:
-                continue
-            try:
-                worker.start()
-                return
-            except Exception:
-                self._workers.discard(worker)
-
-    def queued_count(self) -> int:
-        return len(self._queue)
-
-    def cancel_all(self, wait_ms: int = 8000) -> bool:
-        workers = list(self._workers)
-        self._queue.clear()
-        for worker in workers:
-            try:
-                if worker.isRunning() and hasattr(worker, "cancel"):
-                    worker.cancel()
-            except Exception:
-                pass
-
-        deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
-        all_stopped = True
-        for worker in workers:
-            try:
-                if not worker.isRunning():
-                    continue
-                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-                if remaining_ms <= 0 or not worker.wait(remaining_ms):
-                    all_stopped = False
-            except Exception:
-                all_stopped = False
-
-        if all_stopped:
-            self._prune_finished()
-            self.busyChanged.emit(False)
-        return all_stopped
-
-
-def _cancel_and_wait_child_threads(owner: QtCore.QObject, wait_ms: int) -> bool:
-    """Cancel and audit child QThreads before their QObject owner is destroyed."""
-    workers = list(owner.findChildren(QtCore.QThread))
-    for worker in workers:
-        try:
-            if worker.isRunning() and hasattr(worker, "cancel"):
-                worker.cancel()
-        except Exception:
-            pass
-
-    deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
-    all_stopped = True
-    for worker in workers:
-        try:
-            if not worker.isRunning():
-                continue
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if remaining_ms <= 0 or not worker.wait(remaining_ms):
-                all_stopped = False
-        except Exception:
-            all_stopped = False
-    return all_stopped
-
-
-class FileOpWorker(QtCore.QThread):
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished_ok = pyqtSignal()
-    error = pyqtSignal(str)
-
-    def __init__(
-        self,
-        op: str,
-        srcs: list,
-        dst_dir: str,
-        conflict_map: dict | None = None,
-        parent=None,
-        durable_copies: bool | None = None,
-    ):
-        super().__init__(parent)
-        self.op = op
-        self.srcs = list(srcs)
-        self.dst_dir = dst_dir
-        self.conflict_map = dict(conflict_map or {})
-        self._cancel = False
-        self._total_bytes = 0
-        self._done_bytes = 0
-        self._total_items = 0
-        self._done_items = 0
-        self._last_progress_pct = -1
-        self._last_progress_emit_ts = 0.0
-        self._src_progress_cache: dict[str, tuple[int, int]] = {}
-        self._progress_estimated = False
-        self.errors = []
-        self.error_count = 0
-        self.undo_remove_paths = []
-        self.undo_move_pairs = []
-        self.successful_source_keys = set()
-        self.clipboard_payload = None
-        self._ui_op = op
-        self.durable_copies = DURABLE_FILE_COPIES if durable_copies is None else bool(durable_copies)
-        self._copy_buffer = None
-
-    def cancel(self):
-        self._cancel = True
-
-    def remaining_source_paths(self) -> list[str]:
-        remaining = []
-        for src in self.srcs:
-            if _path_key(src) in self.successful_source_keys:
-                continue
-            if _path_exists_for_delete(src):
-                remaining.append(src)
-        return _dedupe_local_paths(remaining)
-
-    def _mark_source_success(self, src: str):
-        self.successful_source_keys.add(_path_key(src))
-
-    def _scan_source_progress(self, path: str) -> tuple[int, int]:
-        total_bytes = 0
-        total_items = 0
-        if os.path.isdir(path) and not _is_dir_link(path):
-            for root, dirs, files in os.walk(path):
-                if self._cancel:
-                    break
-                total_items += 1
-                if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
-                    self._progress_estimated = True
-                    break
-                traversable_dirs = []
-                for dirname in dirs:
-                    child_dir = os.path.join(root, dirname)
-                    if _is_dir_link(child_dir):
-                        total_items += 1
-                    else:
-                        traversable_dirs.append(dirname)
-                dirs[:] = traversable_dirs
-                for filename in files:
-                    if self._cancel:
-                        break
-                    fp = os.path.join(root, filename)
-                    total_items += 1
-                    if total_items >= FILEOP_FAST_PROGRESS_SCAN_LIMIT:
-                        self._progress_estimated = True
-                        break
-                    if not os.path.islink(fp):
-                        try:
-                            total_bytes += max(0, int(os.path.getsize(fp)))
-                        except Exception:
-                            pass
-        else:
-            total_items = 1
-            try:
-                total_bytes = max(0, int(os.path.getsize(path)))
-            except Exception:
-                total_bytes = 0
-        return total_bytes, max(1, total_items)
-
-    def _calc_total(self):
-        self._total_bytes = 0
-        self._done_bytes = 0
-        self._total_items = 0
-        self._done_items = 0
-        self._src_progress_cache = {}
-        for idx, src in enumerate(self.srcs, start=1):
-            if self._cancel:
-                break
-            name = os.path.basename(src.rstrip("\\/")) or src
-            self.status.emit(f"Scanning {idx}/{len(self.srcs)}: {name}")
-            stats = self._scan_source_progress(src)
-            self._src_progress_cache[_path_key(src)] = stats
-            self._total_bytes += stats[0]
-            self._total_items += stats[1]
-            if self._progress_estimated:
-                self.status.emit("Large operation detected; starting with estimated progress ...")
-                break
-        self._total_items = max(1, self._total_items)
-        self._last_progress_pct = -1
-        self._last_progress_emit_ts = 0.0
-        self._emit_progress()
-
-    def _emit_progress(self, force: bool = False):
-        if force:
-            pct = 100
-        else:
-            item_ratio = min(1.0, self._done_items / max(1, self._total_items))
-            if self._total_bytes > 0:
-                byte_ratio = min(1.0, self._done_bytes / self._total_bytes)
-                item_weight = 0.35 * (self._total_items / (self._total_items + 20.0))
-                ratio = (byte_ratio * (1.0 - item_weight)) + (item_ratio * item_weight)
-            else:
-                ratio = item_ratio
-            cap = 95 if self._progress_estimated else 99
-            pct = min(cap, max(0, int(ratio * 100)))
-
-        now = time.perf_counter()
-        should_emit = (
-            force
-            or self._last_progress_pct < 0
-            or (
-                pct > self._last_progress_pct
-                and (
-                    (pct - self._last_progress_pct) >= 1
-                    or (now - self._last_progress_emit_ts) >= 0.05
-                )
-            )
-        )
-        if not should_emit:
-            return
-        self._last_progress_pct = pct
-        self._last_progress_emit_ts = now
-        self.progress.emit(pct)
-
-    def _tick_progress(self, delta_bytes: int = 0, delta_items: int = 0):
-        self._done_bytes += max(0, int(delta_bytes or 0))
-        self._done_items += max(0, int(delta_items or 0))
-        if self._progress_estimated:
-            self._total_bytes = max(self._total_bytes, self._done_bytes + max(1, delta_bytes or 0))
-            self._total_items = max(self._total_items, self._done_items + max(1, delta_items or 0))
-        self._emit_progress()
-
-    def _source_progress(self, src: str) -> tuple[int, int]:
-        try:
-            stats = self._src_progress_cache.get(_path_key(src))
-        except Exception:
-            stats = None
-        if stats is not None:
-            return stats
-        if self._progress_estimated:
-            return 0, 1
-        return self._scan_source_progress(src)
-
-    def _skip_source_progress(self, src):
-        total_bytes, total_items = self._source_progress(src)
-        self._tick_progress(total_bytes, total_items)
-
-    def _emit_source_done(self):
-        self._emit_progress()
-
-    def _new_sibling_work_path(self, dst: str, kind: str) -> str:
-        parent = os.path.dirname(dst) or os.curdir
-        os.makedirs(parent, exist_ok=True)
-        candidate = os.path.join(parent, f".__mprn_{kind}_{uuid.uuid4().hex}")
-        while os.path.lexists(candidate):
-            candidate = os.path.join(parent, f".__mprn_{kind}_{uuid.uuid4().hex}")
-        return candidate
-
-    def _backup_destination(self, dst: str) -> str | None:
-        if not os.path.lexists(dst):
-            return None
-        backup = self._new_sibling_work_path(dst, "backup")
-        os.replace(dst, backup)
-        return backup
-
-    def _cleanup_path(self, path: str):
-        if not path or not os.path.lexists(path):
-            return
-        remove_any(path)
-
-    def _restore_backup(self, dst: str, backup: str | None):
-        if not backup:
-            return
-        restore_errors = []
-        try:
-            self._cleanup_path(dst)
-        except Exception as exc:
-            restore_errors.append(f"Could not remove partial destination {dst}: {exc}")
-        try:
-            if os.path.lexists(backup):
-                os.replace(backup, dst)
-        except Exception as exc:
-            restore_errors.append(f"Could not restore original destination {dst}: {exc}")
-        if restore_errors:
-            raise RuntimeError("; ".join(restore_errors))
-
-    def _discard_backup(self, backup: str | None, dst: str):
-        if not backup or not os.path.lexists(backup):
-            return
-        try:
-            self._cleanup_path(backup)
-        except Exception as exc:
-            self._record_copy_error(backup, dst, f"Operation succeeded, but backup cleanup failed: {exc}")
-
-    def _rollback_destination(self, dst: str, backup: str | None):
-        try:
-            if backup:
-                self._restore_backup(dst, backup)
-            else:
-                self._cleanup_path(dst)
-        except Exception as exc:
-            self._record_copy_error(dst, dst, f"Rollback failed: {exc}")
-
-    def _copy_file(self, src, dst):
-        copied = 0
-        temp_path = None
-        try:
-            os.makedirs(os.path.dirname(dst) or os.curdir, exist_ok=True)
-            temp_path = self._new_sibling_work_path(dst, "partial")
-            with open(src, "rb") as fsrc, open(temp_path, "xb") as fdst:
-                if self._copy_buffer is None:
-                    self._copy_buffer = bytearray(FILE_COPY_BUFFER_SIZE)
-                buf = self._copy_buffer
-                view = memoryview(buf)
-                while True:
-                    if self._cancel:
-                        return False
-                    count = fsrc.readinto(buf)
-                    if not count:
-                        break
-                    fdst.write(view[:count])
-                    copied += count
-                    self._tick_progress(delta_bytes=count)
-                if self.durable_copies:
-                    fdst.flush()
-                    os.fsync(fdst.fileno())
-            try:
-                shutil.copystat(src, temp_path, follow_symlinks=True)
-            except Exception:
-                pass
-            if self._cancel:
-                return False
-            os.replace(temp_path, dst)
-            temp_path = None
-            self._tick_progress(delta_items=1)
-            return True
-        except Exception:
-            self._skip_file_progress(src, copied)
-            raise
-        finally:
-            if temp_path and os.path.lexists(temp_path):
-                try:
-                    self._cleanup_path(temp_path)
-                except Exception:
-                    pass
-
-    def _copy_link(self, src: str, dst: str) -> bool:
-        temp_path = None
-        try:
-            if _is_junction(src):
-                raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
-            target = os.readlink(src)
-            temp_path = self._new_sibling_work_path(dst, "link")
-            os.symlink(target, temp_path, target_is_directory=_link_target_is_directory(src))
-            try:
-                shutil.copystat(src, temp_path, follow_symlinks=False)
-            except Exception:
-                pass
-            if self._cancel:
-                return False
-            os.replace(temp_path, dst)
-            temp_path = None
-            self._tick_progress(delta_items=1)
-            return True
-        finally:
-            if temp_path and os.path.lexists(temp_path):
-                try:
-                    remove_any(temp_path)
-                except Exception:
-                    pass
-
-    def _skip_file_progress(self, src, copied_bytes: int = 0):
-        try:
-            size = max(0, int(os.path.getsize(src)))
-        except Exception:
-            size = 0
-        remaining = max(0, size - max(0, int(copied_bytes or 0)))
-        self._tick_progress(delta_bytes=remaining, delta_items=1)
-
-    def _record_copy_error(self, src, dst, exc):
-        if self._cancel:
-            return
-        self.error_count += 1
-        if len(self.errors) < FILEOP_ERROR_DETAIL_LIMIT:
-            self.errors.append(f"{src} -> {dst}: {exc}")
-        name = os.path.basename(str(src).rstrip("\\/")) or str(src)
-        self.status.emit(f"Failed: {name}")
-
-    def _can_undo_new_destination(self, existed_before: bool, action: str | None) -> bool:
-        return (not existed_before) or action == "copy"
-
-    def _remember_created_for_undo(self, path: str):
-        if not path:
-            return
-        key = _path_key(path)
-        if any(_path_key(p) == key for p in self.undo_remove_paths):
-            return
-        self.undo_remove_paths.append(path)
-
-    def _remember_move_for_undo(self, final_path: str, original_path: str):
-        if not final_path or not original_path:
-            return
-        self.undo_move_pairs.append((final_path, original_path))
-
-    def _copy_dir_recursive(self, src_dir, dst_dir):
-        if self._cancel:
-            return False
-        self._tick_progress(delta_items=1)
-        ok = True
-        try:
-            entries = list(os.scandir(src_dir))
-        except Exception as exc:
-            self._record_copy_error(src_dir, dst_dir, exc)
-            return False
-
-        for entry in entries:
-            if self._cancel:
-                return False
-            src_path = entry.path
-            dst_path = os.path.join(dst_dir, entry.name)
-            try:
-                if _is_junction(src_path):
-                    raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
-                if entry.is_symlink():
-                    if not self._copy_link(src_path, dst_path):
-                        return False
-                elif entry.is_dir(follow_symlinks=False):
-                    os.makedirs(dst_path, exist_ok=False)
-                    if not self._copy_dir_recursive(src_path, dst_path):
-                        ok = False
-                elif not self._copy_file(src_path, dst_path):
-                    return False
-            except Exception as exc:
-                self._record_copy_error(src_path, dst_path, exc)
-                self._skip_source_progress(src_path)
-                ok = False
-        return ok
-
-    def _copy_to_new_path(self, src: str, dst: str) -> bool:
-        if _is_junction(src):
-            raise OSError("Copying Windows directory junctions is not supported; the junction was left unchanged.")
-        if os.path.islink(src):
-            return self._copy_link(src, dst)
-        if os.path.isdir(src):
-            os.makedirs(dst, exist_ok=False)
-            return self._copy_dir_recursive(src, dst)
-        return self._copy_file(src, dst)
-
-    def _copy_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
-        backup = None
-        if existed and action not in {"skip", "copy", "overwrite"}:
-            self._record_copy_error(src, dst, "No conflict resolution was selected; destination was left unchanged.")
-            self._skip_source_progress(src)
-            return False
-        if existed and action == "skip":
-            self._skip_source_progress(src)
-            return True
-        if existed and action == "copy":
-            dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
-            existed = False
-        if existed and action == "overwrite":
-            try:
-                backup = self._backup_destination(dst)
-            except Exception as exc:
-                self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
-                self._skip_source_progress(src)
-                return False
-
-        created_for_undo = self._can_undo_new_destination(existed, action)
-        copied_ok = False
-        try:
-            copied_ok = self._copy_to_new_path(src, dst)
-            if copied_ok and not self._cancel:
-                self._discard_backup(backup, dst)
-                if created_for_undo:
-                    self._remember_created_for_undo(dst)
-                return True
-        except Exception as exc:
-            self._record_copy_error(src, dst, exc)
-        self._rollback_destination(dst, backup)
-        return False
-
-    def _move_source_transactional(self, src: str, dst: str, action: str | None, existed: bool) -> bool:
-        if existed and action not in {"skip", "copy", "overwrite"}:
-            self._record_copy_error(src, dst, "No conflict resolution was selected; destination was left unchanged.")
-            self._skip_source_progress(src)
-            return False
-        if existed and action == "skip":
-            self._skip_source_progress(src)
-            return False
-        if existed and action == "copy":
-            dst = unique_dest_path(self.dst_dir, os.path.basename(dst))
-            existed = False
-
-        can_undo_move = self._can_undo_new_destination(existed, action)
-        src_progress = self._source_progress(src)
-        same_filesystem = _same_filesystem(src, os.path.dirname(dst) or self.dst_dir)
-
-        if same_filesystem:
-            backup = None
-            if existed and action == "overwrite":
-                try:
-                    backup = self._backup_destination(dst)
-                except Exception as exc:
-                    self._record_copy_error(src, dst, f"Could not protect existing destination: {exc}")
-                    self._skip_source_progress(src)
-                    return False
-            try:
-                os.replace(src, dst)
-                self._tick_progress(src_progress[0], src_progress[1])
-                self._discard_backup(backup, dst)
-                self._mark_source_success(src)
-                if can_undo_move:
-                    self._remember_move_for_undo(dst, src)
-                return True
-            except Exception as exc:
-                self._rollback_destination(dst, backup)
-                if not _is_cross_device_error(exc):
-                    self._record_copy_error(src, dst, exc)
-                    self._skip_source_progress(src)
-                    return False
-                self.status.emit("Filesystem boundary detected; switching to safe copy-and-cleanup move ...")
-
-        if _is_junction(src):
-            self._record_copy_error(
-                src,
-                dst,
-                "Moving a Windows directory junction across filesystems is not supported; the junction was left unchanged.",
-            )
-            self._skip_source_progress(src)
-            return False
-
-        # Cross-filesystem moves are deliberately copy-first.  shutil.move() cannot
-        # be cancelled and may partially delete the source before reporting an error.
-        staging = self._new_sibling_work_path(dst, "move")
-        try:
-            copied_ok = self._copy_to_new_path(src, staging)
-        except Exception as exc:
-            copied_ok = False
-            self._record_copy_error(src, staging, exc)
-
-        if not copied_ok or self._cancel:
-            try:
-                self._cleanup_path(staging)
-            except Exception as exc:
-                self._record_copy_error(staging, dst, f"Could not remove incomplete staging copy: {exc}")
-            return False
-
-        backup = None
-        try:
-            if existed and action == "overwrite":
-                backup = self._backup_destination(dst)
-            os.replace(staging, dst)
-            staging = None
-        except Exception as exc:
-            self._record_copy_error(src, dst, f"Could not promote the completed staging copy: {exc}")
-            try:
-                if staging and os.path.lexists(staging):
-                    self._cleanup_path(staging)
-            except Exception as cleanup_exc:
-                self._record_copy_error(staging, dst, f"Could not remove staging copy: {cleanup_exc}")
-            self._rollback_destination(dst, backup)
-            return False
-
-        # The destination is now a complete copy.  Never roll it back if source
-        # cleanup is cancelled or fails: it may be the only complete copy left.
-        self._discard_backup(backup, dst)
-        if self._cancel:
-            return False
-
-        cleanup_errors = []
-        try:
-            if os.path.isdir(src) and not _is_dir_link(src):
-                _deleted, cleanup_errors = delete_any_permanent_best_effort(
-                    src,
-                    should_cancel=lambda: self._cancel,
-                )
-            else:
-                remove_any(src)
-        except DeleteCancelled:
-            return False
-        except Exception as exc:
-            cleanup_errors = [str(exc)]
-
-        if not _path_exists_for_delete(src):
-            self._mark_source_success(src)
-            if can_undo_move:
-                self._remember_move_for_undo(dst, src)
-            return True
-
-        detail = cleanup_errors[0] if cleanup_errors else "source still exists after cleanup"
-        self._record_copy_error(
-            src,
-            dst,
-            f"Destination copy is complete, but source cleanup was incomplete: {detail}",
-        )
-        return False
-
-    def run(self):
-        try:
-            self.status.emit(f"Scanning items for {self.op} ...")
-            self._calc_total()
-            if self._cancel:
-                self.error.emit("Operation cancelled.")
-                return
-            self.status.emit(f"Preparing {self.op} ...")
-
-            for src in self.srcs:
-                if self._cancel:
-                    break
-                if not os.path.lexists(src):
-                    self._mark_source_success(src)
-                    self._skip_source_progress(src)
-                    self._emit_source_done()
-                    continue
-
-                base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
-                dst = os.path.join(self.dst_dir, base)
-
-                if _paths_same(src, dst):
-                    if self.op == "copy":
-                        dst = unique_dest_path(self.dst_dir, base)
-                    else:
-                        self.status.emit(f"Skipped same path: {base}")
-                        self._skip_source_progress(src)
-                        self._emit_source_done()
-                        continue
-
-                if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
-                    self.status.emit(f"Skipped nested destination: {base}")
-                    self._skip_source_progress(src)
-                    self._emit_source_done()
-                    continue
-
-                existed = os.path.lexists(dst)
-                action = self.conflict_map.get(src) if existed else None
-                if self.op == "copy":
-                    self._copy_source_transactional(src, dst, action, existed)
-                else:
-                    self._move_source_transactional(src, dst, action, existed)
-                self._emit_source_done()
-
-            if self._cancel:
-                self.error.emit("Operation cancelled.")
-                return
-            self._done_bytes = max(self._done_bytes, self._total_bytes)
-            self._done_items = max(self._done_items, self._total_items)
-            self._emit_progress(force=True)
-            self.finished_ok.emit()
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-class DeleteWorker(QtCore.QThread):
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished_ok = pyqtSignal()
-    error = pyqtSignal(str)
-
-    def __init__(self, paths: list, permanent: bool = False, hwnd: int = 0, parent=None):
-        super().__init__(parent)
-        self.paths = [p for p in paths if p]
-        self.permanent = permanent
-        self.hwnd = int(hwnd or 0)
-        self._cancel = False
-        self._total = 1
-        self._done = 0
-        self._last_progress_pct = -1
-        self._last_progress_emit_ts = 0.0
-        self.deleted_count = 0
-        self.errors = []
-
-    def cancel(self):
-        self._cancel = True
-
-    def _emit_progress(self, force: bool = False):
-        if force:
-            pct = 100
-        else:
-            total = max(1, int(self._total or 1))
-            pct = min(99, max(0, int(self._done * 100 / total)))
-        now = time.perf_counter()
-        should_emit = (
-            force
-            or self._last_progress_pct < 0
-            or (
-                pct > self._last_progress_pct
-                and (
-                    (pct - self._last_progress_pct) >= 1
-                    or (now - self._last_progress_emit_ts) >= 0.05
-                )
-            )
-        )
-        if not should_emit:
-            return
-        self._last_progress_pct = pct
-        self._last_progress_emit_ts = now
-        self.progress.emit(pct)
-
-    def _prepare_progress(self):
-        # Counting every descendant first doubles directory I/O and can delay a
-        # Recycle Bin rename by minutes.  Progress is therefore based on selected
-        # top-level paths while the delete helpers report the exact deleted count.
-        self._total = max(1, len(self.paths))
-        self._done = 0
-        self._last_progress_pct = -1
-        self._last_progress_emit_ts = 0.0
-        self._emit_progress()
-
-    def _on_path_done(self):
-        self._done += 1
-        self._emit_progress()
-
-    def run(self):
-        coinit = False
-        try:
-            self.status.emit("Preparing delete ...")
-            self._prepare_progress()
-            if self._cancel:
-                self.error.emit("Operation cancelled.")
-                return
-
-            if sys.platform == "win32" and HAS_PYWIN32:
-                try:
-                    pythoncom.CoInitialize()
-                    coinit = True
-                except Exception:
-                    coinit = False
-
-            verb = "Deleting" if self.permanent else "Sending to Recycle Bin"
-            total_paths = len(self.paths)
-            if total_paths == 0:
-                self._done = self._total
-                self._emit_progress(force=True)
-                self.finished_ok.emit()
-                return
-
-            for idx, path in enumerate(self.paths, start=1):
-                if self._cancel:
-                    self.error.emit("Operation cancelled.")
-                    return
-
-                name = os.path.basename(path.rstrip("\\/")) or os.path.basename(path) or path
-                self.status.emit(f"{verb} {idx}/{total_paths}: {name}")
-
-                try:
-                    if self.permanent:
-                        deleted, errors = delete_any_permanent_best_effort(
-                            path,
-                            should_cancel=lambda: self._cancel,
-                        )
-                    else:
-                        deleted, errors = recycle_any_best_effort(
-                            path,
-                            hwnd=self.hwnd,
-                            should_cancel=lambda: self._cancel,
-                        )
-                    self.deleted_count += deleted
-                    self.errors.extend(errors)
-                    self._on_path_done()
-                except DeleteCancelled:
-                    self.error.emit("Operation cancelled.")
-                    return
-                except Exception as e:
-                    self.errors.append(f"{path}: {e}")
-                    self._on_path_done()
-
-            self._done = max(self._done, self._total)
-            self._emit_progress(force=True)
-            self.finished_ok.emit()
-        except DeleteCancelled:
-            self.error.emit("Operation cancelled.")
-        except Exception as e:
-            self.error.emit(str(e))
-        finally:
-            if coinit:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
 
 
 
@@ -2195,6 +751,58 @@ def icon_cmd(theme: str):
         p.setPen(QPen(textc, 2))
         p.drawLine(6, h//2, 10, h//2-3); p.drawLine(6, h//2, 10, h//2+3); p.drawLine(12, h//2+5, w-6, h//2+5)
     return _make_icon(22, 22, paint)
+
+def icon_customize(theme: str, letter: str = ""):
+    def paint(p: QPainter, w, h):
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#e6e9ee" if theme == "dark" else "#30343b"), 1.6))
+        p.drawRoundedRect(2, 2, w - 4, h - 4, 4, 4)
+        font = QFont(); font.setPixelSize(14); font.setBold(True)
+        p.setFont(font)
+        p.drawText(QtCore.QRect(2, 2, w - 4, h - 4), Qt.AlignCenter, letter or "\u25b6")
+    return _make_icon(22, 22, paint)
+
+
+def normalize_custom_commands(value):
+    value = value if isinstance(value, dict) else {}
+    count = value.get("count", 0)
+    count = count if type(count) is int and count in (0, 2, 4, 6) else 0
+    items = value.get("items", [])
+    items = items if isinstance(items, list) else []
+    cleaned = []
+    for index in range(6):
+        item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+        icon = item.get("icon", "")
+        cleaned.append({"command": str(item.get("command", "")),
+                        "icon": icon if isinstance(icon, str) and icon in tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ") else ""})
+    return {"count": count, "items": cleaned}
+
+
+def launch_custom_command(command: str, path: str):
+    """Run user-authored CMD syntax without creating a console window."""
+    if os.name != "nt":
+        raise OSError("Customize commands require Windows.")
+    if not command.strip():
+        raise ValueError("Set a command in Customize settings first.")
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise OSError(f"Folder is unavailable: {path}")
+    comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+    cwd = path
+    if path.startswith("\\\\"):
+        # CMD needs pushd to map a UNC working directory to a drive.
+        command = f'pushd "{path}" && {command}'
+        cwd = os.environ.get("SystemRoot", r"C:\Windows")
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    # Pass the command verbatim: list2cmdline would escape embedded CMD quotes.
+    return subprocess.Popen(
+        f'"{comspec}" /d /s /c "{command}"', cwd=cwd,
+        creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
 
 def icon_explorer(theme: str):
     def paint(p: QPainter, w, h):
@@ -3264,6 +1872,26 @@ class ShellIconBroker(QtCore.QObject):
         return stopped
 
 
+STAT_RETRY_LIMIT = 3
+STAT_RETRY_BASE_S = 2.0
+
+
+def _record_stat_attempt(rec, mtime):
+    if mtime is not None:
+        rec.pop("stat_failures", None)
+        rec.pop("stat_retry_at", None)
+    else:
+        failures = int(rec.get("stat_failures", 0)) + 1
+        rec["stat_failures"] = failures
+        rec["stat_retry_at"] = time.monotonic() + STAT_RETRY_BASE_S * (2 ** min(failures - 1, 4))
+
+
+def _stat_retry_delay_ms(rec):
+    if int(rec.get("stat_failures", 0)) >= STAT_RETRY_LIMIT:
+        return None
+    return max(0, math.ceil((rec.get("stat_retry_at", 0) - time.monotonic()) * 1000))
+
+
 class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Ext", "Date Modified"]
 
@@ -3317,6 +1945,35 @@ class FastDirModel(QAbstractTableModel):
         for row, rec in enumerate(self._rows):
             self._row_by_path[str(rec.get("path", ""))] = row
             self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def reconcile_snapshot(self, rows):
+        """Apply a completed refresh without resetting selection or the view."""
+        incoming = {str(rec["path"]): dict(rec) for rec in rows}
+        removed = [i for i, rec in enumerate(self._rows) if rec["path"] not in incoming]
+        for first, last in reversed(_contiguous_ranges(removed)):
+            self.beginRemoveRows(QtCore.QModelIndex(), first, last)
+            del self._rows[first:last + 1]
+            self.endRemoveRows()
+        self._rebuild_row_maps()
+        changed = []
+        keys = ("name", "name_l", "path", "is_dir", "ext", "size", "mtime", "icon_key")
+        for row, old in enumerate(self._rows):
+            fresh = incoming.pop(old["path"])
+            fresh.setdefault("icon_key", _icon_cache_key(fresh["path"], bool(fresh.get("is_dir"))))
+            if any(old.get(key) != fresh.get(key) for key in keys):
+                old.update(fresh)
+                changed.append(row)
+            # A new filesystem snapshot permits another bounded retry cycle.
+            old.pop("stat_failures", None)
+            old.pop("stat_retry_at", None)
+        if changed:
+            self._rebuild_row_maps()
+            for first, last in _contiguous_ranges(changed):
+                self.dataChanged.emit(self.index(first, 0), self.index(last, 3), [])
+        if incoming:
+            self.append_rows(list(incoming.values()))
+        if removed or changed or incoming:
+            self._last_sort = None
 
     def sort_records(self, column: int, order=Qt.AscendingOrder):
         sort_state = (int(column), int(order))
@@ -3376,6 +2033,7 @@ class FastDirModel(QAbstractTableModel):
             if row is None or not (0 <= row < len(self._rows)):
                 continue
             rec = self._rows[row]
+            _record_stat_attempt(rec, mtime_val)
             if rec.get("size") is None and size_val is not None:
                 rec["size"] = int(size_val)
                 size_rows.append(row)
@@ -3497,6 +2155,115 @@ class FastDirModel(QAbstractTableModel):
             return rec.get("icon_key", "")
         return None
 
+class BackgroundCheck(QtCore.QThread):
+    completed = pyqtSignal(object)
+
+    def __init__(self, check, parent=None):
+        super().__init__(parent)
+        self.check = check
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            result = self.check(lambda: self._cancel)
+        except Exception as exc:
+            result = exc
+        if not self._cancel:
+            self.completed.emit(result)
+
+
+def prepare_file_operation(op, srcs, dst_dir, cancelled):
+    valid, skipped, blocked, automatic, conflicts = [], [], [], {}, []
+    seen = set()
+    for src in srcs:
+        if cancelled():
+            break
+        key = _path_key(src)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not src or not os.path.lexists(src):
+            continue
+        dst = os.path.join(dst_dir, os.path.basename(src.rstrip("\\/")) or os.path.basename(src))
+        if _paths_same(src, dst):
+            if op == "copy":
+                automatic[src] = "copy"
+                valid.append(src)
+            else:
+                skipped.append(src)
+            continue
+        if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
+            blocked.append(src)
+            continue
+        valid.append(src)
+        if os.path.lexists(dst):
+            conflicts.append((src, dst))
+    return valid, skipped, blocked, automatic, conflicts
+
+
+class SharedStatCache:
+    """Bounded metadata cache; concurrent readers share one filesystem call."""
+    def __init__(self, ttl_s=5.0, max_entries=16384):
+        self.ttl_s = ttl_s
+        self.max_entries = max(1, max_entries)
+        self._lock = threading.Lock()
+        self._cache = OrderedDict()
+        self._flights = {}
+        self._generations = {}
+
+    def read(self, path, cancelled=lambda: False, loader=None):
+        key = _path_key(path)
+        folder = _path_key(os.path.dirname(path))
+        while not cancelled():
+            with self._lock:
+                generation = self._generations.get(folder, 0)
+                cached = self._cache.get(key)
+                if cached and cached[0] > time.monotonic() and cached[1] == generation:
+                    self._cache.move_to_end(key)
+                    return cached[2]
+                flight_key = (key, generation)
+                event = self._flights.get(flight_key)
+                leader = event is None
+                if leader:
+                    event = threading.Event()
+                    self._flights[flight_key] = event
+            if not leader:
+                while not cancelled() and not event.wait(0.05):
+                    pass
+                continue
+            try:
+                st = loader() if loader else os.stat(path, follow_symlinks=False)
+                result = (0 if stat.S_ISDIR(st.st_mode) else int(st.st_size), float(st.st_mtime))
+            except Exception:
+                result = (None, None)
+            with self._lock:
+                current = self._generations.get(folder, 0) == generation
+                if current and not cancelled():
+                    ttl = self.ttl_s if result[1] is not None else min(self.ttl_s, STAT_RETRY_BASE_S)
+                    self._cache[key] = (time.monotonic() + ttl, generation, result)
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > self.max_entries:
+                        self._cache.popitem(last=False)
+                self._flights.pop(flight_key, None)
+                event.set()
+            if current:
+                return result
+            # A DirEntry may retain metadata from before the invalidation.
+            loader = None
+        return None, None
+
+    def invalidate(self, folder):
+        key = _path_key(folder)
+        with self._lock:
+            self._generations[key] = self._generations.get(key, 0) + 1
+
+
+GLOBAL_STAT_CACHE = SharedStatCache()
+
+
 class FastStatWorker(QtCore.QThread):
     statBatchReady=pyqtSignal(list); finishedCycle=pyqtSignal()
     def __init__(self, root:str, paths:list[str], parent=None):
@@ -3507,12 +2274,9 @@ class FastStatWorker(QtCore.QThread):
         try:
             for p in self._paths:
                 if self._cancel: break
-                try:
-                    st=os.stat(p, follow_symlinks=False)
-                    size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
-                    mtime_val=float(st.st_mtime)
-                except Exception:
-                    size_val=0; mtime_val=None
+                size_val, mtime_val = GLOBAL_STAT_CACHE.read(p, lambda: self._cancel)
+                if self._cancel:
+                    break
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -3524,7 +2288,7 @@ class FastStatWorker(QtCore.QThread):
 
 
 class DirectorySnapshotCache:
-    """Thread-safe short-lived cache with one active scan per path/options key."""
+    """Share directory enumeration regardless of each pane's sort options."""
     def __init__(self, ttl_s: float = DIR_SNAPSHOT_TTL_S, max_entries: int = DIR_SNAPSHOT_CACHE_LIMIT):
         self._ttl_s = max(0.0, float(ttl_s))
         self._max_entries = max(1, int(max_entries))
@@ -3540,7 +2304,7 @@ class DirectorySnapshotCache:
 
     def acquire(self, path: str, preload_size: bool, preload_mtime: bool):
         root_key = self._root_key(path)
-        key = (root_key, bool(preload_size), bool(preload_mtime))
+        key = (root_key,)
         now = time.monotonic()
         with self._lock:
             generation = int(self._generations.get(root_key, 0))
@@ -3591,6 +2355,7 @@ class DirectorySnapshotCache:
             self._generations[root_key] = int(self._generations.get(root_key, 0)) + 1
             for key in [key for key in self._cache if key[0] == root_key]:
                 self._cache.pop(key, None)
+            GLOBAL_STAT_CACHE.invalidate(path)
             return True
 
 
@@ -3633,7 +2398,16 @@ class DirEnumWorker(QtCore.QThread):
         for start in range(0, len(rows), batch_size):
             if self._cancel:
                 return
-            self.batchReady.emit(list(rows[start:start + batch_size]))
+            batch = []
+            for original in rows[start:start + batch_size]:
+                if self._cancel:
+                    return
+                rec = dict(original)
+                if (self._preload_size or self._preload_mtime) and rec.get("mtime") is None:
+                    rec["size"], rec["mtime"] = GLOBAL_STAT_CACHE.read(rec["path"], lambda: self._cancel)
+                batch.append(rec)
+            if not self._cancel:
+                self.batchReady.emit(batch)
 
     def _scan_as_leader(self):
         all_rows = []
@@ -3649,17 +2423,10 @@ class DirEnumWorker(QtCore.QThread):
                 size_val = None
                 mtime_val = None
                 if self._preload_size or self._preload_mtime:
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                        if self._preload_size:
-                            size_val = 0 if is_dir else int(st.st_size)
-                        if self._preload_mtime:
-                            mtime_val = float(st.st_mtime)
-                    except Exception:
-                        if self._preload_size:
-                            size_val = 0 if is_dir else None
-                        if self._preload_mtime:
-                            mtime_val = None
+                    size_val, mtime_val = GLOBAL_STAT_CACHE.read(
+                        p, lambda: self._cancel,
+                        loader=lambda: entry.stat(follow_symlinks=False),
+                    )
                 rec = {
                     "name": name,
                     "name_l": name.lower(),
@@ -3723,12 +2490,9 @@ class NormalStatWorker(QtCore.QThread):
         try:
             for p in self._paths:
                 if self._cancel: break
-                try:
-                    st=os.stat(p, follow_symlinks=False)
-                    size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
-                    mtime_val=float(st.st_mtime)
-                except Exception:
-                    size_val=0; mtime_val=None
+                size_val, mtime_val = GLOBAL_STAT_CACHE.read(p, lambda: self._cancel)
+                if self._cancel:
+                    break
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -4037,6 +2801,7 @@ class StatOverlayProxy(QIdentityProxyModel):
         del self._queue[:batch_size]
 
         w = NormalStatWorker(batch, self)
+        w.finished.connect(w.deleteLater)
         w.statBatchReady.connect(self._apply_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch: self._on_cycle_finished(b), Qt.QueuedConnection)
         self._worker = w
@@ -4080,6 +2845,104 @@ class StatOverlayProxy(QIdentityProxyModel):
             self._queue.append(p)
         self._start_next_batch()
 
+class PathSuggestionWorker(QtCore.QThread):
+    resultReady = pyqtSignal(int, str, list)
+
+    def __init__(self, generation, typed, recent, parent=None):
+        super().__init__(parent)
+        self.generation = generation
+        self.typed = typed
+        self.recent = list(recent)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        items = list(self.recent)
+        try:
+            if not self._cancel:
+                items.extend(self._collect_filesystem_suggestions(self.typed, 50))
+        except Exception:
+            pass
+        if not self._cancel:
+            self.resultReady.emit(self.generation, self.typed, list(dict.fromkeys(items))[:80])
+
+    def _list_root_paths(self) -> list[str]:
+        out = []
+        try:
+            for fi in QDir.drives():
+                try:
+                    p = fi.absoluteFilePath()
+                except Exception:
+                    p = ""
+                if p:
+                    out.append(_normalize_fs_path(p))
+        except Exception:
+            pass
+        if not out:
+            out.append(_normalize_fs_path(QDir.rootPath()))
+        seen = set()
+        uniq = []
+        for p in out:
+            k = os.path.normcase(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(p)
+        return uniq
+
+    def _collect_filesystem_suggestions(self, typed: str, max_items: int = 45) -> list[str]:
+        t = (typed or "").strip().strip('"')
+        if not t:
+            return self._list_root_paths()[:max_items]
+
+        t = t.replace("/", os.sep)
+        if os.name == "nt" and len(t) == 2 and t[1] == ":":
+            t = t + os.sep
+
+        if t.endswith(("\\", "/")):
+            parent = _normalize_fs_path(t)
+            prefix = ""
+        else:
+            parent = _normalize_fs_path(os.path.dirname(t))
+            prefix = os.path.basename(t)
+
+        if not parent:
+            roots = self._list_root_paths()
+            tl = t.lower()
+            if not tl:
+                return roots[:max_items]
+            return [r for r in roots if r.lower().startswith(tl)][:max_items]
+
+        if not os.path.isdir(parent):
+            return []
+
+        out = []
+        pref_l = prefix.lower()
+        try:
+            with os.scandir(parent) as it:
+                for entry in it:
+                    if self._cancel:
+                        break
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except Exception:
+                        continue
+                    name = entry.name
+                    if pref_l and not name.lower().startswith(pref_l):
+                        continue
+                    out.append(_normalize_fs_path(os.path.join(parent, name)))
+                    if len(out) >= max_items:
+                        break
+        except Exception:
+            return []
+        if not pref_l and os.path.isdir(parent):
+            out.insert(0, _normalize_fs_path(parent))
+        return out[:max_items]
+
+
 class PathBar(QWidget):
     pathSubmitted=pyqtSignal(str)
     _shared_recent_paths: list[str] | None = None
@@ -4119,6 +2982,10 @@ class PathBar(QWidget):
         self._edit=QLineEdit(self); self._edit.hide(); self._edit.setClearButtonEnabled(True); self._edit.setFixedHeight(UI_H)
         self._edit.returnPressed.connect(self._on_edit_return)
 
+        self._suggest_generation = 0
+        self._suggest_worker = None
+        self._suggest_pending = None
+        self._suggest_shutdown = False
         self._suggest_timer = QTimer(self)
         self._suggest_timer.setSingleShot(True)
         self._suggest_timer.setInterval(110)
@@ -4127,7 +2994,7 @@ class PathBar(QWidget):
         self._edit_completer = QCompleter(self._edit_model, self)
         self._edit_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._edit_completer.setCompletionMode(QCompleter.PopupCompletion)
-        self._edit_completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
+        self._edit_completer.setModelSorting(QCompleter.UnsortedModel)
         self._edit.setCompleter(self._edit_completer)
         self._edit.textEdited.connect(lambda _t: self._queue_suggestions_update(False))
 
@@ -4202,30 +3069,6 @@ class PathBar(QWidget):
                 merged.append(_normalize_fs_path(p))
         self._set_recent_paths(merged)
 
-    def _list_root_paths(self) -> list[str]:
-        out = []
-        try:
-            for fi in QDir.drives():
-                try:
-                    p = fi.absoluteFilePath()
-                except Exception:
-                    p = ""
-                if p:
-                    out.append(_normalize_fs_path(p))
-        except Exception:
-            pass
-        if not out:
-            out.append(_normalize_fs_path(QDir.rootPath()))
-        seen = set()
-        uniq = []
-        for p in out:
-            k = os.path.normcase(p)
-            if k in seen:
-                continue
-            seen.add(k)
-            uniq.append(p)
-        return uniq
-
     def _collect_recent_suggestions(self, typed: str, max_items: int = 30) -> list[str]:
         self._reload_recent_paths()
         t = (typed or "").strip().lower()
@@ -4235,92 +3078,65 @@ class PathBar(QWidget):
         contains = [p for p in self._recent_paths if t in p.lower() and not p.lower().startswith(t)]
         return (starts + contains)[:max_items]
 
-    def _collect_filesystem_suggestions(self, typed: str, max_items: int = 45) -> list[str]:
-        t = (typed or "").strip().strip('"')
-        if not t:
-            return self._list_root_paths()[:max_items]
-
-        t = t.replace("/", os.sep)
-        if os.name == "nt" and len(t) == 2 and t[1] == ":":
-            t = t + os.sep
-
-        if t.endswith(("\\", "/")):
-            parent = _normalize_fs_path(t)
-            prefix = ""
-        else:
-            parent = _normalize_fs_path(os.path.dirname(t))
-            prefix = os.path.basename(t)
-
-        if not parent:
-            roots = self._list_root_paths()
-            tl = t.lower()
-            if not tl:
-                return roots[:max_items]
-            return [r for r in roots if r.lower().startswith(tl)][:max_items]
-
-        if not os.path.isdir(parent):
-            return []
-
-        out = []
-        pref_l = prefix.lower()
-        try:
-            with os.scandir(parent) as it:
-                for entry in it:
-                    try:
-                        if not entry.is_dir(follow_symlinks=False):
-                            continue
-                    except Exception:
-                        continue
-                    name = entry.name
-                    if pref_l and not name.lower().startswith(pref_l):
-                        continue
-                    out.append(_normalize_fs_path(os.path.join(parent, name)))
-                    if len(out) >= max_items:
-                        break
-        except Exception:
-            return []
-        if not pref_l and os.path.isdir(parent):
-            out.insert(0, _normalize_fs_path(parent))
-        return out[:max_items]
-
-    def _collect_edit_suggestions(self, typed: str) -> list[str]:
-        out = []
-        seen = set()
-        def add_path(p):
-            if not p:
-                return
-            np = _normalize_fs_path(str(p))
-            key = os.path.normcase(np)
-            if key in seen:
-                return
-            seen.add(key)
-            out.append(np)
-
-        raw = (typed or "").strip().strip('"')
-        if raw and os.path.isdir(_normalize_fs_path(raw)):
-            add_path(_normalize_fs_path(raw))
-
-        for p in self._collect_recent_suggestions(raw, 35):
-            add_path(p)
-        for p in self._collect_filesystem_suggestions(raw, 50):
-            add_path(p)
-        return out[:80]
-
     def _queue_suggestions_update(self, immediate: bool = False):
+        self._suggest_generation += 1
+        self._suggest_pending = None
+        if self._suggest_worker:
+            self._suggest_worker.cancel()
+        self._suggest_timer.stop()
         if immediate:
             self._refresh_edit_completer()
-            return
-        if self._suggest_timer.isActive():
-            self._suggest_timer.stop()
-        self._suggest_timer.start()
+        else:
+            self._suggest_timer.start()
 
     def _refresh_edit_completer(self):
+        if self._suggest_shutdown:
+            return
+        self._suggest_generation += 1
         typed = self._edit.text().strip()
-        items = self._collect_edit_suggestions(typed)
+        recent = self._collect_recent_suggestions(typed, 35)
+        self._apply_suggestions(self._suggest_generation, typed, recent)
+        self._suggest_pending = (self._suggest_generation, typed, recent)
+        if self._suggest_worker is not None:
+            self._suggest_worker.cancel()
+        else:
+            self._start_suggestion_worker()
+
+    def _start_suggestion_worker(self):
+        if self._suggest_shutdown or self._suggest_pending is None:
+            return
+        generation, typed, recent = self._suggest_pending
+        self._suggest_pending = None
+        worker = PathSuggestionWorker(generation, typed, recent, self)
+        self._suggest_worker = worker
+        worker.resultReady.connect(self._apply_suggestions)
+        worker.finished.connect(self._suggestion_worker_finished)
+        worker.start()
+
+    @QtCore.pyqtSlot(int, str, list)
+    def _apply_suggestions(self, generation, typed, items):
+        if self._suggest_shutdown or generation != self._suggest_generation or typed != self._edit.text().strip():
+            return
         self._edit_model.setStringList(items)
         self._edit_completer.setCompletionPrefix(typed)
         if self._edit.isVisible() and self._edit.hasFocus() and items:
             self._edit_completer.complete()
+
+    @QtCore.pyqtSlot()
+    def _suggestion_worker_finished(self):
+        worker = self.sender()
+        if self._suggest_worker is worker:
+            self._suggest_worker = None
+        worker.deleteLater()
+        self._start_suggestion_worker()
+
+    def shutdown_suggestions(self):
+        self._suggest_shutdown = True
+        self._suggest_generation += 1
+        self._suggest_pending = None
+        self._suggest_timer.stop()
+        if self._suggest_worker:
+            self._suggest_worker.cancel()
 
     def _show_recent_paths_menu(self):
         self._reload_recent_paths()
@@ -4612,6 +3428,7 @@ class SearchResultModel(QAbstractTableModel):
             if row is None or not (0 <= row < len(self._rows)):
                 continue
             rec = self._rows[row]
+            _record_stat_attempt(rec, mtime_val)
             if rec.get("size") is None and size_val is not None:
                 rec["size"] = int(size_val)
                 size_rows.append(row)
@@ -5218,6 +4035,10 @@ class ExplorerPane(QWidget):
         self._update_pane_status()
 
     def _init_state(self):
+        self._closing = False
+        self._navigation_generation = 0
+        self._path_check = None
+        self._space_check = None
         self._search_mode=False; self._search_model=None; self._search_proxy=None
         self._search_pending_items={}; self._search_stats_done=set(); self._search_stat_worker=None
         self._search_stat_queue=[]; self._search_stat_pending=set()
@@ -5240,6 +4061,7 @@ class ExplorerPane(QWidget):
         self._fast_enum_done = False
         self._large_folder_mode = False
         self._file_worker=None
+        self._undo_worker=None
         self._icon_cache = {}
         self._icon_failed = GLOBAL_SHELL_ICON_FAILURES
         self._op_progress_dialog=None
@@ -5269,8 +4091,8 @@ class ExplorerPane(QWidget):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder")
         base_star_width = max(UI_H, self.btn_star.sizeHint().width())
-        self.btn_star.setFixedSize(base_star_width * 2, UI_H * 2)
-        self.btn_star.setIconSize(QSize(36, 36))
+        self.btn_star.setFixedSize(base_star_width, UI_H)
+        self.btn_star.setIconSize(QSize(18, 18))
         self._bm_btn_container=QWidget(self)
         self._bm_btn_layout=QVBoxLayout(self._bm_btn_container)
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(max(0, ROW_SPACING-2))
@@ -5310,6 +4132,8 @@ class ExplorerPane(QWidget):
 
         tool_grid_widget = QWidget(self)
         tool_grid = QGridLayout(tool_grid_widget)
+        self._tool_grid = tool_grid
+        self._custom_buttons = []
         tool_grid.setContentsMargins(0,0,0,0)
         tool_grid.setHorizontalSpacing(max(0, ROW_SPACING-2))
         tool_grid.setVerticalSpacing(max(0, ROW_SPACING-2))
@@ -5318,10 +4142,9 @@ class ExplorerPane(QWidget):
         row_toolbar.setContentsMargins(0,0,0,0)
 
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
-        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignVCenter)
+        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignTop)
         row_toolbar.addWidget(self._bm_btn_container,1)
-        for index, button in enumerate((self.btn_cmd, self.btn_explorer, self.btn_up, self.btn_new, self.btn_new_file, self.btn_refresh)):
-            tool_grid.addWidget(button, index // 3, index % 3)
+        self._rebuild_custom_buttons()
         row_toolbar.addWidget(tool_grid_widget, 0, Qt.AlignVCenter)
         self._row_toolbar=row_toolbar
 
@@ -5331,6 +4154,44 @@ class ExplorerPane(QWidget):
             b.setStyleSheet(_tight_css)
             b.setAutoRaise(True)
         return row_toolbar
+
+    def _rebuild_custom_buttons(self):
+        while self._tool_grid.count():
+            self._tool_grid.takeAt(0)
+        for button in self._custom_buttons:
+            button.hide()
+            button.deleteLater()
+        self._custom_buttons = []
+        config = self.host.custom_commands
+        columns = config["count"] // 2
+        for row, buttons in enumerate(((self.btn_cmd, self.btn_explorer, self.btn_up),
+                                       (self.btn_new, self.btn_new_file, self.btn_refresh))):
+            for col, button in enumerate(buttons):
+                self._tool_grid.addWidget(button, row, col if col == 0 else col + columns)
+        for index, item in enumerate(config["items"][:config["count"]]):
+            button = QToolButton(self)
+            button.setFixedSize(self.btn_cmd.sizeHint().width(), UI_H)
+            button.setAutoRaise(True)
+            button.setStyleSheet("QToolButton{padding-left:4px;padding-right:4px;}")
+            button.setIcon(icon_customize(self.host.theme, item["icon"]))
+            button.setToolTip(f"Customize {index + 1}: {item['command'] or 'Set command in Customize settings'}")
+            button.setAccessibleName(f"Customize {index + 1}")
+            button.clicked.connect(lambda checked=False, i=index: self._run_custom_command(i))
+            self._tool_grid.addWidget(button, index % 2, 1 + index // 2)
+            self._custom_buttons.append(button)
+        if hasattr(self, "_quick_bm_buttons"):
+            QTimer.singleShot(0, self._refresh_quick_bookmark_button_texts)
+
+    def _run_custom_command(self, index):
+        command = self.host.custom_commands["items"][index]["command"]
+        try:
+            process = launch_custom_command(command, self.current_path() or os.getcwd())
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Customize", str(error))
+            return
+        self.host._custom_processes.append((process, index + 1))
+        self.host._custom_process_timer.start()
+        self.host.flash_status(f"Customize {index + 1} started")
 
     def _build_path_row(self):
         self.path_bar=PathBar(self); self.path_bar.setToolTip("Breadcrumb - Double-click or F4/Ctrl+L to enter path")
@@ -5483,7 +4344,7 @@ class ExplorerPane(QWidget):
 
     def _request_file_op_cancel(self):
         worker = getattr(self, "_file_worker", None)
-        if worker and worker.isRunning():
+        if worker:
             try:
                 worker.cancel()
             except Exception:
@@ -5965,7 +4826,7 @@ class ExplorerPane(QWidget):
                         w.cancel()
                 except Exception:
                     pass
-                if not w.wait(wait_ms):
+                if not w.wait(0):
                     # Don't block UI; defer deletion after thread finishes.
                     try:
                         w.finished.connect(w.deleteLater, QtCore.Qt.UniqueConnection)
@@ -6003,6 +4864,8 @@ class ExplorerPane(QWidget):
 
     @QtCore.pyqtSlot(str, list)
     def _on_search_batch(self, base_path: str, rows: list):
+        if self.sender() is not getattr(self, "_search_worker", None):
+            return
         if not self._search_mode or not isinstance(self._search_model, SearchResultModel):
             return
         self._search_model.append_rows(rows)
@@ -6068,6 +4931,7 @@ class ExplorerPane(QWidget):
         del self._search_stat_queue[:size]
 
         w = NormalStatWorker(batch, self)
+        w.finished.connect(w.deleteLater)
         w.statBatchReady.connect(self._apply_search_stat_batch, Qt.QueuedConnection)
         w.finishedCycle.connect(lambda b=batch, worker=w: self._on_search_stat_cycle_finished(worker, b), Qt.QueuedConnection)
         self._search_stat_worker = w
@@ -6094,6 +4958,7 @@ class ExplorerPane(QWidget):
         self._search_stat_worker = None
         if self._search_mode:
             self._start_next_search_stat_worker()
+            self._request_visible_stats(0)
 
     def _on_filter_text_changed(self, text: str):
 
@@ -6238,6 +5103,11 @@ class ExplorerPane(QWidget):
         return stopped
 
     def shutdown(self, wait_ms: int = 300):
+        self._closing = True
+        for timer in self.findChildren(QTimer):
+            timer.stop()
+        for pathbar in self.findChildren(PathBar):
+            pathbar.shutdown_suggestions()
         self._flush_pending_ui_settings()
         try:
             self._cancel_search_worker()
@@ -6263,7 +5133,10 @@ class ExplorerPane(QWidget):
         # References may have been cleared after a timed-out cancellation.  The
         # workers remain QObject children, so audit every child thread before the
         # pane is allowed to be destroyed.
-        return _cancel_and_wait_child_threads(self, wait_ms)
+        stopped = _cancel_and_wait_child_threads(self, wait_ms)
+        if not stopped:
+            self._closing = False
+        return stopped
 
     def _ensure_visible_stats_timer(self):
         if self._visible_stats_timer is not None:
@@ -6275,6 +5148,8 @@ class ExplorerPane(QWidget):
         self._visible_stats_timer = t
 
     def _request_visible_stats(self, delay_ms: int | None = None):
+        if self._closing:
+            return
         self._ensure_visible_stats_timer()
         t = self._visible_stats_timer
         delay = self._visible_stats_interval_ms if delay_ms is None else max(0, int(delay_ms))
@@ -6335,29 +5210,48 @@ class ExplorerPane(QWidget):
         self._selection_cache_ts = now
         return data
 
-    def _update_free_space_label(self, force: bool = False):
-        path = self.current_path()
-        if self._is_network_path(path):
-            self.lbl_free.setText("")
-            return
+    def _background_check(self, check, callback):
+        worker = BackgroundCheck(check, self)
+        def completed(result):
+            if not self._closing and not worker._cancel:
+                callback(result)
+        def finished():
+            for name in ("_path_check", "_space_check"):
+                if getattr(self, name, None) is worker:
+                    setattr(self, name, None)
+        worker.completed.connect(completed, Qt.QueuedConnection)
+        worker.finished.connect(finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        return worker
 
+    def _update_free_space_label(self, force: bool = False):
+        if self._closing:
+            return
+        path = self.current_path()
         key = self._drive_label(path)
         now = time.perf_counter()
         if (not force and self._disk_free_cache_key == key
-            and (now - self._disk_free_cache_ts) <= self._disk_free_ttl_s):
+            and now - self._disk_free_cache_ts <= self._disk_free_ttl_s):
             self.lbl_free.setText(self._disk_free_cache_text)
             return
-
-        try:
-            _total, _used, free = shutil.disk_usage(path)
-            text = f"{key} free {human_size(free)}"
-        except Exception:
-            text = ""
-
-        self._disk_free_cache_key = key
-        self._disk_free_cache_text = text
-        self._disk_free_cache_ts = now
-        self.lbl_free.setText(text)
+        if self._space_check is not None:
+            return
+        def check(cancelled):
+            if self._is_network_path(path) or cancelled():
+                return ""
+            return f"{key} free {human_size(shutil.disk_usage(path).free)}"
+        def completed(result):
+            self._space_check = None
+            if path != self.current_path():
+                self._update_free_space_label()
+                return
+            text = "" if isinstance(result, Exception) else result
+            self._disk_free_cache_key = key
+            self._disk_free_cache_text = text
+            self._disk_free_cache_ts = time.perf_counter()
+            self.lbl_free.setText(text)
+        self._space_check = self._background_check(check, completed)
 
     def _flush_selection_status_update(self):
         self._render_selection_status(update_statusbar=True, update_label=True, update_free=True)
@@ -6386,7 +5280,31 @@ class ExplorerPane(QWidget):
         if update_free:
             self._update_free_space_label(force=False)
 
+    def _stat_ready_for_request(self, model, row):
+        if model.has_stat(row):
+            return False
+        delay = _stat_retry_delay_ms(model._rows[row])
+        if delay is None:
+            return False
+        if delay > 0:
+            if not hasattr(self, "_stat_retry_timer"):
+                self._stat_retry_timer = QTimer(self)
+                self._stat_retry_timer.setSingleShot(True)
+                self._stat_retry_timer.timeout.connect(lambda: self._request_visible_stats(0))
+            timer = self._stat_retry_timer
+            if not timer.isActive() or timer.remainingTime() > delay:
+                timer.start(delay)
+            return False
+        return True
+
+    @QtCore.pyqtSlot(list)
+    def _apply_fast_stat_batch(self, updates):
+        if self.sender() is self._fast_stat_worker:
+            self._fast_model.apply_stat_batch(updates)
+
     def _schedule_visible_stats(self):
+        if self._closing:
+            return
 
         if self._search_mode:
             self._fill_search_visible_icons()
@@ -6419,7 +5337,7 @@ class ExplorerPane(QWidget):
                 row = src_ix.row()
                 if row is None or row < 0:
                     continue
-                if not self._fast_model.has_stat(row):
+                if self._stat_ready_for_request(self._fast_model, row):
                     path = self._fast_model.row_path(row)
                     if path:
                         stat_paths.append(path)
@@ -6441,7 +5359,8 @@ class ExplorerPane(QWidget):
                 return
             root = self._fast_model.rootPath()
             w = FastStatWorker(root, stat_paths, self)
-            w.statBatchReady.connect(self._fast_model.apply_stat_batch, Qt.QueuedConnection)
+            w.finished.connect(w.deleteLater)
+            w.statBatchReady.connect(self._apply_fast_stat_batch, Qt.QueuedConnection)
             def _on_fast_cycle_finished():
                 if self._fast_stat_worker is w:
                     self._fast_stat_worker = None
@@ -6770,52 +5689,67 @@ class ExplorerPane(QWidget):
         except Exception:
             return None
 
-    def _use_fast_model(self, path: str):
+    def _use_fast_model(self, path: str, preserve: bool = False):
         self._cancel_fast_stat_worker()
         self._cancel_enum_worker(wait_ms=150)
 
         self._using_fast = True
-        self._fast_model.reset_dir(path)
-        self.view.setModel(self._fast_proxy)
-        self.view.setRootIndex(QtCore.QModelIndex())
-        self._hook_selection_model()
-        self._configure_header_fast()
+        preserve = bool(preserve and self._fast_model.rootPath() == path
+                        and self.view.model() is self._fast_proxy)
+        if not preserve:
+            self._fast_model.reset_dir(path)
+            self.view.setModel(self._fast_proxy)
+            self.view.setRootIndex(QtCore.QModelIndex())
+            self._hook_selection_model()
+            self._configure_header_fast()
         self._set_large_folder_mode(False)
         self._fast_enum_count = 0
         self._fast_enum_root = path
         self._fast_enum_done = False
 
         sort_col, sort_order = self._get_sort_state(search_mode=False)
-        preload_size = (sort_col == 1)
-        preload_mtime = (sort_col == 3)
+        preload_size = preserve or (sort_col == 1)
+        preload_mtime = preserve or (sort_col == 3)
         live_sort_during_enum = False
         was_sorting = self.view.isSortingEnabled()
         old_dynamic_sort = self._fast_proxy.dynamicSortFilter()
         self._fast_proxy.setDynamicSortFilter(False)
-        if was_sorting:
+        if was_sorting and not preserve:
             self.view.setSortingEnabled(False)
 
         self._fast_batch_counter = 0
         worker = DirEnumWorker(path, self, preload_size=preload_size, preload_mtime=preload_mtime)
         self._enum_worker = worker
+        refresh_rows = []
+        refresh_failed = False
 
         def _on_batch(rows):
             if worker is not self._enum_worker or os.path.normcase(path) != os.path.normcase(self.current_path()):
                 return
-            self._fast_model.append_rows(rows)
+            if preserve:
+                refresh_rows.extend(rows)
+            else:
+                self._fast_model.append_rows(rows)
             self._fast_enum_count += len(rows or [])
             if self._fast_enum_count >= LARGE_FOLDER_THRESHOLD:
                 self._set_large_folder_mode(True, count=self._fast_enum_count, complete=False)
             self._fast_batch_counter += 1
-            if (self._fast_batch_counter % 4) == 0:
+            if not preserve and (self._fast_batch_counter % 4) == 0:
                 self._request_visible_stats(0)
 
         worker.batchReady.connect(_on_batch, Qt.QueuedConnection)
-        worker.error.connect(lambda msg: self.host.statusBar().showMessage(f"List error: {msg}", 4000))
+        def _on_error(msg):
+            nonlocal refresh_failed
+            refresh_failed = True
+            if worker is self._enum_worker:
+                self.host.statusBar().showMessage(f"List error: {msg}", 4000)
+        worker.error.connect(_on_error, Qt.QueuedConnection)
 
         def _on_finished():
             if worker is not self._enum_worker:
                 return
+            if preserve and not refresh_failed:
+                self._fast_model.reconcile_snapshot(refresh_rows)
             self._fast_enum_done = True
             self._enum_worker = None
             self._set_large_folder_mode(
@@ -6888,8 +5822,8 @@ class ExplorerPane(QWidget):
                 if DEBUG:
                     dlog(f"[net] WNetAddConnection3W failed: {e}")
 
-            if os.path.exists(path) or os.path.exists(target):
-                return True, prompted
+            if prompted:
+                return False, prompted
 
         open_target = target or path
         try:
@@ -6899,28 +5833,37 @@ class ExplorerPane(QWidget):
             if DEBUG:
                 dlog(f"[net] explorer launch failed ({open_target}): {e}")
 
-        return os.path.exists(path), prompted
+        return False, prompted
 
-    def set_path(self, path:str, push_history:bool=True):
-        with perf(f"set_path begin -> {path}"):
-            path = nice_path(path)
-            if (not os.path.exists(path)) and self._is_network_path(path):
-                accessible, prompted = self._try_network_auth_prompt(path)
-                if accessible:
-                    pass
-                elif prompted:
-                    QMessageBox.information(
-                        self,
-                        "Network Sign-in",
-                        "Network location requires sign-in.\nPlease complete sign-in and try again.",
-                    )
-                    return
-            if not os.path.exists(path):
-                QMessageBox.warning(self, "Path not found", path)
+    def set_path(self, path: str, push_history: bool = True, _allow_auth: bool = True):
+        path = nice_path(path)
+        self._navigation_generation += 1
+        generation = self._navigation_generation
+        if self._path_check is not None:
+            self._path_check.cancel()
+        def check(cancelled):
+            accessible = os.path.isdir(path)
+            return accessible, not accessible and self._is_network_path(path)
+        def completed(result):
+            if generation != self._navigation_generation:
                 return
+            self._path_check = None
+            if isinstance(result, Exception):
+                self.host.flash_status(str(result))
+                return
+            accessible, network = result
+            if not accessible:
+                if network and _allow_auth:
+                    self._try_network_auth_prompt(path)
+                    self.set_path(path, push_history, _allow_auth=False)
+                else:
+                    QMessageBox.warning(self, "Path not found", path)
+                return
+            self._accept_path(path, push_history)
+        self._path_check = self._background_check(check, completed)
 
-
-
+    def _accept_path(self, path: str, push_history: bool):
+        with perf(f"set_path -> {path}"):
             if self._search_mode:
                 self._enter_browse_mode()
 
@@ -6974,8 +5917,7 @@ class ExplorerPane(QWidget):
 
         try:
 
-            if os.path.isdir(folder_path):
-                self._fswatch.addPath(folder_path)
+            self._fswatch.addPath(folder_path)
         except Exception:
 
             pass
@@ -7027,7 +5969,7 @@ class ExplorerPane(QWidget):
             # Several panes may watch the same folder and receive the same native
             # event. Invalidate once, then let all panes join one shared scan.
             GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
-            self._use_fast_model(self.current_path())
+            self._use_fast_model(self.current_path(), preserve=True)
         except Exception:
             pass
 
@@ -7196,6 +6138,8 @@ class ExplorerPane(QWidget):
         )
 
     def _push_file_op_undo(self, worker, op: str):
+        if getattr(worker, "_undo_registered", False):
+            return
         remove_paths = list(getattr(worker, "undo_remove_paths", []) or [])
         move_pairs = list(getattr(worker, "undo_move_pairs", []) or [])
         actions = []
@@ -7208,6 +6152,7 @@ class ExplorerPane(QWidget):
         act = actions[0] if len(actions) == 1 else {"type": "compound", "actions": actions}
         act["label"] = f"Undo {op}"
         self._undo_stack.append(act)
+        worker._undo_registered = True
 
     def _sync_move_clipboard(self, worker):
         expected = getattr(worker, "clipboard_payload", None)
@@ -7230,6 +6175,7 @@ class ExplorerPane(QWidget):
     def _on_file_worker_error(self, msg):
         worker = self.sender()
         if isinstance(worker, FileOpWorker):
+            self._push_file_op_undo(worker, getattr(worker, "_ui_op", worker.op))
             self._sync_move_clipboard(worker)
         op = getattr(worker, "_ui_op", "operation")
         if msg == "Operation cancelled.":
@@ -7267,40 +6213,28 @@ class ExplorerPane(QWidget):
     @QtCore.pyqtSlot()
     def _on_file_worker_thread_finished(self):
         worker = self.sender()
+        if isinstance(worker, FileOpWorker):
+            self._push_file_op_undo(worker, getattr(worker, "_ui_op", worker.op))
         if getattr(self, "_file_worker", None) is worker:
             self._file_worker = None
         self._hide_pane_progress()
 
     def _start_bg_op(self, op, srcs, dst_dir, clipboard_payload=None):
+        srcs = list(srcs)
+        self.host.flash_status(f"Checking {len(srcs)} item(s) for {op} ...")
+        def completed(result):
+            if isinstance(result, Exception):
+                self.host.flash_status(f"Could not prepare {op}: {result}")
+                return
+            self._start_prepared_op(op, dst_dir, clipboard_payload, result)
+        self._background_check(
+            lambda cancelled: prepare_file_operation(op, srcs, dst_dir, cancelled), completed
+        )
+        return True
+
+    def _start_prepared_op(self, op, dst_dir, clipboard_payload, prepared):
         manager = getattr(self.host, "file_ops", None)
-
-        valid_srcs = []
-        skipped_same = []
-        blocked_nested = []
-        auto_map = {}
-        seen_src_keys = set()
-
-        for src in srcs:
-            src_key = _path_key(src)
-            if src_key in seen_src_keys:
-                continue
-            seen_src_keys.add(src_key)
-            if not src or not os.path.lexists(src):
-                continue
-
-            base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
-            dst = os.path.join(dst_dir, base)
-            if _paths_same(src, dst):
-                if op == "copy":
-                    auto_map[src] = "copy"
-                    valid_srcs.append(src)
-                else:
-                    skipped_same.append(src)
-                continue
-            if os.path.isdir(src) and not _is_dir_link(src) and _is_subpath(dst, src):
-                blocked_nested.append(src)
-                continue
-            valid_srcs.append(src)
+        valid_srcs, skipped_same, blocked_nested, auto_map, conflicts = prepared
 
         if blocked_nested:
             sample = "\n".join(blocked_nested[:5])
@@ -7315,15 +6249,6 @@ class ExplorerPane(QWidget):
             if skipped_same:
                 self.host.flash_status("Nothing to move (same source and destination)")
             return False
-
-        conflicts = []
-        for src in valid_srcs:
-            if src in auto_map:
-                continue
-            base = os.path.basename(src.rstrip("\\/")) or os.path.basename(src)
-            dst = os.path.join(dst_dir, base)
-            if os.path.lexists(dst):
-                conflicts.append((src, dst))
 
         conflict_map = dict(auto_map)
         if conflicts:
@@ -7457,14 +6382,25 @@ class ExplorerPane(QWidget):
         paths=self._selected_paths()
         if len(paths)!=1: return
         src=paths[0]; base=os.path.basename(src)
-        new_name,ok=QInputDialog.getText(self,"Rename","New name:", text=base)
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Rename")
+        dialog.setLabelText("New name:")
+        dialog.setTextValue(base)
+        stem = base if os.path.isdir(src) else os.path.splitext(base)[0]
+        # Qt cursor positions count UTF-16 code units, including non-BMP names.
+        cursor_position = len(stem.encode("utf-16-le")) // 2
+        editor = dialog.findChild(QLineEdit)
+        # Apply after the dialog opens, since QInputDialog initially selects all.
+        QTimer.singleShot(0, lambda: editor.setCursorPosition(cursor_position))
+        ok = dialog.exec_() == QDialog.Accepted
+        new_name = dialog.textValue()
         if not ok or not new_name or new_name==base: return
         dst=os.path.join(os.path.dirname(src), new_name)
         if os.path.exists(dst):
             QMessageBox.warning(self,"Rename","A file or folder with that name already exists."); return
         try:
             os.rename(src, dst)
-            self._undo_stack.append({"type":"move_back","pairs":[(dst,src)]}); self.refresh(); self.host.flash_status("Renamed")
+            self._undo_stack.append({"type":"move_back","pairs":[(dst,src)],"rename_group":True}); self.refresh(); self.host.flash_status("Renamed")
         except Exception as e:
             QMessageBox.critical(self,"Rename failed",str(e))
 
@@ -7491,67 +6427,57 @@ class ExplorerPane(QWidget):
             return
 
         if committed:
-            self._undo_stack.append({"type": "move_back", "pairs": committed})
+            self._undo_stack.append({"type": "move_back", "pairs": committed, "rename_group": True})
         self.refresh()
         self.host.flash_status(f"Renamed {len(committed)} item(s)")
 
-    def _undo_remove_created(self, paths: list[str]) -> bool:
-        failed = []
-        hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
-        for p in reversed(list(paths or [])):
-            if not p or not os.path.exists(p):
-                continue
-            if not recycle_path_to_trash(p, hwnd):
-                failed.append(p)
-        if failed:
-            sample = "\n".join(failed[:8])
-            more = "\n..." if len(failed) > 8 else ""
-            raise RuntimeError(
-                "Could not move copied item(s) to Recycle Bin, so they were left in place:\n"
-                f"{sample}{more}"
-            )
-        return True
-
-    def _apply_undo_action(self, act: dict) -> bool:
-        t = act.get("type")
-        if t=="mkdir":
-            path=act["path"]
-            try: os.rmdir(path)
-            except OSError:
-                QMessageBox.information(self,"Undo New Folder","Folder is not empty; cannot undo safely.")
-                return False
-        elif t=="delete":
-            for p in act.get("paths",[]): remove_any(p)
-        elif t=="remove_created":
-            return self._undo_remove_created(act.get("paths", []))
-        elif t=="move_back":
-            for dst,src in reversed(list(act.get("pairs",[]))):
-                target_dir=os.path.dirname(src)
-                if target_dir:
-                    os.makedirs(target_dir, exist_ok=True)
-                if os.path.exists(src):
-                    base=os.path.basename(src); src=unique_dest_path(target_dir, base)
-                worker = FileOpWorker("move", [dst], target_dir or os.curdir)
-                if not worker._move_source_transactional(dst, src, None, False):
-                    details = "\n".join(worker.errors) or f"Could not safely move {dst} back to {src}."
-                    raise RuntimeError(details)
-        else:
-            return False
-        return True
-
     def undo_last(self):
-        if not self._undo_stack: self.host.flash_status("Nothing to undo"); return
-        act=self._undo_stack.pop()
-        try:
-            if act.get("type") == "compound":
-                for sub in reversed(list(act.get("actions", []))):
-                    if not self._apply_undo_action(sub):
-                        return
-            elif not self._apply_undo_action(act):
-                return
-            self.refresh(); self.host.flash_status("Undone")
-        except Exception as e:
-            QMessageBox.critical(self,"Undo failed",str(e))
+        if getattr(self, "_undo_worker", None) is not None:
+            self.host.flash_status("Undo is already running or queued")
+            return
+        if not self._undo_stack:
+            self.host.flash_status("Nothing to undo")
+            return
+        action = self._undo_stack[-1]
+        hwnd = int(self.window().winId()) if sys.platform == "win32" else 0
+        worker = UndoWorker(action, hwnd)
+        worker.original_action = action
+        self._undo_worker = worker
+        self._file_worker = worker
+        self._show_pane_progress("Undo", busy=True)
+        worker.started.connect(lambda: self._show_pane_progress("Undo", busy=False))
+        worker.progress.connect(self._set_pane_progress_value)
+        worker.status.connect(self._set_pane_progress_status)
+        worker.status.connect(self.host.show_operation_status)
+        worker.finished.connect(self._on_undo_worker_finished)
+        manager = getattr(self.host, "file_ops", None)
+        if manager:
+            state = manager.submit(worker)
+            if state == "queued":
+                self._set_pane_progress_status("Undo queued")
+        else:
+            worker.start()
+
+    @QtCore.pyqtSlot()
+    def _on_undo_worker_finished(self):
+        worker = self.sender()
+        action = worker.original_action
+        action.clear()
+        action.update(worker.remaining_action)
+        if worker.completed:
+            self._undo_stack[:] = [item for item in self._undo_stack if item is not action]
+        if self._undo_worker is worker:
+            self._undo_worker = None
+        if self._file_worker is worker:
+            self._file_worker = None
+            self._hide_pane_progress()
+        self.refresh()
+        if worker.completed:
+            self.host.flash_status("Undone")
+        elif worker.failure_message == "Operation cancelled.":
+            self.host.flash_status("Undo cancelled; unfinished items can be retried")
+        else:
+            QMessageBox.warning(self, "Undo incomplete", worker.failure_message)
 
 
     def _dispose_search_models(self, model, proxy):
@@ -7713,7 +6639,7 @@ class ExplorerPane(QWidget):
             key = model.icon_key(row)
             if key and not model.has_icon(row):
                 icon_jobs.append((key, path, is_dir))
-            if path and not model.has_stat(row) and path not in self._search_stat_pending:
+            if path and self._stat_ready_for_request(model, row) and path not in self._search_stat_pending:
                 stat_paths.append(path)
                 if len(stat_paths) >= 220:
                     break
@@ -7866,6 +6792,7 @@ class MultiExplorer(QMainWindow):
             ("btn_layout", "Toggle layout (4 / 6 / 8)", self._cycle_layout),
             ("btn_theme", "Toggle Light/Dark", self._toggle_theme),
             ("btn_bm_edit", "Edit Bookmarks", self._open_bookmark_editor),
+            ("btn_customize", "Customize command buttons", self._open_customize_settings),
             ("btn_session", "Session (save/load all pane paths)", self._open_session_manager),
             ("btn_shortcuts", "Keyboard Shortcuts", self._show_shortcuts),
             ("btn_about", "About", self._show_about),
@@ -7877,6 +6804,11 @@ class MultiExplorer(QMainWindow):
         vmain=QVBoxLayout(self.central); vmain.setContentsMargins(0,0,0,0); vmain.setSpacing(ROW_SPACING)
         vmain.addWidget(top,0); self.grid=QGridLayout(); vmain.addLayout(self.grid,1)
         self.named_bookmarks=migrate_legacy_favorites_into_named(load_named_bookmarks()); save_named_bookmarks(self.named_bookmarks)
+        self.custom_commands = normalize_custom_commands(QSettings(ORG_NAME, APP_NAME).value("customize/commands", {}))
+        self._custom_processes = []
+        self._custom_process_timer = QTimer(self)
+        self._custom_process_timer.setInterval(250)
+        self._custom_process_timer.timeout.connect(self._poll_custom_processes)
         self._clipboard=None; self._bm_dlg=None
         self.file_ops = FileOperationManager(self)
         self.icon_broker = ShellIconBroker(self)
@@ -7974,6 +6906,7 @@ class MultiExplorer(QMainWindow):
         for name, icon_fn in (
             ("btn_theme", icon_theme_toggle),
             ("btn_bm_edit", icon_bookmark_edit),
+            ("btn_customize", icon_customize),
             ("btn_session", icon_session),
             ("btn_shortcuts", icon_shortcuts),
             ("btn_about", icon_info),
@@ -7989,6 +6922,8 @@ class MultiExplorer(QMainWindow):
                 p.btn_star.setIcon(icon_star(p.btn_star.isChecked(), self.theme))
                 p.btn_cmd.setIcon(icon_cmd(self.theme))
                 p.btn_explorer.setIcon(icon_explorer(self.theme))
+                for index, button in enumerate(p._custom_buttons):
+                    button.setIcon(icon_customize(self.theme, self.custom_commands["items"][index]["icon"]))
 
                 if getattr(getattr(p, "path_bar", None), "_btn_copy", None):
                     p.path_bar._btn_copy.setIcon(icon_copy_squares(self.theme))
@@ -8441,6 +7376,29 @@ class MultiExplorer(QMainWindow):
             if len(self.named_bookmarks)>BOOKMARK_LIMIT: self.named_bookmarks=self.named_bookmarks[:BOOKMARK_LIMIT]
         save_named_bookmarks(self.named_bookmarks); self.namedBookmarksChanged.emit(self.named_bookmarks); self.flash_status("Bookmarks updated")
 
+    def _poll_custom_processes(self):
+        pending = []
+        for process, number in self._custom_processes:
+            code = process.poll()
+            if code is None:
+                pending.append((process, number))
+            else:
+                self.flash_status(f"Customize {number} finished (exit code {code})")
+        self._custom_processes = pending
+        if not pending:
+            self._custom_process_timer.stop()
+
+    def _open_customize_settings(self):
+        dialog = CustomizeDialog(self, self.custom_commands)
+        if dialog.exec_() == QDialog.Accepted:
+            self.custom_commands = dialog.config()
+            settings = QSettings(ORG_NAME, APP_NAME)
+            settings.setValue("customize/commands", self.custom_commands)
+            settings.sync()
+            for pane in self.panes:
+                pane._rebuild_custom_buttons()
+            self.flash_status("Customize settings saved")
+
     def _open_bookmark_editor(self):
         if getattr(self,"_bm_dlg",None) and self._bm_dlg.isVisible():
             self._bm_dlg.raise_(); self._bm_dlg.activateWindow(); return
@@ -8761,6 +7719,59 @@ class SessionManagerDialog(QDialog):
 
 
 
+class CustomizeDialog(QDialog):
+    def __init__(self, parent, config):
+        super().__init__(parent)
+        self.setWindowTitle("Customize command buttons")
+        self.resize(760, 390)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Run commands in the clicked pane's current folder with the CMD window hidden.", self))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Enabled buttons:", self))
+        self.count_combo = QComboBox(self)
+        for count, label in ((0, "All off (default)"), (2, "2 buttons - 2 x 4"),
+                             (4, "4 buttons - 2 x 5"), (6, "6 buttons - 2 x 6")):
+            self.count_combo.addItem(label, count)
+        self.count_combo.setCurrentIndex((0, 2, 4, 6).index(config["count"]))
+        row.addWidget(self.count_combo); row.addStretch()
+        layout.addLayout(row)
+        grid = QGridLayout()
+        for col, label in enumerate(("Button / position", "Icon", "CMD command")):
+            grid.addWidget(QLabel(label, self), 0, col)
+        self.editors = []
+        for index, item in enumerate(config["items"]):
+            label = QLabel(f"{index + 1} / {'Top' if index % 2 == 0 else 'Bottom'} {index // 2 + 1}", self)
+            icons = QComboBox(self)
+            icons.addItem(icon_customize(parent.theme), "Default", "")
+            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                icons.addItem(icon_customize(parent.theme, letter), letter, letter)
+            icons.setCurrentIndex(icons.findData(item["icon"]))
+            command = QLineEdit(item["command"], self)
+            command.setPlaceholderText('Example: echo Hello > result.txt')
+            for col, widget in enumerate((label, icons, command)):
+                grid.addWidget(widget, index + 1, col)
+            self.editors.append((label, icons, command))
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+        note = QLabel("Disabled buttons retain their settings. Console output is hidden; use > file.txt to save it.", self)
+        note.setWordWrap(True); layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.count_combo.currentIndexChanged.connect(self._update_enabled)
+        self._update_enabled()
+
+    def _update_enabled(self):
+        for index, widgets in enumerate(self.editors):
+            for widget in widgets:
+                widget.setEnabled(index < self.count_combo.currentData())
+
+    def config(self):
+        return {"count": self.count_combo.currentData(), "items": [
+            {"icon": icons.currentData(), "command": command.text()}
+            for label, icons, command in self.editors]}
+
+
 class BookmarkOrderTable(QTableWidget):
     rowMoveRequested = pyqtSignal(int, int)
 
@@ -8926,6 +7937,7 @@ def main():
     global DEBUG
     args=parse_args()
     DEBUG = bool(args.debug or _env_flag("MULTIPANE_DEBUG"))
+    file_operations.DEBUG = DEBUG
     _enable_win_per_monitor_v2()
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)

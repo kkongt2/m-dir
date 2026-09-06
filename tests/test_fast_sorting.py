@@ -87,6 +87,31 @@ class FastRecordSortingTests(unittest.TestCase):
 
         self.assertEqual([len(batch) for batch in batches], [64, 64, 2])
 
+    def test_snapshot_refresh_preserves_survivors_and_emits_only_changes(self):
+        model, proxy = self._model()
+        persistent = QtCore.QPersistentModelIndex(model.index(3, 0))
+        resets, changed, inserted, removed = [], [], [], []
+        model.modelReset.connect(lambda: resets.append(True))
+        model.dataChanged.connect(lambda first, last, roles: changed.append((first.row(), last.row())))
+        model.rowsInserted.connect(lambda parent, first, last: inserted.append(last - first + 1))
+        model.rowsRemoved.connect(lambda parent, first, last: removed.append(last - first + 1))
+        snapshot = [dict(rec) for rec in model._rows if rec['name'] != 'z.txt']
+        snapshot[-1]['size'] = 99
+        snapshot.append({'name': 'new.txt', 'path': 'C:/new.txt', 'is_dir': False, 'size': 1, 'mtime': 1})
+        model.reconcile_snapshot(snapshot)
+        proxy.sort(0, QtCore.Qt.AscendingOrder)
+        self.assertEqual(resets, [])
+        self.assertEqual(inserted, [1])
+        self.assertEqual(removed, [1])
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(persistent.data(), 'a.txt')
+        self.assertEqual(model._rows[persistent.row()]['size'], 99)
+        changed.clear()
+        model.reconcile_snapshot([dict(rec) for rec in model._rows])
+        self.assertEqual(changed, [])
+        self.assertEqual(inserted, [1])
+        self.assertEqual(removed, [1])
+
 
 if __name__ == "__main__":
     unittest.main()

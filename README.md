@@ -12,21 +12,28 @@ This README reflects the current behavior of `multipane_explorer.py`.
 ## Features
 - 4/6/8 pane layout switching (top toolbar + `--panes`), with last layout/path restore
 - Per-pane back/forward/up navigation history
-- Path-bar edit mode with recent-path dropdown and folder path autocomplete
+- Path-bar edit mode with recent-path dropdown and background folder path autocomplete; stale suggestions are discarded when input changes
 - Folders-first sorting, with proper size/date sorting for files
-- Large-folder optimization: fast incremental listing via `os.scandir`, then normal model handoff, with a visible large-folder mode badge
-- Auto-refresh on file system changes via `QFileSystemWatcher`
+- Large-folder optimization: incremental `os.scandir` listing with a visible large-folder mode badge; directory snapshots and metadata queries are shared across panes and sort modes
+- Auto-refresh via `QFileSystemWatcher` keeps the existing listing visible and applies changed rows after a successful scan, preserving selections for surviving files
+- Background path validation, paste conflict checks, and free-space queries keep navigation responsive; cancelled navigation results are discarded
+- Failed metadata queries back off and stop after three attempts until the listing is refreshed
 - Filter/recursive search (wildcards like `*.txt`, `*report*.xlsx`, multi-pattern support)
 - Copy/move/paste + drag-and-drop, with conflict actions: `Overwrite / Skip / Copy`
-- Safe cross-filesystem moves use a completed staging copy before source cleanup; symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
+- Safe cross-filesystem moves use a completed staging copy before source cleanup; source changes detected during copying are preserved and reported, and cleanup never recursively removes newly added entries
+- Same-filesystem moves skip descendant progress scans; folder copies process entries as they are enumerated and close enumeration handles on cancellation
+- Copy/move promotion refuses concurrent destination conflicts; if restoring an overwritten destination is blocked, its backup is retained and its recovery path is reported
+- Symbolic links are preserved when permitted, while cross-filesystem Windows junction copies are refused rather than traversed
 - Bulk rename tool (prefix/suffix/find-replace/numbering) via `Ctrl+Shift+R`
 - Per-pane file operation progress bar with cancellation
+- Background undo with progress and cancellation; completed portions of cancelled operations remain undoable, and unfinished undo items can be retried
 - Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
-- Roomier two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with drag-to-reorder bookmark editing
+- Two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with a compact 1×1 star button, blank space below it, and more horizontal room for bookmarks; supports drag-to-reorder bookmark editing
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise
 - Open Command Prompt in the current folder
+- Customize command buttons (v2.9.0): top-left settings enable 0 (default), 2, 4, or 6 shared buttons between the CMD and Explorer columns; each uses a default icon or A-Z icon and runs a saved CMD command in the clicked pane's folder without showing a console. Settings persist, including disabled slots. Console output can be redirected to a file.
 
 ## Install
 ```powershell
@@ -64,6 +71,15 @@ $env:MULTIPANE_DURABLE_COPIES=1; python multipane_explorer.py
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+The suite includes temporary-directory recovery checks and isolated, offscreen Qt
+checks for responsive autocomplete and cancellable undo.
+
+## Code layout
+- `multipane_explorer.py`: application entry point, panes, models, search, path suggestions, settings, and dialogs
+- `file_operations.py`: file transactions, source validation, rollback, bulk rename, Recycle Bin handling, operation queue, and copy/move/delete/undo workers; no explorer-widget dependency
+- `tests/test_operation_recovery.py`: source changes, destination conflicts, cancellation, rename rollback, and partial undo
+- `tests/test_async_operations.py`: Qt responsiveness and application startup checks in isolated subprocesses
 
 ## Search/Filter Behavior
 - Type a filter and press `Enter` (or click `Search`) to run recursive search from the current folder
