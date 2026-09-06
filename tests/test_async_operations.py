@@ -110,17 +110,22 @@ class AsyncOperationTests(unittest.TestCase):
                     time.sleep(.001)
                 assert check(), 'timed out'
             with tempfile.TemporaryDirectory() as root:
+                # Windows resolves actual path casing (including runner temp paths).
+                # Exercise that mismatch instead of relying on local temp casing.
+                if e.os.name == 'nt':
+                    root = root.swapcase()
                 QtCore.QSettings.setDefaultFormat(QtCore.QSettings.IniFormat)
                 QtCore.QSettings.setPath(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope, root)
                 old, new = Path(root, 'old'), Path(root, 'new')
                 old.mkdir(); new.mkdir()
+                old_path, new_path = e.nice_path(str(old)), e.nice_path(str(new))
                 window = e.MultiExplorer(pane_count=4, start_paths=[root] * 4)
                 pump(lambda: all(p._fast_enum_done for p in window.panes))
                 pane = window.panes[0]
                 entered, release = threading.Event(), threading.Event()
                 original = e.os.path.isdir
                 def slow(path):
-                    if str(path) == str(old):
+                    if str(path) == old_path:
                         entered.set(); release.wait(3)
                     return original(path)
                 try:
@@ -130,12 +135,12 @@ class AsyncOperationTests(unittest.TestCase):
                         ticks = []
                         QtCore.QTimer.singleShot(0, lambda: ticks.append(True))
                         pane.set_path(str(new))
-                        pump(lambda: ticks and pane.current_path() == str(new))
+                        pump(lambda: ticks and pane.current_path() == new_path)
                         assert not release.is_set()
                         release.set()
                         pump(lambda: all(not w.isRunning() for w in pane.findChildren(e.BackgroundCheck)))
                         app.processEvents()
-                        assert pane.current_path() == str(new)
+                        assert pane.current_path() == new_path
                     entered.clear(); release.clear()
                     def prepare(*args):
                         entered.set(); release.wait(3)
