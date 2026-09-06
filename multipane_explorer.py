@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.2"
+APP_VERSION = "2.9.3"
 
 
 BASE_FONT_PT = 9.5

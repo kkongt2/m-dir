@@ -975,7 +975,12 @@ class FileOpWorker(QtCore.QThread):
                 break
             name = os.path.basename(src.rstrip("\\/")) or src
             self.status.emit(f"Scanning {idx}/{len(self.srcs)}: {name}")
-            stats = self._scan_source_progress(src)
+            # A same-filesystem move renames the selected root. Counting its
+            # descendants can cost much more than the operation itself.
+            if self.op == "move" and _same_filesystem(src, self.dst_dir):
+                stats = (0, 1)
+            else:
+                stats = self._scan_source_progress(src)
             self._src_progress_cache[_path_key(src)] = stats
             self._total_bytes += stats[0]
             self._total_items += stats[1]
