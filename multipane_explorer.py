@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.3"
+APP_VERSION = "2.9.4"
 
 
 BASE_FONT_PT = 9.5
@@ -1871,6 +1871,26 @@ class ShellIconBroker(QtCore.QObject):
         return stopped
 
 
+STAT_RETRY_LIMIT = 3
+STAT_RETRY_BASE_S = 2.0
+
+
+def _record_stat_attempt(rec, mtime):
+    if mtime is not None:
+        rec.pop("stat_failures", None)
+        rec.pop("stat_retry_at", None)
+    else:
+        failures = int(rec.get("stat_failures", 0)) + 1
+        rec["stat_failures"] = failures
+        rec["stat_retry_at"] = time.monotonic() + STAT_RETRY_BASE_S * (2 ** min(failures - 1, 4))
+
+
+def _stat_retry_delay_ms(rec):
+    if int(rec.get("stat_failures", 0)) >= STAT_RETRY_LIMIT:
+        return None
+    return max(0, math.ceil((rec.get("stat_retry_at", 0) - time.monotonic()) * 1000))
+
+
 class FastDirModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Ext", "Date Modified"]
 
@@ -1983,6 +2003,7 @@ class FastDirModel(QAbstractTableModel):
             if row is None or not (0 <= row < len(self._rows)):
                 continue
             rec = self._rows[row]
+            _record_stat_attempt(rec, mtime_val)
             if rec.get("size") is None and size_val is not None:
                 rec["size"] = int(size_val)
                 size_rows.append(row)
@@ -2168,7 +2189,7 @@ class FastStatWorker(QtCore.QThread):
                     size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
                     mtime_val=float(st.st_mtime)
                 except Exception:
-                    size_val=0; mtime_val=None
+                    size_val=None; mtime_val=None
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -2384,7 +2405,7 @@ class NormalStatWorker(QtCore.QThread):
                     size_val=0 if stat.S_ISDIR(st.st_mode) else int(st.st_size)
                     mtime_val=float(st.st_mtime)
                 except Exception:
-                    size_val=0; mtime_val=None
+                    size_val=None; mtime_val=None
                 batch.append((p, size_val, mtime_val))
                 if len(batch) >= 64:
                     self.statBatchReady.emit(batch)
@@ -3319,6 +3340,7 @@ class SearchResultModel(QAbstractTableModel):
             if row is None or not (0 <= row < len(self._rows)):
                 continue
             rec = self._rows[row]
+            _record_stat_attempt(rec, mtime_val)
             if rec.get("size") is None and size_val is not None:
                 rec["size"] = int(size_val)
                 size_rows.append(row)
@@ -4847,6 +4869,7 @@ class ExplorerPane(QWidget):
         self._search_stat_worker = None
         if self._search_mode:
             self._start_next_search_stat_worker()
+            self._request_visible_stats(0)
 
     def _on_filter_text_changed(self, text: str):
 
@@ -5168,6 +5191,23 @@ class ExplorerPane(QWidget):
         if update_free:
             self._update_free_space_label(force=False)
 
+    def _stat_ready_for_request(self, model, row):
+        if model.has_stat(row):
+            return False
+        delay = _stat_retry_delay_ms(model._rows[row])
+        if delay is None:
+            return False
+        if delay > 0:
+            if not hasattr(self, "_stat_retry_timer"):
+                self._stat_retry_timer = QTimer(self)
+                self._stat_retry_timer.setSingleShot(True)
+                self._stat_retry_timer.timeout.connect(lambda: self._request_visible_stats(0))
+            timer = self._stat_retry_timer
+            if not timer.isActive() or timer.remainingTime() > delay:
+                timer.start(delay)
+            return False
+        return True
+
     @QtCore.pyqtSlot(list)
     def _apply_fast_stat_batch(self, updates):
         if self.sender() is self._fast_stat_worker:
@@ -5208,7 +5248,7 @@ class ExplorerPane(QWidget):
                 row = src_ix.row()
                 if row is None or row < 0:
                     continue
-                if not self._fast_model.has_stat(row):
+                if self._stat_ready_for_request(self._fast_model, row):
                     path = self._fast_model.row_path(row)
                     if path:
                         stat_paths.append(path)
@@ -6494,7 +6534,7 @@ class ExplorerPane(QWidget):
             key = model.icon_key(row)
             if key and not model.has_icon(row):
                 icon_jobs.append((key, path, is_dir))
-            if path and not model.has_stat(row) and path not in self._search_stat_pending:
+            if path and self._stat_ready_for_request(model, row) and path not in self._search_stat_pending:
                 stat_paths.append(path)
                 if len(stat_paths) >= 220:
                     break
