@@ -75,7 +75,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.9"
+APP_VERSION = "2.9.10"
 
 
 BASE_FONT_PT = 9.5
@@ -1134,7 +1134,9 @@ def _invoke_menu(owner_hwnd, cm, hmenu, screen_pt, work_dir, paths=None, id_firs
         return True
 
 
-    if verb and verb.lower() in ("properties","prop","property"):
+    # Multi-selection must use the context menu bound to the entire selection.
+    # SHObjectProperties/ShellExecuteEx below accept only a single file path.
+    if verb and verb.lower() in ("properties","prop","property") and len(paths or []) <= 1:
         try:
             target = paths[0] if (paths and len(paths)>0) else work_dir
             target = _normalize_fs_path(target)
