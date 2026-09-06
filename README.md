@@ -28,7 +28,7 @@ This README reflects the current behavior of `multipane_explorer.py`.
 - Per-pane file operation progress bar with cancellation
 - Background undo with progress and cancellation; completed portions of cancelled operations remain undoable, and unfinished undo items can be retried
 - Delete to Recycle Bin (`send2trash`/Shell API when available; no permanent fallback), `Shift+Delete` for permanent delete
-- Roomier two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with drag-to-reorder bookmark editing
+- Two-row quick bookmark toolbar (top row first, up to 30 bookmarks with overflow menu), with a compact 1×1 star button, blank space below it, and more horizontal room for bookmarks; supports drag-to-reorder bookmark editing
 - Session save/load/delete (pane count + pane paths)
 - Dark/light theme toggle and active-pane highlighting
 - Native Explorer context menu when `pywin32` is available, fallback menu otherwise

@@ -75,7 +75,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.7"
+APP_VERSION = "2.9.8"
 
 
 BASE_FONT_PT = 9.5
@@ -4091,8 +4091,8 @@ class ExplorerPane(QWidget):
         self.btn_star=QToolButton(self); self.btn_star.setCheckable(True)
         self.btn_star.setIcon(icon_star(False, getattr(self.host,"theme","dark"))); self.btn_star.setToolTip("Add bookmark for this folder")
         base_star_width = max(UI_H, self.btn_star.sizeHint().width())
-        self.btn_star.setFixedSize(base_star_width * 2, UI_H * 2)
-        self.btn_star.setIconSize(QSize(36, 36))
+        self.btn_star.setFixedSize(base_star_width, UI_H)
+        self.btn_star.setIconSize(QSize(18, 18))
         self._bm_btn_container=QWidget(self)
         self._bm_btn_layout=QVBoxLayout(self._bm_btn_container)
         self._bm_btn_layout.setContentsMargins(0,0,0,0); self._bm_btn_layout.setSpacing(max(0, ROW_SPACING-2))
@@ -4142,7 +4142,7 @@ class ExplorerPane(QWidget):
         row_toolbar.setContentsMargins(0,0,0,0)
 
         row_toolbar.setSpacing(max(0, ROW_SPACING-2))
-        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignVCenter)
+        row_toolbar.addWidget(self.btn_star, 0, Qt.AlignTop)
         row_toolbar.addWidget(self._bm_btn_container,1)
         self._rebuild_custom_buttons()
         row_toolbar.addWidget(tool_grid_widget, 0, Qt.AlignVCenter)
