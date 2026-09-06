@@ -74,7 +74,7 @@ def perf(name):
 
 ORG_NAME = "MultiPane"
 APP_NAME = "Multi-Pane File Explorer"
-APP_VERSION = "2.9.4"
+APP_VERSION = "2.9.5"
 
 
 BASE_FONT_PT = 9.5
@@ -1944,6 +1944,35 @@ class FastDirModel(QAbstractTableModel):
         for row, rec in enumerate(self._rows):
             self._row_by_path[str(rec.get("path", ""))] = row
             self._icon_rows.setdefault(rec.get("icon_key", ""), []).append(row)
+
+    def reconcile_snapshot(self, rows):
+        """Apply a completed refresh without resetting selection or the view."""
+        incoming = {str(rec["path"]): dict(rec) for rec in rows}
+        removed = [i for i, rec in enumerate(self._rows) if rec["path"] not in incoming]
+        for first, last in reversed(_contiguous_ranges(removed)):
+            self.beginRemoveRows(QtCore.QModelIndex(), first, last)
+            del self._rows[first:last + 1]
+            self.endRemoveRows()
+        self._rebuild_row_maps()
+        changed = []
+        keys = ("name", "name_l", "path", "is_dir", "ext", "size", "mtime", "icon_key")
+        for row, old in enumerate(self._rows):
+            fresh = incoming.pop(old["path"])
+            fresh.setdefault("icon_key", _icon_cache_key(fresh["path"], bool(fresh.get("is_dir"))))
+            if any(old.get(key) != fresh.get(key) for key in keys):
+                old.update(fresh)
+                changed.append(row)
+            # A new filesystem snapshot permits another bounded retry cycle.
+            old.pop("stat_failures", None)
+            old.pop("stat_retry_at", None)
+        if changed:
+            self._rebuild_row_maps()
+            for first, last in _contiguous_ranges(changed):
+                self.dataChanged.emit(self.index(first, 0), self.index(last, 3), [])
+        if incoming:
+            self.append_rows(list(incoming.values()))
+        if removed or changed or incoming:
+            self._last_sort = None
 
     def sort_records(self, column: int, order=Qt.AscendingOrder):
         sort_state = (int(column), int(order))
@@ -5599,52 +5628,67 @@ class ExplorerPane(QWidget):
         except Exception:
             return None
 
-    def _use_fast_model(self, path: str):
+    def _use_fast_model(self, path: str, preserve: bool = False):
         self._cancel_fast_stat_worker()
         self._cancel_enum_worker(wait_ms=150)
 
         self._using_fast = True
-        self._fast_model.reset_dir(path)
-        self.view.setModel(self._fast_proxy)
-        self.view.setRootIndex(QtCore.QModelIndex())
-        self._hook_selection_model()
-        self._configure_header_fast()
+        preserve = bool(preserve and self._fast_model.rootPath() == path
+                        and self.view.model() is self._fast_proxy)
+        if not preserve:
+            self._fast_model.reset_dir(path)
+            self.view.setModel(self._fast_proxy)
+            self.view.setRootIndex(QtCore.QModelIndex())
+            self._hook_selection_model()
+            self._configure_header_fast()
         self._set_large_folder_mode(False)
         self._fast_enum_count = 0
         self._fast_enum_root = path
         self._fast_enum_done = False
 
         sort_col, sort_order = self._get_sort_state(search_mode=False)
-        preload_size = (sort_col == 1)
-        preload_mtime = (sort_col == 3)
+        preload_size = preserve or (sort_col == 1)
+        preload_mtime = preserve or (sort_col == 3)
         live_sort_during_enum = False
         was_sorting = self.view.isSortingEnabled()
         old_dynamic_sort = self._fast_proxy.dynamicSortFilter()
         self._fast_proxy.setDynamicSortFilter(False)
-        if was_sorting:
+        if was_sorting and not preserve:
             self.view.setSortingEnabled(False)
 
         self._fast_batch_counter = 0
         worker = DirEnumWorker(path, self, preload_size=preload_size, preload_mtime=preload_mtime)
         self._enum_worker = worker
+        refresh_rows = []
+        refresh_failed = False
 
         def _on_batch(rows):
             if worker is not self._enum_worker or os.path.normcase(path) != os.path.normcase(self.current_path()):
                 return
-            self._fast_model.append_rows(rows)
+            if preserve:
+                refresh_rows.extend(rows)
+            else:
+                self._fast_model.append_rows(rows)
             self._fast_enum_count += len(rows or [])
             if self._fast_enum_count >= LARGE_FOLDER_THRESHOLD:
                 self._set_large_folder_mode(True, count=self._fast_enum_count, complete=False)
             self._fast_batch_counter += 1
-            if (self._fast_batch_counter % 4) == 0:
+            if not preserve and (self._fast_batch_counter % 4) == 0:
                 self._request_visible_stats(0)
 
         worker.batchReady.connect(_on_batch, Qt.QueuedConnection)
-        worker.error.connect(lambda msg: self.host.statusBar().showMessage(f"List error: {msg}", 4000))
+        def _on_error(msg):
+            nonlocal refresh_failed
+            refresh_failed = True
+            if worker is self._enum_worker:
+                self.host.statusBar().showMessage(f"List error: {msg}", 4000)
+        worker.error.connect(_on_error, Qt.QueuedConnection)
 
         def _on_finished():
             if worker is not self._enum_worker:
                 return
+            if preserve and not refresh_failed:
+                self._fast_model.reconcile_snapshot(refresh_rows)
             self._fast_enum_done = True
             self._enum_worker = None
             self._set_large_folder_mode(
@@ -5864,7 +5908,7 @@ class ExplorerPane(QWidget):
             # Several panes may watch the same folder and receive the same native
             # event. Invalidate once, then let all panes join one shared scan.
             GLOBAL_DIR_SNAPSHOTS.invalidate(self.current_path(), coalesce_s=0.25)
-            self._use_fast_model(self.current_path())
+            self._use_fast_model(self.current_path(), preserve=True)
         except Exception:
             pass
 
